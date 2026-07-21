@@ -1,0 +1,5 @@
+Hello world
+The quick brown fox jumps over the lazy dog.
+123 code() test + math * 42
+Café résumé naïve Zürich
+def f(x): return x**2  # comment

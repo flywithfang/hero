@@ -1,0 +1,144 @@
+#include "../src/gemma4.hpp"
+#include <cstdio>
+#include <type_traits>
+
+static_assert(TransformerArchitecture<Gemma4E4BArchitecture>);
+static_assert(!std::is_default_constructible_v<Gemma4E4BTextModel>);
+
+static int g_fail = 0;
+static void check(bool ok, const char* msg) {
+    std::printf("  [%s] %s\n", ok ? "PASS" : "FAIL", msg);
+    if (!ok) ++g_fail;
+}
+
+template <size_t In, size_t Out>
+static Linear<In, Out> zero_linear() {
+    MatT<In, Out> matrix = MatT<In, Out>::owning();
+    return Linear<In, Out>(Weight<In, Out>(std::move(matrix)));
+}
+
+template <size_t N>
+static RMSNorm<N> unit_norm(Scalar eps = 1e-6f) {
+    Vec<N> gamma;
+    for (size_t i = 0; i < N; ++i) gamma[i] = 1.f;
+    return RMSNorm<N>(std::move(gamma), eps);
+}
+
+int main() {
+    std::printf("== Gemma E4B layer schedule ==\n");
+    check(Gemma4E4BTextConfig::attention_kind(0) == GemmaAttentionKind::Sliding &&
+          Gemma4E4BTextConfig::attention_kind(5) == GemmaAttentionKind::Full &&
+          Gemma4E4BTextConfig::attention_kind(41) == GemmaAttentionKind::Full,
+          "five sliding layers followed by one full layer");
+    check(Gemma4E4BTextConfig::stores_shared_kv(22) &&
+          Gemma4E4BTextConfig::stores_shared_kv(23) &&
+          Gemma4E4BTextConfig::shares_kv(24),
+          "last local/full producers feed the final 18 KV-sharing layers");
+
+    std::printf("== Gemma normalization ==\n");
+    {
+        RMSNormNoScale<4> norm(1e-6f);
+        Vec<4> a, b;
+        for (size_t i = 0; i < 4; ++i) { a[i] = Scalar(i + 1); b[i] = 7 * a[i]; }
+        Vec<4> na = norm(a), nb = norm(b);
+        Scalar delta = 0;
+        for (size_t i = 0; i < 4; ++i) delta = std::max(delta, std::fabs(na[i] - nb[i]));
+        check(delta < 1e-5f, "scale-free RMSNorm is scale invariant");
+    }
+
+    std::printf("== proportional RoPE ==\n");
+    {
+        GemmaProportionalRope<8, 1, 2, 10000> rope;
+        static_assert(decltype(rope)::rotary_planes() == 2);
+        Vec<8> value;
+        for (size_t i = 0; i < 8; ++i) value[i] = Scalar(i + 1);
+        Vec<8> original = copy(VecView<8>(value));
+        rope.apply(slice_mut<8>(value, 0), 7);
+        check(value[2] == original[2] && value[3] == original[3] &&
+              value[6] == original[6] && value[7] == original[7],
+              "non-RoPE planes are exactly unchanged");
+        check(value[0] != original[0] && value[4] != original[4],
+              "configured proportional prefix rotates");
+    }
+
+    std::printf("== heterogeneous K/V cache and Gemma attention ==\n");
+    {
+        GemmaKVCache<1, 2> full;
+        Vec<2> k0, v0, k1, v1;
+        k0[0] = 1; k0[1] = 0; v0[0] = 10; v0[1] = 20;
+        k1[0] = 0; k1[1] = 1; v1[0] = 30; v1[1] = 40;
+        full.append(Position{0}, k0, v0);
+        full.append(Position{1}, k1, v1);
+        Vec<4> q;
+        q[0] = 1; q[1] = 0; q[2] = 1; q[3] = 0;
+        Vec<4> global = gemma_attend<2, 1, 2>(q, full, Position{1});
+        const Scalar p0 = std::exp(1.f) / (std::exp(1.f) + 1.f);
+        check(std::fabs(global[0] - (p0 * 10 + (1 - p0) * 30)) < 1e-5f &&
+              global[0] == global[2],
+              "GQA heads share KV and attention uses scale 1.0");
+        Vec<4> local = gemma_attend<2, 1, 2>(q, full, Position{1}, 1);
+        check(local[0] == 30 && local[1] == 40,
+              "sliding attention excludes positions outside its window");
+
+        GemmaKVCache<1, 2> ring(2);
+        Vec<2> k2, v2; k2[0] = 2; k2[1] = 2; v2[0] = 50; v2[1] = 60;
+        ring.append(Position{0}, k0, v0);
+        ring.append(Position{1}, k1, v1);
+        ring.append(Position{2}, k2, v2);
+        check(ring.size() == 2 && ring.position(0).i == 1 && ring.position(1).i == 2,
+              "bounded cache is an ordered sliding ring");
+    }
+
+    std::printf("== E4B cache topology ==\n");
+    {
+        Gemma4E4BCache cache;
+        check(cache.local(0).capacity() == Gemma4E4BTextConfig::SLIDING_WINDOW,
+              "ordinary local layers own bounded caches");
+        check(cache.local(22).capacity() == 0 && &cache.local(24) == &cache.local(22),
+              "shared local layers reuse the full-retention layer-22 cache");
+        check(cache.global(23).capacity() == 0 && &cache.global(29) == &cache.global(23),
+              "shared global layers reuse the layer-23 cache");
+    }
+
+    std::printf("== embedding scale and logit cap ==\n");
+    {
+        const Scalar scale = gemma_embedding_scale<2560>();
+        const Scalar reference = bf16_to_fp32(fp32_to_bf16(std::sqrt(2560.f)));
+        check(scale == reference, "embedding sqrt(D) includes BF16 rounding");
+        check(std::fabs(gemma_softcap(1000.f, 30.f) - 30.f) < 1e-4f &&
+              gemma_softcap(-4.f, 30.f) < 0.f,
+              "logit softcap is cap*tanh(x/cap)");
+    }
+
+
+    std::printf("== dense decoder residual anatomy ==\n");
+    {
+        struct MockAttention {};
+        GeluGatedMLP<2, 2> mlp(zero_linear<2, 2>(), zero_linear<2, 2>(),
+                                zero_linear<2, 2>());
+        GemmaPerLayerResidual<2, 1> ple(zero_linear<2, 1>(), zero_linear<1, 2>(),
+                                               unit_norm<2>());
+        using Definition = GemmaDenseDecoderLayerDefinition<2, 2, 1, MockAttention>;
+        GemmaDenseDecoderLayer<2, 2, 1, MockAttention> layer(
+            Definition::TokenMixerBranch(
+                unit_norm<2>(), MockAttention{},
+                PostNormalize<RMSNorm<2>>(unit_norm<2>())),
+            Definition::ChannelMixerBranch(
+                unit_norm<2>(), std::move(mlp),
+                PostNormalize<RMSNorm<2>>(unit_norm<2>())),
+            Definition::Tail(std::move(ple), 2.f));
+        Vec<2> x; x[0] = 3; x[1] = -4;
+        Vec<1> per_layer; per_layer[0] = 7;
+        Vec<2> y = layer.forward(
+            x, VecView<1>(per_layer),
+            [](const MockAttention&, VecView<2>) { return Vec<2>{}; },
+            [](const auto& channel, VecView<2> normalized) {
+                return channel(normalized);
+            });
+        check(y[0] == 6 && y[1] == -8,
+              "post-norm attention/FF/PLE residuals precede layer scaling");
+    }
+
+    std::printf("\n%s (%d failures)\n", g_fail ? "GEMMA4 TESTS FAILED" : "ALL GEMMA4 TESTS PASSED", g_fail);
+    return g_fail ? 1 : 0;
+}

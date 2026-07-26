@@ -13,7 +13,7 @@
 // state, so those DO start from nothing.
 static_assert(!std::is_default_constructible_v<RMSNorm<4>>);
 static_assert(!std::is_default_constructible_v<Linear<2, 2>>);
-static_assert(!std::is_default_constructible_v<PostNormalize<RMSNorm<4>>>);
+static_assert(!std::is_default_constructible_v<GeluGatedMLP<2, 2>>);
 static_assert(std::is_default_constructible_v<RotaryEmbedding<8, 10000>>);
 static_assert(std::is_default_constructible_v<KVCache<1, 2>>);
 

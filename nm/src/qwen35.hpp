@@ -245,11 +245,23 @@ private:
 
 // ---- layers -----------------------------------------------------------------
 //
-// Both kinds are the canonical block: pre-norm token mixer, pre-norm channel
-// mixer, no post transform, no tail. The tensor named `attn_post_norm` in the
-// checkpoint is, despite its name, the channel mixer's INPUT norm.
+// One layer's weights. Both kinds are plain pre-norm: two norms, a token mixer,
+// a channel mixer, no post-norm and no tail. That is the entire topology, so it
+// is four members rather than a composition of branch types. The tensor named
+// `attn_post_norm` in the checkpoint is, despite its name, the channel mixer's
+// INPUT norm.
+//
+// There is no forward() here: a layer cannot run itself, because evaluating the
+// mixer needs this layer's cache or recurrent state, which belong to the
+// PrefixState and not to any weight. The equation is written out in
+// Qwen35Architecture::forward_layer, where the mixer call can just be a call.
 template <class C, class Mixer>
-using Qwen35Block = TransformerBlock<C::D, ResidualBranch<C::D, RMSNorm<C::D>, Mixer>, ResidualBranch<C::D, RMSNorm<C::D>, GatedMLP<C::D, C::FF>>>;
+struct Qwen35Block {
+    RMSNorm<C::D> mixer_norm;
+    Mixer mixer;
+    RMSNorm<C::D> channel_norm;
+    GatedMLP<C::D, C::FF> channel;
+};
 
 template <class C>
 using QwenAttentionMixer = QwenGatedAttention<C::D, C::Hq, C::Hkv, C::HEAD_DIM>;
@@ -338,9 +350,28 @@ struct Qwen35Architecture {
 
     static PreparedInput prepare(const Weights&, const EmbeddedSequence<D>&) { return {}; }
 
-    static void forward_layer(const Weights& weights, PrefixState& state, const EmbeddedSequence<D>& input, ResidualStream<D>& residual, PreparedInput&, size_t layer_index) {
+    // One layer, whole. This is the payoff for calling attention a token mixer:
+    // the two kinds of Qwen layer have the SAME equation, and std::visit picks
+    // which mixer runs. mix_tokens is overloaded on the mixer type — gated
+    // attention for the 1-in-4 full layers, the gated delta net for the rest —
+    // and that overload is the only difference between a recurrent layer and an
+    // attention layer in the entire stack.
+    static void forward_layer(const Weights& weights, PrefixState& state, const EmbeddedSequence<D>& input, ResidualStream<D>& residual, const PreparedInput&, size_t layer_index) {
         const size_t first_position = input.position(0).i;
-        Matrix<D> next = std::visit([&](const auto& layer) { return layer.forward(residual.matrix(), NoLayerInput{}, [&](const auto& mixer, MatrixView<D> normalized) { return mix_tokens(mixer, normalized, state, layer_index, first_position); }, [](const auto& channel, MatrixView<D> normalized) { return channel(normalized); }); }, weights.layer(layer_index));
+        const MatrixView<D> X = residual.matrix();
+        Matrix<D> next = std::visit(
+            [&](const auto& layer) {
+                // h = x + mix( norm(x) )
+                Matrix<D> U = layer.mixer_norm(X);
+                Matrix<D> M = mix_tokens(layer.mixer, U.view(), state, layer_index, first_position);
+                Matrix<D> H = add(X, M.view());
+
+                // out = h + mlp( norm(h) )
+                Matrix<D> Z = layer.channel_norm(H.view());
+                Matrix<D> F = layer.channel(Z.view());
+                return add(H.view(), F.view());
+            },
+            weights.layer(layer_index));
         residual.set_matrix(std::move(next));
     }
 

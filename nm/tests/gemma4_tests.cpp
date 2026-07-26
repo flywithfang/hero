@@ -109,32 +109,39 @@ int main() {
         check(std::fabs(gemma_softcap(1000.f, 30.f) - 30.f) < 1e-4f && gemma_softcap(-4.f, 30.f) < 0.f, "logit softcap is cap*tanh(x/cap)");
     }
 
-    std::printf("== dense decoder residual anatomy ==\n");
+    std::printf("== dense decoder tail anatomy ==\n");
     {
+        // The layer equation now reads straight out of forward_layer() in each
+        // architecture, so it has no mockable seam and is pinned by the parity
+        // harness instead. What is still a component with numbers of its own is
+        // the tail. Zero PLE projections make the residual contribute nothing,
+        // leaving exactly the layer_output_scale on the FF residual.
         struct MockAttention {};
-        GeluGatedMLP<2, 2> mlp(zero_linear<2, 2>(), zero_linear<2, 2>(), zero_linear<2, 2>());
         GemmaPerLayerResidual<2, 1> ple(zero_linear<2, 1>(), zero_linear<1, 2>(), unit_norm<2>());
-        GemmaDenseDecoderLayer<2, 2, MockAttention, GemmaPerLayerTail<2, 1>> layer(unit_norm<2>(), MockAttention{}, unit_norm<2>(), unit_norm<2>(), std::move(mlp), unit_norm<2>(), GemmaPerLayerTail<2, 1>(std::move(ple), 2.f));
-        Vec<2> x;
-        x[0] = 3;
-        x[1] = -4;
+        GemmaPerLayerTail<2, 1> tail(std::move(ple), 2.f);
+        auto x = [] {
+            Vec<2> value;
+            value[0] = 3;
+            value[1] = -4;
+            return value;
+        };
         Vec<1> per_layer;
         per_layer[0] = 7;
-        Vec<2> y = layer.forward(x, VecView<1>(per_layer), [](const MockAttention&, VecView<2>) { return Vec<2>{}; });
-        check(y[0] == 6 && y[1] == -8, "scalar post-norm attention/FF/PLE residuals precede layer scaling");
+        Vec<2> y = tail(x(), VecView<1>(per_layer));
+        check(y[0] == 6 && y[1] == -8, "the PLE residual precedes layer scaling");
 
         Matrix<2> batch(1);
-        batch.set_row(0, x);
+        batch.set_row(0, x());
         Matrix<1> batch_per_layer(1);
         batch_per_layer.set_row(0, per_layer);
-        Matrix<2> batch_output = layer.forward(batch.view(), batch_per_layer.view(), [](const MockAttention&, MatrixView<2> normalized) { return Matrix<2>(normalized.rows()); });
-        check(batch_output.row(0)[0] == 6 && batch_output.row(0)[1] == -8, "matrix forward states the same Gemma layer equation");
+        Matrix<2> batch_output = tail(std::move(batch), batch_per_layer.view());
+        check(batch_output.row(0)[0] == 6 && batch_output.row(0)[1] == -8, "the matrix tail states the same equation as the scalar one");
 
-        // The same layer with no PLE at all: 12B's tail type. The FF residual
-        // is the layer output, unscaled.
-        GemmaDenseDecoderLayer<2, 2, MockAttention, GemmaNoTail<2>> tailless(unit_norm<2>(), MockAttention{}, unit_norm<2>(), unit_norm<2>(), GeluGatedMLP<2, 2>(zero_linear<2, 2>(), zero_linear<2, 2>(), zero_linear<2, 2>()), unit_norm<2>(), GemmaNoTail<2>{});
-        Vec<2> plain = tailless.forward(x, NoLayerInput{}, [](const MockAttention&, VecView<2>) { return Vec<2>{}; });
-        check(plain[0] == 3 && plain[1] == -4, "a layer with no PLE tail returns the FF residual unscaled");
+        // 12B's tail types: a scalar-only tail, and no tail at all.
+        Vec<2> scaled = GemmaLayerScaleTail<2>(2.f)(x());
+        check(scaled[0] == 6 && scaled[1] == -8, "a PLE-free size still applies layer_output_scale");
+        Vec<2> plain = GemmaNoTail<2>{}(x());
+        check(plain[0] == 3 && plain[1] == -4, "a layer with no tail returns the FF residual unscaled");
         check(sizeof(GemmaDenseDecoderLayer<2, 2, MockAttention, GemmaNoTail<2>>) < sizeof(GemmaDenseDecoderLayer<2, 2, MockAttention, GemmaPerLayerTail<2, 1>>), "the absent tail costs no space");
     }
 

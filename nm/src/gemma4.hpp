@@ -374,53 +374,24 @@ private:
     Scalar scale_;
 };
 
-// One concrete Gemma decoder layer. The equation intentionally lives here:
-// attention communication, channel mixing, and the optional PLE tail are model
-// anatomy rather than a compile-time assembly of generic branch aliases.
+// One concrete Gemma decoder layer: the seven weight objects a layer owns, in
+// the order the equation applies them, and nothing else. There is deliberately
+// no forward() here. The layer cannot run itself — evaluating attention needs
+// the cache, RoPE table and window, which belong to the architecture's schedule
+// and not to any weight — so a forward() here would need a callback punched
+// through its middle. Each Gemma size writes the equation out in its own
+// forward_layer() instead, where the attention call can just be a call.
+//
+// Members are public and this is an aggregate: it is data.
 template <size_t D, size_t FF, class Attention, class Tail>
-class GemmaDenseDecoderLayer {
-public:
-    GemmaDenseDecoderLayer(RMSNorm<D> attention_norm, Attention attention_weights, RMSNorm<D> post_attention_norm, RMSNorm<D> ffn_norm, GeluGatedMLP<D, FF> ffn_weights, RMSNorm<D> post_ffn_norm, Tail tail) : attention_norm_(std::move(attention_norm)), attention_weights_(std::move(attention_weights)), post_attention_norm_(std::move(post_attention_norm)), ffn_norm_(std::move(ffn_norm)), ffn_weights_(std::move(ffn_weights)), post_ffn_norm_(std::move(post_ffn_norm)), tail_(std::move(tail)) {}
-
-    template <class TailInput, class EvaluateAttention>
-    Vec<D> forward(VecView<D> X, const TailInput& tail_input, EvaluateAttention&& evaluate_attention) const {
-        Vec<D> U = attention_norm_(X);
-        Vec<D> A = std::forward<EvaluateAttention>(evaluate_attention)(attention_weights_, VecView<D>(U));
-        A = post_attention_norm_(A);
-        A += X;
-        Vec<D> H = std::move(A);
-
-        Vec<D> Z = ffn_norm_(H);
-        Vec<D> F = ffn_weights_(Z);
-        F = post_ffn_norm_(F);
-        F += H;
-
-        return tail_(std::move(F), tail_input);
-    }
-
-    template <class TailInput, class EvaluateAttention>
-    Matrix<D> forward(MatrixView<D> X, const TailInput& tail_input, EvaluateAttention&& evaluate_attention) const {
-        Matrix<D> U = attention_norm_(X);
-        Matrix<D> A = std::forward<EvaluateAttention>(evaluate_attention)(attention_weights_, U.view());
-        A = post_attention_norm_(A);
-        Matrix<D> H = add(X, A.view());
-
-        Matrix<D> Z = ffn_norm_(H.view());
-        Matrix<D> F = ffn_weights_(Z.view());
-        F = post_ffn_norm_(F);
-        H = add(H.view(), F.view());
-
-        return tail_(std::move(H), tail_input);
-    }
-
-private:
-    RMSNorm<D> attention_norm_;
-    Attention attention_weights_;
-    RMSNorm<D> post_attention_norm_;
-    RMSNorm<D> ffn_norm_;
-    GeluGatedMLP<D, FF> ffn_weights_;
-    RMSNorm<D> post_ffn_norm_;
-    [[no_unique_address]] Tail tail_;
+struct GemmaDenseDecoderLayer {
+    RMSNorm<D> attention_norm;
+    Attention attention;
+    RMSNorm<D> post_attention_norm;
+    RMSNorm<D> ffn_norm;
+    GeluGatedMLP<D, FF> ffn;
+    RMSNorm<D> post_ffn_norm;
+    [[no_unique_address]] Tail tail;
 };
 
 template <size_t D, size_t V>
@@ -527,18 +498,45 @@ struct Gemma4E4BArchitecture {
 
     static PreparedInput prepare(const Weights& weights, const EmbeddedSequence<D>& input) { return weights.architecture_data()(input.matrix(), input.ple_token_identities()); }
 
-    static void forward_layer(const Weights& weights, PrefixState& prefix_state, const EmbeddedSequence<D>& input, ResidualStream<D>& residual, PreparedInput& per_layer, size_t layer_index) {
-        const auto& layer_variant = weights.layer(layer_index);
-        Matrix<C::PLE> ple = slice_columns<C::PLE>(per_layer.view(), layer_index * C::PLE);
+    // Run layer `layer_index` in place: `residual` is the only in/out, every
+    // other argument is read-only. The signature is the TransformerArchitecture
+    // contract's, not a choice — evaluate_transformer_suffix() loops the layers
+    // and hands each the same six arguments — so this function's job is to
+    // narrow the whole model down to the three things ONE layer needs:
+    //   * its weights          weights.layer(layer_index)
+    //   * its PLE columns      per_layer[:, layer_index*PLE ...]
+    //   * where it starts      input.position(0), for RoPE and the mask
+    //
+    // std::visit is the layer-kind dispatch, and the only one. GemmaE4BLayer's
+    // four alternatives are 2 head widths x 2 KV kinds, and all four are real
+    // types rather than flags: head width is a static matrix width, and a
+    // shared-KV layer has no W_k/W_v members at all. The kind is resolved once
+    // here, so the body below is monomorphic — no per-token branch on width,
+    // window, or which cache. The whole layer equation is in that body.
+    static void forward_layer(const Weights& weights, PrefixState& prefix_state, const EmbeddedSequence<D>& input, ResidualStream<D>& residual, const PreparedInput& per_layer, size_t layer_index) {
         const size_t first_position = input.position(0).i;
+        const Matrix<C::PLE> ple = slice_columns<C::PLE>(per_layer.view(), layer_index * C::PLE);
+        const MatrixView<D> X = residual.matrix();
         Matrix<D> next = std::visit(
             [&](const auto& layer) {
-                return layer.forward(residual.matrix(), ple.view(), [&](const auto& attention, MatrixView<D> normalized) {
-                    using Attention = std::decay_t<decltype(attention)>;
-                    return mix_tokens<shape_of<Attention>>(attention, normalized, prefix_state, layer_index, first_position);
-                });
+                using Shape = shape_of<std::decay_t<decltype(layer.attention)>>;
+
+                // h = x + post_norm( attn( pre_norm(x) ) )
+                Matrix<D> U = layer.attention_norm(X);
+                Matrix<D> A = gemma_attend_layer<D, C::Hq, Shape::WINDOW, typename Shape::Rope>(layer.attention, U.view(), Shape::cache(prefix_state, layer_index), first_position);
+                A = layer.post_attention_norm(A);
+                Matrix<D> H = add(X, A.view());
+
+                // h = h + post_norm( mlp( pre_norm(h) ) )
+                Matrix<D> Z = layer.ffn_norm(H.view());
+                Matrix<D> F = layer.ffn(Z.view());
+                F = layer.post_ffn_norm(F);
+                H = add(H.view(), F.view());
+
+                // h = layer_output_scale * ( h + norm( (act(h W_gate) (*) ple) W_proj ) )
+                return layer.tail(std::move(H), ple.view());
             },
-            layer_variant);
+            weights.layer(layer_index));
         residual.set_matrix(std::move(next));
     }
 
@@ -559,13 +557,13 @@ private:
         static constexpr size_t HEAD_DIM = C::LOCAL_HEAD_DIM;
         static constexpr size_t WINDOW = C::SLIDING_WINDOW;
         using Rope = LocalRope;
-        static auto& cache(PrefixState& prefix_state, size_t layer) { return prefix_state.local(layer); }
+        static KVCache<C::Hkv, HEAD_DIM>& cache(PrefixState& prefix_state, size_t layer) { return prefix_state.local(layer); }
     };
     struct FullShape {
         static constexpr size_t HEAD_DIM = C::GLOBAL_HEAD_DIM;
         static constexpr size_t WINDOW = 0;  // 0 == look back to position 0
         using Rope = GlobalRope;
-        static auto& cache(PrefixState& prefix_state, size_t layer) { return prefix_state.global(layer); }
+        static KVCache<C::Hkv, HEAD_DIM>& cache(PrefixState& prefix_state, size_t layer) { return prefix_state.global(layer); }
     };
 
     // Head width is what physically distinguishes the two shapes, so it is
@@ -575,16 +573,11 @@ private:
     template <class Attention>
     using shape_of = std::conditional_t<Attention::HEAD_DIM == C::LOCAL_HEAD_DIM, SlidingShape, FullShape>;
 
-    // Two things vary per layer, and each is resolved at compile time from a
-    // type: the Shape (head width, RoPE table, window, which cache) and the
-    // KV kind. Layers 24..41 own no K/V: they contribute no rows and attend
-    // against what layer 22 (sliding) or 23 (full) wrote earlier in this same
-    // pass, which is why cache() redirects rather than the layer holding a
-    // cache of its own. The reduction is gemma_attend_layer's.
-    template <class Shape, class Attention>
-    static Matrix<D> mix_tokens(const Attention& attention, MatrixView<D> X, PrefixState& prefix_state, size_t layer, size_t first_position) {
-        return gemma_attend_layer<D, C::Hq, Shape::WINDOW, typename Shape::Rope>(attention, X, Shape::cache(prefix_state, layer), first_position);
-    }
+    // Layers 24..41 own no K/V: they contribute no rows and attend against what
+    // layer 22 (sliding) or 23 (full) wrote earlier in this same pass, which is
+    // why cache() redirects rather than the layer holding a cache of its own.
+    // gemma_attend_layer picks the contribute-and-reduce or reduce-only path
+    // from Attention::OWNS_KV.
 };
 
 using Gemma4E4BTransformer = Transformer<Gemma4E4BArchitecture>;
@@ -720,17 +713,37 @@ struct Gemma4_12BArchitecture {
 
     static PreparedInput prepare(const Weights&, const EmbeddedSequence<D>&) { return {}; }
 
-    static void forward_layer(const Weights& weights, PrefixState& state, const EmbeddedSequence<D>& input, ResidualStream<D>& residual, PreparedInput&, size_t layer_index) {
+    // The same equation as E4B minus the PLE tail, written out here rather than
+    // shared, so that reading 12B is reading one function. What genuinely
+    // differs from E4B: no per-layer input, and the two attention kinds differ
+    // in KV head count (8 sliding, 1 global) as well as head width, so their
+    // caches are different types and the branch stays an if constexpr.
+    static void forward_layer(const Weights& weights, PrefixState& state, const EmbeddedSequence<D>& input, ResidualStream<D>& residual, const PreparedInput&, size_t layer_index) {
         const size_t first_position = input.position(0).i;
+        const MatrixView<D> X = residual.matrix();
         Matrix<D> next = std::visit(
             [&](const auto& layer) {
-                return layer.forward(residual.matrix(), NoLayerInput{}, [&](const auto& attention, MatrixView<D> normalized) {
-                    using Attention = std::decay_t<decltype(attention)>;
+                using Attention = std::decay_t<decltype(layer.attention)>;
+
+                // h = x + post_norm( attn( pre_norm(x) ) )
+                Matrix<D> U = layer.attention_norm(X);
+                Matrix<D> A = [&] {
                     if constexpr (Attention::HEAD_DIM == C::LOCAL_HEAD_DIM)
-                        return gemma_attend_layer<D, C::Hq, C::SLIDING_WINDOW, LocalRope>(attention, normalized, state.local(layer_index), first_position);
+                        return gemma_attend_layer<D, C::Hq, C::SLIDING_WINDOW, LocalRope>(layer.attention, U.view(), state.local(layer_index), first_position);
                     else
-                        return gemma_attend_layer<D, C::Hq, /*window=*/0, GlobalRope>(attention, normalized, state.global(layer_index), first_position);
-                });
+                        return gemma_attend_layer<D, C::Hq, /*window=*/0, GlobalRope>(layer.attention, U.view(), state.global(layer_index), first_position);
+                }();
+                A = layer.post_attention_norm(A);
+                Matrix<D> H = add(X, A.view());
+
+                // h = h + post_norm( mlp( pre_norm(h) ) )
+                Matrix<D> Z = layer.ffn_norm(H.view());
+                Matrix<D> F = layer.ffn(Z.view());
+                F = layer.post_ffn_norm(F);
+                H = add(H.view(), F.view());
+
+                // h = layer_output_scale * h
+                return layer.tail(std::move(H));
             },
             weights.layer(layer_index));
         residual.set_matrix(std::move(next));

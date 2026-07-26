@@ -291,7 +291,9 @@ Matrix<Hq * HeadDim> attend_and_cache(MatrixView<Hq * HeadDim> queries, MatrixVi
     if (queries.rows() != keys.rows() || keys.rows() != values.rows()) throw std::invalid_argument("attend_and_cache: Q/K/V row mismatch");
 
     if (cache.can_append_without_eviction(queries.rows())) {
-        for (size_t row = 0; row < queries.rows(); ++row) cache.append(Position{first_query_position + row}, keys.row(row), values.row(row));
+        for (size_t row = 0; row < queries.rows(); ++row) {
+            cache.append(Position{first_query_position + row}, keys.row(row), values.row(row));
+        }
         return attend<Hq, Hkv, HeadDim>(queries, cache, first_query_position, sliding_window, score_scale);
     }
 

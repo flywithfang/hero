@@ -28,124 +28,6 @@ struct AnyLayerSchedule {
     static void validate(const Layer&, size_t) {}
 };
 
-// Normalization/residual topology belongs to a branch, not to "Transformer"
-// globally.  This represents both classic Pre-Norm (NoPostTransform) and the
-// Gemma-style pre+post normalized branch without anatomy booleans.
-struct NoPostTransform {
-    template <size_t D>
-    void apply(Vec<D>&) const {}
-    template <size_t D>
-    void apply(Matrix<D>&) const {}
-};
-
-template <class Norm>
-class PostNormalize {
-public:
-    explicit PostNormalize(Norm norm) : norm_(std::move(norm)) {}
-
-    template <size_t D>
-    void apply(Vec<D>& value) const {
-        value = norm_(value);
-    }
-    template <size_t D>
-    void apply(Matrix<D>& value) const {
-        value = norm_(value);
-    }
-
-private:
-    Norm norm_;
-};
-
-template <size_t D, class InputNorm_, class Operation_, class PostTransform_ = NoPostTransform>
-class ResidualBranch {
-public:
-    using InputNorm = InputNorm_;
-    using Operation = Operation_;
-    using PostTransform = PostTransform_;
-
-    ResidualBranch(InputNorm input_norm, Operation operation, PostTransform post_transform = {}) : input_norm_(std::move(input_norm)), operation_(std::move(operation)), post_transform_(std::move(post_transform)) {}
-
-    Vec<D> normalize(VecView<D> input) const { return input_norm_(input); }
-    Matrix<D> normalize(MatrixView<D> input) const { return input_norm_(input); }
-    const Operation& operation() const { return operation_; }
-
-    template <class Runner>
-    Vec<D> finish(VecView<D> residual, VecView<D> normalized, Runner&& run) const {
-        Vec<D> branch = std::forward<Runner>(run)(operation_, normalized);
-        post_transform_.apply(branch);
-        branch += residual;
-        return branch;
-    }
-
-    template <class Runner>
-    Matrix<D> finish(MatrixView<D> residual, MatrixView<D> normalized, Runner&& run) const {
-        Matrix<D> branch = std::forward<Runner>(run)(operation_, normalized);
-        post_transform_.apply(branch);
-        return add(residual, branch.view());
-    }
-
-    template <class Runner>
-    Vec<D> forward(VecView<D> input, Runner&& run) const {
-        Vec<D> normalized = normalize(input);
-        return finish(input, normalized, std::forward<Runner>(run));
-    }
-
-    template <class Runner>
-    Matrix<D> forward(MatrixView<D> input, Runner&& run) const {
-        Matrix<D> normalized = normalize(input);
-        return finish(input, normalized.view(), std::forward<Runner>(run));
-    }
-
-private:
-    InputNorm input_norm_;
-    Operation operation_;
-    [[no_unique_address]] PostTransform post_transform_;
-};
-
-// The default tail is the identity, and it takes ownership so that a layer
-// with no architecture-specific tail work costs nothing rather than a copy.
-template <size_t D>
-struct IdentityLayerTail {
-    Vec<D> operator()(Vec<D> hidden, NoLayerInput = {}) const { return hidden; }
-    Matrix<D> operator()(Matrix<D> hidden, NoLayerInput = {}) const { return hidden; }
-};
-
-// A canonical decoder block is communication across tokens followed by a
-// per-token channel transform.  Tail represents optional architecture-specific
-// work after those branches (for example Gemma E4B's PLE residual and scale).
-template <size_t D, class TokenMixerBranch_, class ChannelMixerBranch_, class Tail_ = IdentityLayerTail<D>>
-class TransformerBlock {
-public:
-    using TokenMixerBranch = TokenMixerBranch_;
-    using ChannelMixerBranch = ChannelMixerBranch_;
-    using Tail = Tail_;
-
-    TransformerBlock(TokenMixerBranch token_mixer, ChannelMixerBranch channel_mixer, Tail tail = {}) : token_mixer_(std::move(token_mixer)), channel_mixer_(std::move(channel_mixer)), tail_(std::move(tail)) {}
-
-    const TokenMixerBranch& token_mixer_branch() const { return token_mixer_; }
-    const ChannelMixerBranch& channel_mixer_branch() const { return channel_mixer_; }
-    const Tail& tail() const { return tail_; }
-
-    template <class LayerInput, class TokenMixerRunner, class ChannelMixerRunner>
-    Vec<D> forward(VecView<D> input, const LayerInput& layer_input, TokenMixerRunner&& run_token_mixer, ChannelMixerRunner&& run_channel_mixer) const {
-        Vec<D> communicated = token_mixer_.forward(input, std::forward<TokenMixerRunner>(run_token_mixer));
-        Vec<D> transformed = channel_mixer_.forward(VecView<D>(communicated), std::forward<ChannelMixerRunner>(run_channel_mixer));
-        return tail_(std::move(transformed), layer_input);
-    }
-
-    template <class LayerInput, class TokenMixerRunner, class ChannelMixerRunner>
-    Matrix<D> forward(MatrixView<D> input, const LayerInput& layer_input, TokenMixerRunner&& run_token_mixer, ChannelMixerRunner&& run_channel_mixer) const {
-        Matrix<D> communicated = token_mixer_.forward(input, std::forward<TokenMixerRunner>(run_token_mixer));
-        Matrix<D> transformed = channel_mixer_.forward(communicated.view(), std::forward<ChannelMixerRunner>(run_channel_mixer));
-        return tail_(std::move(transformed), layer_input);
-    }
-
-private:
-    TokenMixerBranch token_mixer_;
-    ChannelMixerBranch channel_mixer_;
-    [[no_unique_address]] Tail tail_;
-};
-
 // The mutable [T,D] stream carried through the transformer stack.  Modalities
 // disappear at this boundary: text, image, and audio encoders must all produce
 // decoder-width embeddings before a ResidualStream is constructed.
@@ -253,7 +135,9 @@ Vec<Architecture::V> evaluate_transformer_suffix(const typename Architecture::We
 
     ResidualStream<Architecture::D> residual(input);
     typename Architecture::PreparedInput prepared = Architecture::prepare(weights, input);
-    for (size_t layer = 0; layer < Architecture::L; ++layer) Architecture::forward_layer(weights, prefix_state, input, residual, prepared, layer);
+    for (size_t layer = 0; layer < Architecture::L; ++layer){
+         Architecture::forward_layer(weights, prefix_state, input, residual, prepared, layer);
+    }
     Architecture::advance_prefix(prefix_state, input.tokens());
     return Architecture::output(weights, residual);
 }

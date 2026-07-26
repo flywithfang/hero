@@ -76,7 +76,6 @@ static RMSNorm<N> unit_norm() {
 static Qwen35Layer<ToyQwen> make_layer(size_t index) {
     using C = ToyQwen;
     GatedMLP<C::D, C::FF> mlp(linear_from<C::D, C::FF>(small), linear_from<C::D, C::FF>(small), linear_from<C::FF, C::D>(small));
-    ResidualBranch<C::D, RMSNorm<C::D>, GatedMLP<C::D, C::FF>> channel(unit_norm<C::D>(), std::move(mlp));
 
     if (C::is_recurrent(index)) {
         using Mixer = QwenRecurrentMixer<C>;
@@ -88,12 +87,12 @@ static Qwen35Layer<ToyQwen> make_layer(size_t index) {
                     // -exp(A_log), which is what makes exp(gate) a contraction.
                     // A positive value here makes the state grow every token.
                     Vec<C::VALUE_HEADS>{}, filled<C::VALUE_HEADS>(-1.f), PerHeadNorm<C::VALUE_HEADS, C::VALUE_HEAD_DIM, RMSNorm<C::VALUE_HEAD_DIM>>(unit_norm<C::VALUE_HEAD_DIM>()), linear_from<Mixer::VALUE_WIDTH, C::D>(small));
-        return Qwen35Block<C, Mixer>(ResidualBranch<C::D, RMSNorm<C::D>, Mixer>(unit_norm<C::D>(), std::move(mixer)), std::move(channel));
+        return Qwen35Block<C, Mixer>{unit_norm<C::D>(), std::move(mixer), unit_norm<C::D>(), std::move(mlp)};
     }
 
     using Mixer = QwenAttentionMixer<C>;
     Mixer mixer(linear_from<C::D, Mixer::GATED_QW>(small), PerHeadNorm<C::Hq, C::HEAD_DIM, RMSNorm<C::HEAD_DIM>>(unit_norm<C::HEAD_DIM>()), linear_from<C::D, Mixer::KW>(small), PerHeadNorm<C::Hkv, C::HEAD_DIM, RMSNorm<C::HEAD_DIM>>(unit_norm<C::HEAD_DIM>()), linear_from<C::D, Mixer::KW>(small), linear_from<Mixer::QW, C::D>(small));
-    return Qwen35Block<C, Mixer>(ResidualBranch<C::D, RMSNorm<C::D>, Mixer>(unit_norm<C::D>(), std::move(mixer)), std::move(channel));
+    return Qwen35Block<C, Mixer>{unit_norm<C::D>(), std::move(mixer), unit_norm<C::D>(), std::move(mlp)};
 }
 
 static Qwen35Weights<ToyQwen> make_toy_weights() {

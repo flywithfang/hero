@@ -117,14 +117,13 @@ QwenRecurrentMixer<C> load_recurrent(const GGUF& gguf, size_t layer) {
 
 template <class C>
 Qwen35Layer<C> load_layer(const GGUF& gguf, size_t layer) {
-    ResidualBranch<C::D, RMSNorm<C::D>, GatedMLP<C::D, C::FF>> channel(
-        // Named `post_attention_norm` in the checkpoint, but it is the channel
-        // mixer's INPUT norm — plain pre-norm, two norms per layer.
-        load_norm<C>(gguf, block(layer, "post_attention_norm.weight")), load_channel_mixer<C>(gguf, layer));
     RMSNorm<C::D> mixer_norm = load_norm<C>(gguf, block(layer, "attn_norm.weight"));
+    // Named `post_attention_norm` in the checkpoint, but it is the channel
+    // mixer's INPUT norm — plain pre-norm, two norms per layer.
+    auto channel_norm = [&] { return load_norm<C>(gguf, block(layer, "post_attention_norm.weight")); };
 
-    if (C::is_recurrent(layer)) return Qwen35Block<C, QwenRecurrentMixer<C>>(ResidualBranch<C::D, RMSNorm<C::D>, QwenRecurrentMixer<C>>(std::move(mixer_norm), load_recurrent<C>(gguf, layer)), std::move(channel));
-    return Qwen35Block<C, QwenAttentionMixer<C>>(ResidualBranch<C::D, RMSNorm<C::D>, QwenAttentionMixer<C>>(std::move(mixer_norm), load_attention<C>(gguf, layer)), std::move(channel));
+    if (C::is_recurrent(layer)) return Qwen35Block<C, QwenRecurrentMixer<C>>{std::move(mixer_norm), load_recurrent<C>(gguf, layer), channel_norm(), load_channel_mixer<C>(gguf, layer)};
+    return Qwen35Block<C, QwenAttentionMixer<C>>{std::move(mixer_norm), load_attention<C>(gguf, layer), channel_norm(), load_channel_mixer<C>(gguf, layer)};
 }
 
 template <class C>

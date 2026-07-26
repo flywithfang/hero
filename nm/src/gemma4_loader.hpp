@@ -88,7 +88,7 @@ GemmaE4BDenseLayer<Attention> load_dense_layer(const GGUF& gguf, size_t layer, A
     GeluGatedMLP<C::D, C::FF> mlp(Linear<C::D, C::FF>(tensor_loader::load_weight<C::D, C::FF>(gguf, block(layer, "ffn_gate.weight"))), Linear<C::D, C::FF>(tensor_loader::load_weight<C::D, C::FF>(gguf, block(layer, "ffn_up.weight"))), Linear<C::FF, C::D>(tensor_loader::load_weight<C::FF, C::D>(gguf, block(layer, "ffn_down.weight"))));
     GemmaPerLayerResidual<C::D, C::PLE> ple(Linear<C::D, C::PLE>(tensor_loader::load_weight<C::D, C::PLE>(gguf, block(layer, "inp_gate.weight"))), Linear<C::PLE, C::D>(tensor_loader::load_weight<C::PLE, C::D>(gguf, block(layer, "proj.weight"))), norm("post_norm.weight"));
 
-    return GemmaE4BDenseLayer<Attention>(norm("attn_norm.weight"), std::move(attention), norm("post_attention_norm.weight"), norm("ffn_norm.weight"), std::move(mlp), norm("post_ffw_norm.weight"), GemmaPerLayerTail<C::D, C::PLE>(std::move(ple), optional_scalar(gguf, block(layer, "layer_output_scale.weight"), 1.f)));
+    return GemmaE4BDenseLayer<Attention>{norm("attn_norm.weight"), std::move(attention), norm("post_attention_norm.weight"), norm("ffn_norm.weight"), std::move(mlp), norm("post_ffw_norm.weight"), GemmaPerLayerTail<C::D, C::PLE>(std::move(ple), optional_scalar(gguf, block(layer, "layer_output_scale.weight"), 1.f))};
 }
 
 inline GemmaE4BLayer load_layer(const GGUF& gguf, size_t layer) {
@@ -175,9 +175,9 @@ template <class Attention>
 Gemma12BDenseLayer<Attention> load_12b_dense_layer(const GGUF& gguf, size_t layer, Attention attention) {
     auto norm = [&](const char* suffix) { return RMSNorm<C12::D>(tensor_loader::load_vector<C12::D>(gguf, block(layer, suffix)), C12::RMS_EPS); };
     GeluGatedMLP<C12::D, C12::FF> mlp(Linear<C12::D, C12::FF>(tensor_loader::load_weight<C12::D, C12::FF>(gguf, block(layer, "ffn_gate.weight"))), Linear<C12::D, C12::FF>(tensor_loader::load_weight<C12::D, C12::FF>(gguf, block(layer, "ffn_up.weight"))), Linear<C12::FF, C12::D>(tensor_loader::load_weight<C12::FF, C12::D>(gguf, block(layer, "ffn_down.weight"))));
-    return Gemma12BDenseLayer<Attention>(norm("attn_norm.weight"), std::move(attention), norm("post_attention_norm.weight"), norm("ffn_norm.weight"), std::move(mlp), norm("post_ffw_norm.weight"),
+    return Gemma12BDenseLayer<Attention>{norm("attn_norm.weight"), std::move(attention), norm("post_attention_norm.weight"), norm("ffn_norm.weight"), std::move(mlp), norm("post_ffw_norm.weight"),
                                          // No PLE, but the per-layer output scalar is still present.
-                                         GemmaLayerScaleTail<C12::D>(optional_scalar(gguf, block(layer, "layer_output_scale.weight"), 1.f)));
+                                         GemmaLayerScaleTail<C12::D>(optional_scalar(gguf, block(layer, "layer_output_scale.weight"), 1.f))};
 }
 
 inline Gemma12BLayer load_12b_layer(const GGUF& gguf, size_t layer) {

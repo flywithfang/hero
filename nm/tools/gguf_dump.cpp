@@ -5,6 +5,7 @@
 //   gguf_dump model.gguf            full dump
 //   gguf_dump model.gguf --tensors  tensor table only
 //   gguf_dump model.gguf --meta     metadata only
+//   gguf_dump model.gguf --values NAME [N]   first N values of one tensor
 #include "../src/gguf.hpp"
 #include <cstdio>
 #include <string>
@@ -65,8 +66,31 @@ static void print_value(const GGUFValue& v) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: %s model.gguf [--tensors|--meta]\n", argv[0]); return 2; }
+    if (argc < 2) {
+        std::fprintf(stderr,
+            "usage: %s model.gguf [--tensors|--meta|--values NAME [N]]\n", argv[0]);
+        return 2;
+    }
     std::string mode = argc > 2 ? argv[2] : "";
+    if (mode == "--values") {
+        if (argc < 4) { std::fprintf(stderr, "--values needs a tensor name\n"); return 2; }
+        try {
+            GGUF g(argv[1]);
+            const TensorInfo& t = g.require(argv[3]);
+            const size_t want = argc > 4 ? std::stoul(argv[4]) : 16;
+            const size_t n = std::min(want, size_t(t.nelem()));
+            std::vector<Scalar> values(t.nelem());
+            dequant_to_f32(t.type, t.data, values.data(), t.nelem());
+            std::printf("%s  %s  nelem=%zu\n", argv[3], gt_name(t.type),
+                        size_t(t.nelem()));
+            for (size_t i = 0; i < n; ++i)
+                std::printf("  [%zu] %.9g\n", i, double(values[i]));
+            return 0;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "error: %s\n", e.what());
+            return 1;
+        }
+    }
     try {
         GGUF g(argv[1]);
         std::printf("GGUF version %u   alignment %llu   %zu tensors   %zu metadata keys\n",

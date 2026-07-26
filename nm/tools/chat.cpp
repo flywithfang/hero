@@ -1,12 +1,11 @@
 // chat.cpp — model-neutral interactive chat over GGUF models.
 //
-// Model selection is metadata-driven. The REPL speaks only to ChatModel;
-// Llama and Gemma adapters own their templates, caches, sampling and optional
-// modality encoders.
-#include "src/chat_models.hpp"
-#include "src/image_io.hpp"
+// Model selection is metadata-driven. The REPL speaks only to ChatModel; each
+// family adapter owns its template, prefix memoization, sampling, and any
+// modality encoder.
+#include "../src/chat_models.hpp"
+#include "../src/image_io.hpp"
 #include <cstdio>
-#include <ctime>
 #include <iostream>
 #include <optional>
 
@@ -20,22 +19,15 @@ struct Opts {
     size_t max_new = 1024;
 };
 
-static std::string llama_default_system() {
-    char date[32];
-    std::time_t now = std::time(nullptr);
-    std::strftime(date, sizeof date, "%d %b %Y", std::localtime(&now));
-    return std::string("Cutting Knowledge Date: December 2023\nToday Date: ") +
-           date + "\n\n";
-}
-
 static std::optional<ChatModelKind> requested_kind(const Opts& options,
                                                     const GGUF& gguf) {
     if (options.arch.empty()) return detect_chat_model(chat_model_identity(gguf));
-    if (options.arch == "1b") return ChatModelKind::Llama32_1B;
-    if (options.arch == "3b") return ChatModelKind::Llama32_3B;
-    if (options.arch == "8b") return ChatModelKind::Llama3_8B;
     if (options.arch == "e4b" || options.arch == "gemma4-e4b")
         return ChatModelKind::Gemma4E4B;
+    if (options.arch == "12b" || options.arch == "gemma4-12b")
+        return ChatModelKind::Gemma4_12B;
+    if (options.arch == "qwen35-4b") return ChatModelKind::Qwen35_4B;
+    if (options.arch == "qwen35-9b") return ChatModelKind::Qwen35_9B;
     return std::nullopt;
 }
 
@@ -49,29 +41,29 @@ static std::unique_ptr<ChatModel> load_chat_model(const GGUF& gguf, const Opts& 
     }
 
     if (*kind != ChatModelKind::Gemma4E4B && !options.mmproj.empty())
-        throw std::invalid_argument("--mmproj is only supported by a multimodal model adapter");
+        throw std::invalid_argument(
+            "--mmproj is only supported by a multimodal model adapter");
 
-    const std::string llama_system = options.system.value_or(llama_default_system());
-    const std::string gemma_system = options.system.value_or("");
     switch (*kind) {
-        case ChatModelKind::Llama32_1B:
-            return std::make_unique<LlamaChatModel<Llama32_1B>>(
-                gguf, llama_system, options.sampling);
-        case ChatModelKind::Llama32_3B:
-            return std::make_unique<LlamaChatModel<Llama32_3B>>(
-                gguf, llama_system, options.sampling);
-        case ChatModelKind::Llama3_8B:
-            return std::make_unique<LlamaChatModel<Llama3_8B>>(
-                gguf, llama_system, options.sampling);
         case ChatModelKind::Gemma4E4B:
             return std::make_unique<Gemma4E4BChatModel>(
-                gguf, options.mmproj, gemma_system, options.sampling);
+                gguf, options.mmproj, options.system.value_or(""),
+                options.sampling);
+        case ChatModelKind::Gemma4_12B:
+            return make_gemma4_12b_chat_model(
+                gguf, options.system.value_or(""), options.sampling);
+        case ChatModelKind::Qwen35_4B:
+            return make_qwen35_chat_model<Qwen35_4BConfig>(
+                gguf, options.system.value_or(""), options.sampling, "4B");
+        case ChatModelKind::Qwen35_9B:
+            return make_qwen35_chat_model<Qwen35_9BConfig>(
+                gguf, options.system.value_or(""), options.sampling, "9B");
     }
     throw std::logic_error("unreachable chat model kind");
 }
 
 static void print_help(bool images) {
-    std::printf("  /reset       clear the conversation and KV cache\n"
+    std::printf("  /reset       clear the conversation and prefix cache\n"
                 "  /stats       show context and cumulative throughput\n"
                 "  /help        show this help\n"
                 "  /quit        exit\n");
@@ -116,7 +108,7 @@ static int chat_loop(ChatModel& model, const Opts& options) {
         if (line.rfind("/image", 0) == 0 &&
             (line.size() == 6 || std::isspace(static_cast<unsigned char>(line[6])))) {
             if (!model.supports_images()) {
-                std::printf("[this session has no image encoder; start Gemma with --mmproj]\n");
+                std::printf("[this model has no image encoder; start Gemma with --mmproj]\n");
                 continue;
             }
             size_t begin = 6;
@@ -155,7 +147,7 @@ static int chat_loop(ChatModel& model, const Opts& options) {
             pending_image.clear();
             if (result.truncated)
                 std::printf("\n[response truncated at --max %zu tokens]", options.max_new);
-            std::printf("\n\x1b[2m[ Prompt: %zu tok, %.1f t/s | Cache: %zu tok"
+            std::printf("\n\x1b[2m[ Prompt: %zu tok, %.1f t/s | Prefix: %zu tok"
                         " | Generation: %zu tok, %.1f t/s",
                         result.delta.prefill_tokens, result.delta.prefill_tps(),
                         model.context_used(), result.delta.generated_tokens,
@@ -176,7 +168,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
             "usage: %s model.gguf [--mmproj FILE] [--image FILE] [--system S]\n"
             "          [--temp T] [--top-k K] [--top-p P] [--rep-penalty R]\n"
-            "          [--seed S] [--max N] [--arch 1b|3b|8b|e4b]\n", argv[0]);
+            "          [--seed S] [--max N] [--arch e4b|12b|qwen35-4b|qwen35-9b]\n", argv[0]);
         return 2;
     }
 
@@ -216,7 +208,7 @@ int main(int argc, char** argv) {
                      identity.block_count, gguf.tensors().size(), nm_num_threads());
         std::unique_ptr<ChatModel> model = load_chat_model(gguf, options);
         if (!options.initial_image.empty() && !model->supports_images())
-            throw std::invalid_argument("--image requires a Gemma session with --mmproj");
+            throw std::invalid_argument("--image requires a Gemma model with --mmproj");
         return chat_loop(*model, options);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "error: %s\n", error.what());

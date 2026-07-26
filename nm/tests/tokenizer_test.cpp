@@ -1,6 +1,7 @@
 // tokenizer_test — reads lines from stdin, prints "id id ..." per line using
-// our Tokenizer (encode with add_bos=false, parse_special=true). Diff against
-// scratchpad/ref_tokenize (llama.cpp) over a corpus to check GATE M2a parity.
+// our Tokenizer (encode with add_bos=false, parse_special=true). --roundtrip
+// checks decode(encode(x)) == x instead; tools/tokenizer_parity.py diffs the
+// printed ids against llama-tokenize on the same vocab, which is the real gate.
 //   tokenizer_test vocab.gguf [--roundtrip]
 #include "../src/tokenizer.hpp"
 #include <cstdio>

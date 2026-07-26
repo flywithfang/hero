@@ -63,6 +63,7 @@ bool in_ranges(uint32_t cp, const uint32_t (*r)[2], size_t n) {
 }
 bool is_letter(uint32_t cp) { return in_ranges(cp, nm_letter_ranges, nm_letter_ranges_n); }
 bool is_number(uint32_t cp) { return in_ranges(cp, nm_number_ranges, nm_number_ranges_n); }
+bool is_mark(uint32_t cp) { return in_ranges(cp, nm_mark_ranges, nm_mark_ranges_n); }
 bool is_ws(uint32_t cp) {
     for (size_t i = 0; i < nm_whitespace_n; ++i) if (nm_whitespace_set[i]==cp) return true;
     return false;
@@ -76,9 +77,14 @@ Tokenizer::Tokenizer(const GGUF& g) {
     const std::string tokenizer_model = g.get_str("tokenizer.ggml.model", "");
     const std::string tokenizer_pre = g.get_str("tokenizer.ggml.pre", "");
     if (tokenizer_model == "gemma4" || tokenizer_pre == "gemma4") {
-        pretokenizer_ = Pretokenizer::Gemma4;
+        pretokenizer_ = Pretokenizer::Sentence;
         byte_encode_ = false;
         ignore_merges_ = false;
+    } else if (tokenizer_pre == "qwen35") {
+        // Qwen 3.5 splits every digit into its own piece and lets combining
+        // marks continue a word; everything else matches the GPT-2 scanner.
+        word_split_.max_digit_run = 1;
+        word_split_.marks_join_letters = true;
     }
     if (g.has("tokenizer.ggml.ignore_merges"))
         ignore_merges_ = g.get_int("tokenizer.ggml.ignore_merges", ignore_merges_) != 0;
@@ -106,28 +112,27 @@ Tokenizer::Tokenizer(const GGUF& g) {
         int32_t ty = i < (int32_t)token_type_.size() ? token_type_[i] : 1;
         if (ty == 3 || ty == 4) special_[toks[i]] = i;
     }
-    bos_ = (int32_t)g.get_int("tokenizer.ggml.bos_token_id", 128000);
-    eos_ = (int32_t)g.get_int("tokenizer.ggml.eos_token_id", 128001);
-    auto it = special_.find("<|eot_id|>");
-    eot_ = it != special_.end() ? it->second : eos_;
+    bos_ = (int32_t)g.get_int("tokenizer.ggml.bos_token_id", -1);
+    eos_ = (int32_t)g.get_int("tokenizer.ggml.eos_token_id", -1);
 }
 
 bool Tokenizer::is_eog(int32_t id) const {
-    if (id == eos_ || id == eot_) return true;
-    // Text-surface fallbacks mirror llama.cpp's EOG classification. Gemma 4
-    // carries <turn|> and tool-response terminators without dedicated GGUF ids.
-    for (const char* s : {"<|end_of_text|>", "<|eom_id|>", "<eos>",
-                          "<turn|>", "<|tool_response>"}) {
+    if (id == eos_) return true;
+    // Text-surface fallbacks mirror llama.cpp's EOG classification: a family
+    // may terminate a turn with a token that is not the GGUF's eos id. Gemma 4
+    // uses <turn|> and a tool-response terminator, Qwen uses <|im_end|>.
+    for (const char* s : {"<eos>", "<turn|>", "<|tool_response>",
+                          "<|im_end|>", "<|endoftext|>"}) {
         auto it = special_.find(s); if (it != special_.end() && it->second == id) return true;
     }
     return false;
 }
 
-// ================= llama3 pre-tokenizer (hand-rolled, trap T3) ==============
+// ============ pre-tokenizer (hand-rolled scanner, trap T3) =================
 std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
-    if (pretokenizer_ == Pretokenizer::Gemma4) {
-        // SPM-style BPE: spaces become U+2581, then merges operate over each
-        // maximal newline/non-newline run without word-level splitting.
+    if (pretokenizer_ == Pretokenizer::Sentence) {
+        // Sentence dialect: spaces become U+2581, then merges operate over
+        // each maximal newline/non-newline run with no word-level splitting.
         std::string escaped;
         escaped.reserve(text.size());
         for (char ch : text) {
@@ -151,8 +156,14 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
     const size_t N = cp.size();
     std::vector<std::pair<size_t,size_t>> spans;   // [ini,end) in codepoints
 
+    const bool marks_join = word_split_.marks_join_letters;
+    const size_t max_digits = word_split_.max_digit_run;
+
     auto in = [&](size_t p){ return p < N; };
-    auto L  = [&](size_t p){ return in(p) && is_letter(cp[p]); };
+    // L is the "word continues" class: \p{L}, or [\p{L}\p{M}] on a vocab whose
+    // regex lets combining marks stay attached to their base letter.
+    auto L  = [&](size_t p){ return in(p) && (is_letter(cp[p]) ||
+                                              (marks_join && is_mark(cp[p]))); };
     auto Nn = [&](size_t p){ return in(p) && is_number(cp[p]); };
     auto W  = [&](size_t p){ return in(p) && is_ws(cp[p]); };
     auto C  = [&](size_t p)->uint32_t{ return in(p) ? cp[p] : 0xFFFFFFFF; };
@@ -172,14 +183,15 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
                 if ((n1=='r'&&n2=='e')||(n1=='v'&&n2=='e')||(n1=='l'&&n2=='l')) { pos += 3; emit(pos); continue; }
             }
         }
-        // [^\r\n\p{L}\p{N}]?\p{L}+
+        // [^\r\n\p{L}\p{N}]?\p{L}+   (L may include \p{M}; the optional prefix
+        // character is excluded by letter/number only, in either dialect)
         if (!(c=='\r'||c=='\n'||is_number(c))) {
             if (L(pos) || L(pos+1)) { pos++; while (L(pos)) pos++; emit(pos); continue; }
         }
-        // \p{N}{1,3}
+        // \p{N}{1,max_digits}
         if (is_number(c)) {
             size_t ini = pos;
-            while (Nn(pos)) { if (++pos - ini >= 3) { emit(pos); ini = pos; } }
+            while (Nn(pos)) { if (++pos - ini >= max_digits) { emit(pos); ini = pos; } }
             emit(pos); continue;
         }
         // <space>?[^\s\p{L}\p{N}]+[\r\n]*
@@ -221,7 +233,7 @@ std::vector<int32_t> Tokenizer::bpe_encode_chunk(const std::string& piece) const
             std::string s; utf8_append(s, remap().byte_to_cp[b]); sym.push_back(std::move(s));
         }
     } else {
-        // Gemma 4 mode: initial symbols are raw UTF-8 codepoints.
+        // Sentence mode: initial symbols are raw UTF-8 codepoints.
         std::vector<uint32_t> cps; std::vector<size_t> offsets;
         utf8_decode(piece, cps, offsets);
         sym.reserve(cps.size());
@@ -230,7 +242,8 @@ std::vector<int32_t> Tokenizer::bpe_encode_chunk(const std::string& piece) const
     }
     if (sym.empty()) return {};
 
-    // ignore_merges (Llama 3): whole pre-token already in vocab wins directly.
+    // ignore_merges: a pre-token already present in the vocab wins directly,
+    // without ever consulting the merge table.
     std::string whole; for (auto& s : sym) whole += s;
     if (ignore_merges_) if (int32_t w = id_of(whole); w >= 0) return { w };
 
@@ -305,7 +318,7 @@ std::string Tokenizer::decode1(int32_t id) const {
     if (ty == 3) return "";                    // control tokens render as nothing
     const std::string& t = id_to_tok_[id];
     if (!byte_encode_) {
-        // Gemma byte fallbacks have literal <0xXX> surfaces.
+        // Sentence-dialect byte fallbacks have literal <0xXX> surfaces.
         if (t.size() == 6 && t[0] == '<' && t[1] == '0' && t[2] == 'x' && t[5] == '>') {
             auto nibble = [](char c) -> int {
                 if ('0' <= c && c <= '9') return c - '0';
@@ -337,18 +350,4 @@ std::string Tokenizer::decode1(int32_t id) const {
 }
 std::string Tokenizer::decode(const std::vector<int32_t>& ids) const {
     std::string out; for (int32_t id : ids) out += decode1(id); return out;
-}
-
-// ================= Llama-3 chat template ===================================
-std::vector<int32_t> Tokenizer::chat_user_turn(const std::string& user, bool first,
-                                               const std::string& system) const {
-    std::string s;
-    if (first) {
-        s += "<|begin_of_text|>";
-        if (!system.empty())
-            s += "<|start_header_id|>system<|end_header_id|>\n\n" + system + "<|eot_id|>";
-    }
-    s += "<|start_header_id|>user<|end_header_id|>\n\n" + user + "<|eot_id|>";
-    s += "<|start_header_id|>assistant<|end_header_id|>\n\n";
-    return encode(s, /*add_bos=*/false, /*parse_special=*/true);
 }

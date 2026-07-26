@@ -10,14 +10,16 @@
 namespace {
 
 EmbeddingSegment<Gemma4E4BTextConfig::D> text_segment(
-    const Gemma4E4BTextModel& model, const std::vector<int32_t>& ids) {
+    const Gemma4E4BTextWeights& weights,
+    const std::vector<int32_t>& ids) {
     if (ids.empty()) throw std::invalid_argument("empty text segment");
     TokenMatrix<Gemma4E4BTextConfig::D> embeddings(ids.size());
     std::vector<TokenId> identities;
     identities.reserve(ids.size());
     for (size_t i = 0; i < ids.size(); ++i) {
         identities.push_back(TokenId{ids[i]});
-        embeddings.set_row(i, model.token_io().token(TokenId{ids[i]}));
+        embeddings.set_row(
+            i, weights.token_io().token(TokenId{ids[i]}));
     }
     return EmbeddingSegment<Gemma4E4BTextConfig::D>(
         std::move(embeddings), std::move(identities));
@@ -41,7 +43,8 @@ int main(int argc, char** argv) {
         GGUF text_gguf(argv[1]);
         GGUF vision_gguf(argv[2]);
         Tokenizer tokenizer(text_gguf);
-        auto text_model = gemma4_loader::load_e4b_text(text_gguf);
+        auto transformer =
+            gemma4_loader::load_e4b_text(text_gguf);
         auto vision_model = gemma4_vision_loader::load_e4b_vision(vision_gguf);
         RGBImage image = load_rgb_image(argv[3]);
 
@@ -57,15 +60,17 @@ int main(int argc, char** argv) {
         auto prefix_ids = tokenizer.encode(prefix, /*add_bos=*/true, /*parse_special=*/true);
         auto suffix_ids = tokenizer.encode(suffix, /*add_bos=*/false, /*parse_special=*/true);
         std::vector<EmbeddingSegment<Gemma4E4BTextConfig::D>> segments;
-        segments.push_back(text_segment(text_model, prefix_ids));
+        segments.push_back(
+            text_segment(transformer.weights(), prefix_ids));
         const size_t image_tokens = image_segment.embeddings().rows();
         segments.push_back(std::move(image_segment));
-        segments.push_back(text_segment(text_model, suffix_ids));
+        segments.push_back(
+            text_segment(transformer.weights(), suffix_ids));
         auto sequence = compose_embeddings(std::move(segments));
 
-        AutoregressiveRuntime<Gemma4E4BArchitecture> runtime(text_model);
+        PrefixCache<Gemma4E4BArchitecture> memo;
         const auto text_start = std::chrono::steady_clock::now();
-        auto logits = runtime.forward(sequence);
+        auto logits = transformer(sequence, memo);
         const double text_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - text_start).count();
 
@@ -79,7 +84,10 @@ int main(int argc, char** argv) {
             std::printf(" %zu", token);
             answer += tokenizer.decode1(int32_t(token));
             if (tokenizer.is_eog(int32_t(token))) break;
-            logits = runtime.step(TokenId{int32_t(token)});
+            std::vector<int32_t> generated{int32_t(token)};
+            sequence.append(
+                text_segment(transformer.weights(), generated));
+            logits = transformer(sequence, memo);
         }
         std::printf("\nanswer: %s\n", answer.c_str());
         return 0;

@@ -17,7 +17,7 @@
 // ggml_type values (ggml.h) — only the subset this engine reads.
 enum class GT : uint32_t {
     F32 = 0, F16 = 1, Q4_0 = 2, Q8_0 = 8,
-    Q4_K = 12, Q6_K = 14, BF16 = 30,
+    Q4_K = 12, Q5_K = 13, Q6_K = 14, BF16 = 30,
 };
 
 inline const char* gt_name(GT t) {
@@ -25,7 +25,8 @@ inline const char* gt_name(GT t) {
         case GT::F32: return "F32"; case GT::F16: return "F16";
         case GT::BF16: return "BF16";
         case GT::Q4_0: return "Q4_0"; case GT::Q8_0: return "Q8_0";
-        case GT::Q4_K: return "Q4_K"; case GT::Q6_K: return "Q6_K";
+        case GT::Q4_K: return "Q4_K"; case GT::Q5_K: return "Q5_K";
+        case GT::Q6_K: return "Q6_K";
     }
     return "UNKNOWN";
 }
@@ -37,11 +38,14 @@ constexpr size_t QK4_0 = 32, QK8_0 = 32, QK_K = 256, K_SCALE_SIZE = 12;
 struct block_q4_0 { uint16_t d;               uint8_t qs[QK4_0 / 2]; };      // 18
 struct block_q8_0 { uint16_t d;               int8_t  qs[QK8_0];     };      // 34
 struct block_q4_K { uint16_t d, dmin; uint8_t scales[K_SCALE_SIZE]; uint8_t qs[QK_K / 2]; }; // 144
+// Q5_K is Q4_K plus one high bit per weight, carried in a separate plane.
+struct block_q5_K { uint16_t d, dmin; uint8_t scales[K_SCALE_SIZE]; uint8_t qh[QK_K / 8]; uint8_t qs[QK_K / 2]; }; // 176
 struct block_q6_K { uint8_t ql[QK_K / 2]; uint8_t qh[QK_K / 4]; int8_t scales[QK_K / 16]; uint16_t d; }; // 210
 #pragma pack(pop)
 static_assert(sizeof(block_q4_0) == 18);
 static_assert(sizeof(block_q8_0) == 34);
 static_assert(sizeof(block_q4_K) == 144);
+static_assert(sizeof(block_q5_K) == 176);
 static_assert(sizeof(block_q6_K) == 210);
 
 // bytes for a tensor of `nelem` elements stored as type t (nelem % blocklen==0).
@@ -52,6 +56,7 @@ inline size_t type_size_bytes(GT t, size_t nelem) {
         case GT::Q4_0: return nelem / QK4_0 * sizeof(block_q4_0);
         case GT::Q8_0: return nelem / QK8_0 * sizeof(block_q8_0);
         case GT::Q4_K: return nelem / QK_K  * sizeof(block_q4_K);
+        case GT::Q5_K: return nelem / QK_K  * sizeof(block_q5_K);
         case GT::Q6_K: return nelem / QK_K  * sizeof(block_q6_K);
     }
     throw std::runtime_error("type_size_bytes: unknown type");
@@ -60,7 +65,7 @@ inline size_t block_len(GT t) {
     switch (t) {
         case GT::F32: case GT::F16: case GT::BF16: return 1;
         case GT::Q4_0: return QK4_0; case GT::Q8_0: return QK8_0;
-        case GT::Q4_K: case GT::Q6_K: return QK_K;
+        case GT::Q4_K: case GT::Q5_K: case GT::Q6_K: return QK_K;
     }
     return 1;
 }
@@ -133,6 +138,33 @@ inline Scalar dot_block_q4_K(const block_q4_K& b, const Scalar* xb) {
     return acc;
 #endif
 }
+// Q5_K: the same 6-bit scale/min structure as Q4_K, with a fifth bit per
+// weight taken from the qh plane. Bit (2*sub) of qh[l] belongs to the low
+// nibble of sub-block pair `sub`, bit (2*sub+1) to the high nibble — which is
+// what the u1/u2 shifting below tracks.
+inline Scalar dot_block_q5_K(const block_q5_K& b, const Scalar* xb) {
+    const Scalar d = fp16_to_fp32(b.d), mn = fp16_to_fp32(b.dmin);
+    const uint8_t* ql = b.qs;
+    const uint8_t* qh = b.qh;
+    const Scalar* x = xb;
+    int is = 0;
+    uint8_t u1 = 1, u2 = 2;
+    Scalar acc = 0;
+    for (int j = 0; j < (int)QK_K; j += 64) {
+        uint8_t sc, m;
+        get_scale_min_k4(is + 0, b.scales, sc, m);
+        const Scalar d1 = d * sc, m1 = mn * m;
+        get_scale_min_k4(is + 1, b.scales, sc, m);
+        const Scalar d2 = d * sc, m2 = mn * m;
+        for (int l = 0; l < 32; ++l)
+            acc += (d1 * Scalar((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1) * *x++;
+        for (int l = 0; l < 32; ++l)
+            acc += (d2 * Scalar((ql[l] >>  4) + ((qh[l] & u2) ? 16 : 0)) - m2) * *x++;
+        ql += 32; is += 2; u1 <<= 2; u2 <<= 2;
+    }
+    return acc;
+}
+
 #if defined(__ARM_NEON)
 // build 16 int8 Q6 values: (nib | (((qh>>Shift)&3)<<4)) - 32.
 template <int Shift>
@@ -237,6 +269,28 @@ inline void dequant_to_f32(GT t, const void* src, Scalar* dst, size_t n) {
             }
             return;
         }
+        case GT::Q5_K: {
+            const block_q5_K* b = (const block_q5_K*)src;
+            Scalar* y = dst;
+            for (size_t i = 0; i < n / QK_K; ++i) {
+                const Scalar d = fp16_to_fp32(b[i].d), mn = fp16_to_fp32(b[i].dmin);
+                const uint8_t* ql = b[i].qs; const uint8_t* qh = b[i].qh;
+                int is = 0; uint8_t u1 = 1, u2 = 2;
+                for (int j = 0; j < (int)QK_K; j += 64) {
+                    uint8_t sc, m;
+                    get_scale_min_k4(is + 0, b[i].scales, sc, m);
+                    const Scalar d1 = d * sc, m1 = mn * m;
+                    get_scale_min_k4(is + 1, b[i].scales, sc, m);
+                    const Scalar d2 = d * sc, m2 = mn * m;
+                    for (int l = 0; l < 32; ++l)
+                        *y++ = d1 * ((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1;
+                    for (int l = 0; l < 32; ++l)
+                        *y++ = d2 * ((ql[l] >>  4) + ((qh[l] & u2) ? 16 : 0)) - m2;
+                    ql += 32; is += 2; u1 <<= 2; u2 <<= 2;
+                }
+            }
+            return;
+        }
         case GT::Q6_K: {
             const block_q6_K* b = (const block_q6_K*)src;
             Scalar* y = dst;
@@ -327,6 +381,13 @@ public:
     // divisibility (In % QK == 0) for quantised tensors is checked at load
     // time, not statically — F32 tensors like FF=172 are legal.
     Vec<Out> matvec(VecView<In> x) const;
+    Matrix<Out> matmul(MatrixView<In> x) const;
+    Matrix<In> gather_rows(std::span<const TokenId> rows) const {
+        Matrix<In> output(rows.size());
+        for (size_t row = 0; row < rows.size(); ++row)
+            output.set_row(row, dequant_row(size_t(rows[row])));
+        return output;
+    }
 
     // materialise one output row as fp32 (used for tied unembedding rows etc.)
     Vec<In> dequant_row(size_t o) const {

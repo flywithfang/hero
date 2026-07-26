@@ -1,272 +1,288 @@
-# PLAN: Uniform Transformer Inference Engine (pure C++, interactive chat)
+# PLAN: a modern-transformer inference engine (pure C++, interactive chat)
 
-Goal: a single-binary C++ program with one transformer type system and runtime
-for Llama, Gemma 4, and Qwen 3.5/3.6 families. Llama-3.2 and Gemma 4 E4B text
-and vision are implemented; Gemma MoE and Qwen heterogeneous layers are next.
-The engine runs pure-CPU interactive chat and supports common GGUF storage
-formats (F32/F16/BF16, Q8_0, Q4_0, Q4_K, Q6_K).
+Goal: one transformer type system, pure CPU, covering the **Gemma 4** and
+**Qwen 3.5** families, built so that the matrix/tensor operations sit behind a
+narrow seam that a hardware matrix accelerator can take over later.
 
-## 0. Ground rules (non-negotiable, from the design history)
+Older families (Llama, GPT-2-style dense stacks) have been **removed**. They
+served their purpose — they are how the storage layer, the tokenizer, the quant
+kernels and the parity methodology were derived — but carrying them forward
+costs abstraction clarity and buys nothing for the target checkpoints.
+
+Supported GGUF storage formats: F32/F16/BF16, Q8_0, Q4_0, Q4_K, Q6_K.
+
+## 0. Ground rules (non-negotiable)
 
 1. FIDELITY FIRST. The checkpoint dictates anatomy; the engine is a faithful
-   executor. Every milestone ends with a verification gate. No perf work
-   before greedy-token parity with a reference implementation.
+   executor. Every milestone ends with a verification gate against a reference
+   oracle. No perf work before greedy-token parity on the same weights.
 2. KEEP THE FIVE STRATA:
-     0 typed storage (Vec/Mat/RowStore/PastView)  — the ONLY layout owners
-     1 algebra (operator*, dot, softmax, silu, rmsnorm kernels)
-     2 components (Linear, RMSNorm, GatedMLP, Attention, Rope) — config-free
-     3 transformer + family specifications (model, layers, state, policies)
-     4 runtime (AutoregressiveRuntime: prefill/step/generate; chat; sampling)
+     0 typed storage (`Vec`/`Matrix`/`MatT`/`KVCache`) — the ONLY layout owners
+     1 algebra (dot, softmax, gelu/silu, rms_norm, `par_for`/`par_map`)
+     2 components (`Linear`, norms, gated MLPs, `MoE`) — config-free
+     2 token mixing (`attention.hpp`: cache, mask, GQA reduction, RoPE)
+     3 transformer + family specifications (weights, layers, cache policy)
+     4 application tools (input history, sampling, chat)
    New code must state which stratum it belongs to.
 3. Components take dimensions; assemblies take architectures. Hyperparameters
    are compile-time template parameters; weights are runtime data; sequence
    length T is the only runtime dimension.
-4. Invariants live in types where possible: existing static_asserts and
-   model-family parameter-count checks stay green. Extend, don't bypass.
-5. Executable property tests stay in the build (RoPE offset identity,
-   RMSNorm scale invariance) and grow (tokenizer round-trip, quant
-   round-trip, logit diff).
+4. Shared-by-construction beats copied-per-family. If two families need the
+   same reduction, it goes in `attention.hpp` with a neutral name and the
+   difference becomes a parameter (window width, score scale, rotary fraction).
+5. Executable property tests stay in the build and grow.
 
-## 1. Target configs (already in v10, verified by static_assert)
+## 1. Target checkpoints
 
-Llama32_1B: V=128256 D=2048 L=16 Hq=32 Hkv=8 Dqk=Dv=64 FF=8192
-            CTX=131072 RMS=true ROPE=true base=500000 TIED=true GatedMLP
-            params ~1.24B, KV cache 32 KB/token fp16
-Llama32_3B: V=128256 D=3072 L=28 Hq=24 Hkv=8 Dqk=Dv=128 FF=8192
-            TIED=true, otherwise same anatomy. params ~3.21B.
-Loader must VALIDATE GGUF metadata against the compiled config and abort
-with a clear diff on mismatch (wrong file for this binary is a user error,
-not a crash).
+### Gemma 4 — implemented: E4B
+```
+Gemma4E4BTextConfig: V=262144 D=2560 L=42 Hq=8 Hkv=2
+  LOCAL_HEAD_DIM=256 (sliding, window 512, rope base 10000, full rotation)
+  GLOBAL_HEAD_DIM=512 (full attention, rope base 1e6, 1/4 rotation)
+  attention_kind(l) = Full if l % 6 == 5 else Sliding
+  FF=10240 (GELU-gated), PLE=256, CTX=131072
+  KV sharing: layers 24..41 own no K/V; they read layer 22 (local) / 23 (full)
+  logit softcap 30.0, tied embeddings, embedding scale = bf16(sqrt(D))
+```
+Vision (mmproj) is implemented and joins at `EmbeddingSegment<D>`.
 
-## 2. Repository layout
+### Gemma 4 12B Unified — IMPLEMENTED (text)
+Config pinned from `google/gemma-4-12B` `config.json` (`gemma4_unified_text`):
+```
+V=262144 D=3840 L=48 Hq=16 FF=15360 (gelu_pytorch_tanh) CTX=262144
+head_dim=256 (sliding, Hkv=8), global_head_dim=512 (full, Hkv=1)
+layer_types: full at l % 6 == 5 — the same period-6 rule as E4B, and the
+             final layer (47) is global, as the model card requires
+sliding_window=1024
+rope: sliding = default, theta 1e4; full = proportional, theta 1e6,
+      partial_rotary_factor 0.25   → RotaryEmbedding<512, 1000000, 1, 4>
+rms_norm_eps=1e-6  tie_word_embeddings=true  final_logit_softcapping=30.0
+num_kv_shared_layers=0            → NO KV sharing
+hidden_size_per_layer_input=0     → NO PLE
+attention_k_eq_v=true             → V IS K on layers with no v_proj tensor
+enable_moe_block=false, use_double_wide_mlp=false
+```
+So 12B is a *simpler* decoder than E4B — no PLE tail, no shared-KV layers —
+but it added two things the code did not express, and both became types:
+1. **Per-attention-kind KV head count.** Sliding layers have `Hkv=8`, global
+   layers `Hkv=1`, so `Hkv` moved from a config constant into the attention
+   weight type (`Attention::KV_HEADS`) and the cache follows it.
+2. **Unified K/V.** `GemmaKVKind` replaced the `OwnsKV` bool with three cases —
+   `Owned`, `Unified`, `Shared`. On a unified layer the VALUE is the raw `W_k`
+   output taken *before* the key's learned norm and *before* RoPE, then given
+   the scale-free RMS the ordinary value path uses. `key_and_value()` exists so
+   that projection runs once.
+The PLE tail also became a template parameter (`GemmaPerLayerTail` for E4B,
+`GemmaNoTail` for 12B) rather than a "has PLE" bool, and `[[no_unique_address]]`
+makes its absence free. E4B's numerics and tests were unchanged by all of this.
+Its multimodality is also encoder-free: raw image patches and audio are
+projected straight into the decoder embedding space (`patch_size=16`,
+`num_soft_tokens=280`, `mm_embed_dim=3840`), so there is no ViT to port —
+`EmbeddingSegment<D>` is still the seam, with a much smaller producer.
+Note the local llama.cpp checkout predates this checkpoint (its size switch
+knows 30/35/42/60, not 48), so read the HF config and a `gguf_dump`, not that
+switch, when pinning the config.
 
-  src/
-    core.hpp          strata 0-1 (from v10, split out)
-    components.hpp    stratum 2  (Linear, norms, MLPs, Attention, Rope)
-    transformer.hpp   stratum 3  (residual branches/block, model/session core)
-    llama.hpp         stratum 3  (Llama config, layer/cache architecture policy)
-    gemma4.hpp        stratum 3  (Gemma config, layer/cache architecture policy)
-    runtime.hpp       stratum 4  (AutoregressiveRuntime, samplers)
-    tensor_loader.hpp shared shape-safe GGUF tensor construction
-    llama_loader.hpp  Llama GGUF schema validation and immutable assembly
-    gguf.hpp/.cpp     GGUF parsing + mmap + tensor registry
-    quant.hpp         block formats + dequant + quantized matvec kernels
-    tokenizer.hpp/.cpp  byte-level BPE + chat template
-    chat.cpp          main(): CLI chat REPL
-  tools/
-    gguf_dump.cpp     M0 deliverable: print metadata + tensor table
-    logit_diff.cpp    M1 harness: dump/compare logits for fixed token ids
-  tests/              property + golden tests (assert-based, no framework
-                      needed initially)
-  CLAUDE.md           project memory (updated version provided)
+### Gemma 4 — 26B-A4B (MoE)
+The reference identifies Gemma 4 sizes by layer count:
+`30 → 26B-A4B`, `35 → E2B`, `42 → E4B`, `60 → 31B`.
+What actually changes for **26B-A4B** (from the reference tensor schema):
+- The FFN becomes MoE, but *not* by swapping the channel mixer alone. An expert
+  layer carries the dense FFN **as a shared expert**, a router with its own
+  scale vector (`ffn_gate_inp.scale`), routed experts (either fused
+  `ffn_gate_up_exps` or separate `ffn_gate_exps`/`ffn_up_exps`, plus
+  `ffn_down_exps` and a per-expert scale), and **three extra norms**
+  (`ffn_pre_norm_2`, `ffn_post_norm_1`, `ffn_post_norm_2`).
+  So the MoE layer is a distinct layer type with a second normalized branch,
+  not `GemmaDenseDecoderLayer` with `MoE` substituted for `GeluGatedMLP`.
+- PLE is optional (`n_embd_per_layer > 0`); a checkpoint without it must not
+  require the PLE tail.
+- `LAYER_OUT_SCALE` is optional per layer.
+`EmbeddingSegment<D>` stays the modality/decoder seam and does not change.
 
-## 3. Milestones
+### Qwen 3.5 — 4B and 9B
+Config pinned from `Qwen/Qwen3.5-4B` and `Qwen/Qwen3.5-9B` `config.json`.
+Both are `L=32`, so the loader must key on width as well as depth:
+```
+             4B                       9B
+D            2560                     4096
+FF           9216                     12288
+V            248320                   248320
+tied         true                     false
+shared: Hq=16 Hkv=4 head_dim=256, rope_theta=1e7, partial_rotary_factor=0.25
+        full_attention_interval=4, rms_norm_eps=1e-6, CTX=262144
+        linear: key_head_dim=128 value_head_dim=128
+                num_key_heads=16 num_value_heads=32 conv_kernel_dim=4
+```
+Note `Hq*head_dim = 4096 != D` on the 4B — the same convention break Gemma
+makes, which is why the four attention LAWS never assume it.
 
-### M0 — GGUF reader + dump tool
-Parse: magic "GGUF" (0x46554747 LE), version (expect 3), tensor_count,
-metadata_kv_count; metadata KV store (typed values incl. arrays and strings);
-tensor infos (name, n_dims, dims[], ggml_type, offset); alignment from
-`general.alignment` (default 32); data section offset = aligned end of
-header. mmap the file; tensor data pointer = data_start + offset.
-Deliverable: `gguf_dump model.gguf` prints every metadata key/value and a
-tensor table (name, shape, type, bytes, offset).
-GATE M0: dump of the real Llama-3.2-1B GGUF matches `gguf_dump.py` /
-llama.cpp's own listing; all expected keys below are present and recorded
-in a committed metadata.txt for reference.
+Qwen 3.5 is a **hybrid** stack, and this is the interesting part of the work:
+- Layer schedule: `is_recurrent(l) = (l + 1) % 4 != 0`. Three of every four
+  layers are **gated DeltaNet linear attention**; every fourth is **gated
+  full attention**.
+- Residual topology is plain pre-norm — despite the tensor being named
+  `attn_post_norm`, it is the FFN's *input* norm:
+  `h = x + mix(rms_1(x))`, `y = h + ffn(rms_2(h))`. That is exactly the
+  canonical `TransformerBlock` with two `ResidualBranch`es and no post
+  transform, so Qwen reuses it rather than getting a nominal layer type.
+- Full-attention layers are **gated**: one Q projection emits `2*Hq*head_dim`,
+  laid out per head as `[q | gate]`; per-head Q/K RMSNorm; MRoPE; conventional
+  `1/sqrt(head_dim)` score scale; then `out *= sigmoid(gate)` before `Wo`.
+  For text-only positions all MRoPE sections carry the same position, so
+  interleaved MRoPE reduces exactly to NEOX-ordered partial RoPE —
+  `RotaryEmbedding<256, 10000000, 1, 4>` is bit-for-bit correct there.
+- Linear-attention layers: a different token mixer entirely, with a
+  **fixed-size recurrent state instead of a growing K/V cache**.
+- MTP / NextN is an optional extra block beyond the main stack; not needed for
+  correct single-token decoding, skipped in the first pass.
+- Channel mixer is SwiGLU (`GatedMLP`); `qwen35moe` routes SwiGLU experts plus
+  a gated shared expert.
 
-Metadata keys to read (names as written by llama.cpp convert script —
-VERIFY against the M0 dump, do not trust this list blindly):
-  general.architecture            = "llama"
-  llama.block_count, llama.embedding_length, llama.feed_forward_length
-  llama.attention.head_count, llama.attention.head_count_kv
-  llama.attention.layer_norm_rms_epsilon
-  llama.rope.freq_base            (500000)
-  llama.rope.dimension_count      (=Dqk)
-  llama.context_length
-  llama.rope.scaling.* / original_context_length   (Llama-3.2 long-ctx
-    scaling params; exact key names TO BE CONFIRMED from the M0 dump —
-    expected semantics: factor=32, low_freq_factor=1, high_freq_factor=4,
-    original_max_position_embeddings=8192)
-  tokenizer.ggml.model            = "gpt2"  (means: byte-level BPE)
-  tokenizer.ggml.pre              = "llama-bpe"
-  tokenizer.ggml.tokens[], tokenizer.ggml.merges[], tokenizer.ggml.token_type[]
-  tokenizer.ggml.bos_token_id (128000), .eos_token_id
-  tokenizer.chat_template         (Jinja text; we hardcode the known
-                                   Llama-3 template but keep this for ref)
+The gated delta rule, derived from the reference autoregressive graph, per
+value head `h` with state `S ∈ R^{Dk × Dv}`:
+```
+qkv = conv1d_causal(x·W_qkv, width 4) -> silu       split as [q | k | v]
+q,k = l2_normalize per head;  q *= 1/sqrt(Dk)
+b   = sigmoid(x·W_beta)                              per value head
+g   = A * softplus(x·W_alpha + dt_bias)              per value head, A <= 0
+S   <- S * exp(g)                                    gated decay
+d   = (v - Sᵀk) * b                                  the delta
+S   <- S + k ⊗ d                                     rank-1 update
+o   = Sᵀq
+out = (rmsnorm(o) * silu(x·W_z)) · W_out             gated output norm
+```
+State cost is `num_value_heads * Dv * Dk` floats per layer — 2 MB fp32 per
+layer at 32×128×128, constant in T. That is the whole point of the hybrid:
+24 of 32 layers stop paying the `[GROWS-T]` cache tax.
 
-### M1 — Weight loading (F32/F16) + forward fidelity   [THE BIG GATE]
-Tensor name map (GGUF -> our Model fields):
-  token_embd.weight                 -> embed.wte          [V x D]
-  blk.N.attn_norm.weight            -> block[N].ln1.gamma [D]
-  blk.N.attn_q.weight               -> attn.q_proj.W      (D -> Hq*Dqk)
-  blk.N.attn_k.weight               -> attn.k_proj.W      (D -> Hkv*Dqk)
-  blk.N.attn_v.weight               -> attn.v_proj.W      (D -> Hkv*Dv)
-  blk.N.attn_output.weight          -> attn.o_proj.W      (Hq*Dv -> D)
-  blk.N.ffn_norm.weight             -> block[N].ln2.gamma [D]
-  blk.N.ffn_gate.weight             -> ff.gate.W          (D -> FF)
-  blk.N.ffn_up.weight               -> ff.up.W            (D -> FF)
-  blk.N.ffn_down.weight             -> ff.down.W          (FF -> D)
-  output_norm.weight                -> ln_f.gamma         [D]
-  output.weight                     -> ABSENT in 1B/3B: tied; unembed = wte
-No biases anywhere (Llama). Loader asserts exactly this tensor set.
+## 2. Milestones
 
-TRAP T1 (transposes): ggml stores 2-D tensors with dims [ne0, ne1] where
-ne0 is the CONTIGUOUS (row) dimension, and llama.cpp computes y = W·x with
-W rows contiguous per OUTPUT. Our Mat<In,Out> computes y = x·W with the
-In dimension outer. Decide the mapping ONCE in the loader: for each tensor,
-either copy-transpose into Mat<In,Out>, or add a Mat variant with the other
-layout and a second matvec kernel (preferred for perf later: llama.cpp's
-layout is dot-product-friendly per output). RECOMMENDATION: introduce
-MatT<In,Out> (row = one OUTPUT's weights, contiguous) + matvec_T kernel
-computing Out dot-products of length In; load GGUF 2-D tensors zero-copy
-into MatT views over the mmap. This avoids both the transpose copy and the
-cache-hostile stride. Document the decision in core.hpp.
+### G1 — Gemma 4 12B Unified   [DONE — greedy parity verified]
+Config, architecture, loader, `gemma4_check`/`gemma4_text` support, a chat
+adapter, and unit tests (schedule, per-kind KV heads, cache topology, parameter
+count, and unified-K/V semantics) are in. Vision/audio is NOT done: 12B is
+encoder-free, projecting raw patches and audio straight into the decoder
+embedding space, so it needs a much smaller producer behind the same
+`EmbeddingSegment<D>` seam.
+GATE G1 **MET**: `gemma4_check` validates the real `gemma-4-12b-it-Q4_K_M.gguf`
+(667 tensors), and `gemma4_text` reproduces llama.cpp's greedy continuation
+token-for-token. The checkpoint confirmed the derived anatomy and corrected one
+omission: every layer carries a scalar `layer_output_scale`, so a "no tail"
+layer would have silently dropped it — 12B's tail is scale-only, not absent.
+Also confirmed: partial RoPE is encoded as a `rope_freqs` tensor (1.0 for
+planes 0-63, 1e30 for 64-255), which is exactly what
+`RotaryEmbedding<512, 1e6, 1, 4>` computes.
 
-RoPE completion:
-  - frequency scaling (Llama-3.2): adjust theta_i before table build:
-      wavelen = 2*pi/theta
-      if wavelen < orig_ctx/high_factor: keep theta
-      elif wavelen > orig_ctx/low_factor: theta /= factor
-      else: linear blend between the two by
-            s = (orig_ctx/wavelen - low)/(high - low)
-            theta = (1-s)*(theta/factor) + s*theta
-    Constants from metadata. ~10 lines in Rope's constructor.
-  - pairing: interleaved GGML NORM pairs `(v[2i], v[2i+1])`; the GGUF
-    conversion has already permuted Llama Q/K weights for this convention.
-    Keep the executable identity test.
-TRAP T2: rope pairing convention. If M1 logits mismatch with correct
-weights, this and T1 are the first two suspects.
+### G2 — Gemma 4 26B-A4B (MoE)
+New layer type with the router + shared-expert + extra-norm topology above,
+reusing `MoE<..., Expert>` for the routed part. Derive the routing arithmetic
+(softmax vs sigmoid gate, renormalization, the router scale vector) from the
+reference graph and check it on paper before coding.
+GATE G2: greedy parity with llama.cpp on the same file, plus a unit test that
+routing with TOPK == NE and uniform scores reduces to the dense FFN.
 
-Numerics: all accumulations in fp32 (already true). F16 tensors: dequant to
-fp32 on load initially (1B fp32 resident ~5 GB — acceptable dev mode), or
-keep F16 and widen in the kernel (do later with quant work).
+### Q1 — Qwen 3.5 architecture and loader   [DONE]
+`src/recurrent.hpp` (model-neutral: causal conv1d state, delta-net state, the
+gated delta rule), `src/qwen35.hpp` (4B/9B configs, both mixers, the hybrid
+schedule, the architecture policy), `src/qwen35_loader.hpp`, `tools/qwen35_check`,
+a ChatML adapter in the shared REPL, and `tests/qwen35_tests.cpp`.
+The design bet paid off: both layer kinds bind the SAME canonical
+`TransformerBlock` and differ only in the mixer type, so the residual stream,
+the prefix-cache contract, and the channel mixer are untouched.
+Verified without a checkpoint: the schedule (24 + 8), conv1d against its own
+equation, the delta rule as an associative memory (write at k, read at k
+returns v; an orthogonal query returns nothing; exp(gate) decays it), the
+gated-attention head split, schedule enforcement at assembly time, and —
+the one that matters most for a sequential mixer — **token-by-token decode
+equals one-shot prefill**.
 
-logit_diff harness: feed a FIXED token id sequence (no tokenizer needed),
-dump top-20 logits per position to a file. Reference: (a) llama.cpp
-llama-cli with temp 0 for greedy token parity, and (b) a 10-line Python
-transformers script (provided in tools/reference_logits.py) dumping logits
-for the same ids.
-GATE M1: max |logit delta| vs transformers fp32 within ~1e-2 per position
-on 64 positions AND greedy argmax identical for 200 consecutive tokens vs
-llama.cpp (temp 0). Bitwise equality is NOT expected (summation order).
+### Q2 — Qwen 3.5 parity against a real checkpoint   [DONE]
+GATE Q2 **MET**: `Qwen3.5-4B-Q4_K_M.gguf` and `Qwen3.5-9B-Q4_K_M.gguf` both
+load, and 4B reproduces llama.cpp's greedy continuation token-for-token
+("The capital of France is" -> " Paris.\nA. True\nB. False").
 
-### M2 — Tokenizer + chat
-Byte-level BPE:
-  - byte<->unicode printable remap table (GPT-2 style, e.g. space -> Ġ)
-  - pre-tokenizer regex for "llama-bpe": copy VERBATIM from llama.cpp
-    (llm_tokenizer_bpe, pre = LLM_TOKENIZER_PRE_LLAMA3). Std::regex cannot
-    express \p{L} classes reliably -> implement the pattern as a small
-    hand-rolled scanner over unicode categories (llama.cpp does the same).
-    TRAP T3: an approximated regex changes tokenization silently and breaks
-    greedy parity for non-engine reasons.
-  - encode per chunk: greedy lowest-merge-rank fusion (ranks from
-    tokenizer.ggml.merges); special tokens matched whole BEFORE BPE.
-  - decode: concat token bytes, reverse byte remap.
-GATE M2a: tokenizer parity with llama.cpp `llama-tokenize` on a corpus of
-tricky cases (unicode, numbers, code, emoji, leading spaces) — 100% id match.
+The one genuinely ambiguous decision was settled BY EXPERIMENT rather than by
+reading: `QwenGatedDeltaNet::key_head_of` TILES key heads across value heads
+(`h % Hk`) rather than grouping them GQA-style (`h / (Hv/Hk)`). Flipping that
+single line on the real checkpoint turns top-1 " Paris" (logprob -0.66) into
+" a" (-2.05) and coherent text into gibberish. Both mappings are shape-legal,
+so no amount of reading could decide it — only weights.
 
-Chat protocol (Instruct model):
-  <|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n
-  {system}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n
-  {msg}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n
-  Stop token: <|eot_id|> (128009). Also honor eos list from metadata.
-Multi-turn = incremental prefill: `AutoregressiveRuntime` keeps architecture
-state (including the KV cache) across turns;
-each user turn appends template-wrapped tokens via prefill(delta), then
-stream step() until eot. Never re-prefill history.
-Chat REPL: streaming token print (decode incrementally; flush per token),
-commands: /reset (new cache), /stats (ctx used, tok/s prefill+decode),
-/quit. Context-full policy v1: warn at 90%, refuse at 100% with /reset hint.
-GATE M2: interactive chat produces coherent multi-turn conversation;
-greedy outputs match llama.cpp for identical prompts.
+Still open: MRoPE reduces to partial RoPE only because text positions are equal
+across all four sections, so a vision/video checkpoint needs the sectioned form.
 
-### M3 — Quantization: Q8_0 and Q4_0
-Block formats (all little-endian, block = 32 weights):
-  Q8_0: { fp16 d; int8 q[32]; }              34 B   w = d * q
-  Q4_0: { fp16 d; uint8 q[16]; }             18 B   two nibbles/byte,
-                                                    w = d * (nib - 8)
-Implementation: quantized MatT variants (QMatT8, QMatT4) as zero-copy views
-over the mmap + specialized matvec kernels that dequantize block-by-block
-INSIDE the dot product (fp32 accumulate). Dequant-at-load remains as a
-debug path. Embedding rows and norms are typically F32/F16 in these files;
-handle mixed per-tensor types via a small variant/dispatch in the loader.
-GATE M3: Q8_0 greedy parity with llama.cpp Q8_0 file over 200 tokens;
-Q4_0 parity with llama.cpp Q4_0 (quality differs from fp16 — compare
-same-quant to same-quant). Memory: 1B Q8_0 resident ~1.3 GB.
+These files also forced **Q5_K** support: the Qwen Q4_K_M mixes Q5_K tensors.
+Q5_K is Q4_K plus a high-bit plane; it has no int8-activation kernel yet and
+falls back to the fp32-activation reference path, which is correct but slower.
 
-### M4 — K-quants: Q4_K_M, Q6_K (the formats people actually download)
-Superblock = 256 weights:
-  Q6_K: { uint8 ql[128]; uint8 qh[64]; int8 scales[16]; fp16 d; }
-        w = d * scales[g] * (q - 32), q from 4 low bits + 2 high bits
-  Q4_K: { fp16 d, dmin; uint8 scales[12]; uint8 q[128]; }
-        8 sub-blocks of 32; 6-bit scale+min packed in scales[];
-        w = d*sc[g]*nib - dmin*m[g]
-Copy the exact bit-unpacking from ggml's reference dequant (it is fiddly;
-verify with a round-trip test: dequant our way vs ggml's table for one
-block of known bytes).
-GATE M4: Q4_K_M greedy parity vs llama.cpp same file; quant round-trip
-property test in tests/.
+### Q3 — Qwen 3.5/3.6 MoE
+`qwen35moe` routes SwiGLU experts plus a gated shared expert; reuse `MoE<...,
+Expert>` and the G2 routing work. Qwen 3.6 shares the 3.5 arch in the
+reference (`qwen35`/`qwen35moe` handle both), so it should be a config, not a
+new family.
 
-### M5 — Performance (only after all parity gates)
-Order of attack (decode is BANDWIDTH-bound; measure before/after each):
-  1. Threads: par_for/par_map -> persistent thread pool. Parallelize the
-     matvec over output rows (MatT layout makes rows independent dots) and
-     heads via par_map. Prefill: parallelize over token rows (phase
-     structure in forward already marks what is parallel).
-  2. SIMD in the kernels: AVX2 fp32/f16 dot; integer-dot paths for Q8/Q4
-     (unpack nibbles with shifts/masks, madd). Keep scalar kernels as the
-     reference; select at build or runtime.
-  3. KV cache access: ensure per-head key scan is contiguous (consider
-     storing cache per-head-major if profiling shows strided reads).
-  4. Optional: Q8_0 KV cache (quantize on deposit, dequant in attend) —
-     the KVCache deposit/past API is the pre-built seam.
-Perf model (set expectations, verify with /stats):
-  bytes/token ~ weights(active) + KV cache(T). 1B Q8 ~1.1 GB + 32KB*T.
-  Dual-channel DDR5 ~60-90 GB/s => ceiling ~55-80 tok/s; naive scalar
-  single-thread will land ~5-15; threaded+SIMD should reach a meaningful
-  fraction of ceiling. Prefill is compute-bound: report tok/s separately.
-GATE M5: >= 20 tok/s decode on 1B Q8_0 on the dev machine at 2K context,
-parity tests still green (run the full gate suite after every optimization).
+### P1 — Matrix/tensor acceleration (only after the parity gates)
+The seam is already narrow: `Weight::matvec`/`matmul`, the norms and
+activations, and the attention reduction. Decode is bandwidth-bound and prefill
+is compute-bound, so they want different treatments:
+  1. Prefill: batch the token dimension into real GEMM against a
+     weight-stationary tile; this is what an AMX/SME/tensor-core backend wants.
+  2. Decode: keep the int8-activation path; optimize bytes moved, not FLOPs.
+  3. KV cache: Q8_0 cache storage — `KVCache::append`/`key`/`value` is the
+     pre-built seam.
+GATE P1: parity suite still green after every kernel change.
 
-### M6 — Polish
-Samplers: temperature, top-k, top-p (host-side, on logits; greedy remains
-the test mode). Repetition penalty optional. /save-/load session (dump KV
-cache + token history) optional. 3B config enablement (new struct + the
-same loader). Sliding context policy (drop-oldest with re-prefill, or
-refuse — document the choice; do NOT silently truncate mid-turn).
+## 3. Verification harnesses
 
-## 4. Trap checklist (each has bitten someone; check explicitly)
-  T1 ggml tensor layout vs Mat<In,Out> — decide once, in loader, documented
-  T2 RoPE pairing (rotate_half vs interleaved) + scaling constants
-  T3 pre-tokenizer regex fidelity (no std::regex approximations)
-  T4 special tokens matched before BPE; correct stop token (<|eot_id|>,
-     NOT eos 128001, for Instruct chat)
-  T5 tied unembedding: no output.weight tensor; logits = h · wte rows
-  T6 fp32 accumulation everywhere; fp16 only as storage
-  T7 chat template exact whitespace (\n\n after headers)
+- `tools/gguf_dump model.gguf` — metadata + tensor table; the source of truth
+  for any new config. Never write a config from a model card.
+- `tools/gemma4_check` / `gemma4_vision_check` — schema validation only.
+- `tools/gemma4_text model.gguf "prompt" N` — top-5 logits with logprobs plus
+  an N-token greedy continuation. **This is the logit-parity harness**; rerun it
+  after any numerics-touching change.
+- `tools/tokenizer_parity.py build/tokenizer_test <llama-tokenize> vocab.gguf
+  corpus.txt` — token-id parity against the reference tokenizer.
+- `ctest` — property tests, quant round-trips, Gemma unit tests, multimodal
+  tests, chat-session tests, and tokenizer round-trips for whichever vocab
+  GGUFs are present.
+
+## 4. Testing strategy
+
+- Property (in-binary, every build): RoPE offset identity; RMSNorm scale
+  invariance; attention against its own equation, including the sliding window
+  and the "no visible key is an error" rule; quant block round-trips;
+  `PrefixCache` purity (pure, extended, repeated, divergent evaluations agree).
+- Golden: tokenizer id parity per vocab; top-5 logit dumps; greedy transcripts
+  per quant format.
+- E2E: multi-turn chat sanity; image turns for Gemma; `/stats` vs the
+  bandwidth model.
+- Rule: any numerics-touching change reruns the logit harness before merge.
+
+## 5. Trap checklist (each has bitten someone; check explicitly)
+
+  T1 ggml `[in,out]` tensor layout vs a row-major `[out,in]` assumption —
+     decided once in the loader, documented in `core.hpp` (`MatT`)
+  T2 RoPE pairing (half-split vs interleaved) and partial-rotation fraction
+  T3 pre-tokenizer fidelity — a hand-rolled scanner over unicode categories,
+     never an approximated `std::regex`
+  T4 special tokens matched whole BEFORE BPE
+  T5 tied unembedding: no `output.weight`; logits = h · token_embd rows
+  T6 fp32 accumulation everywhere; fp16/int8 are storage formats
+  T7 exact chat-template whitespace and control-token spelling
   T8 GGUF alignment: tensor offsets are relative to the ALIGNED data start
-  T9 metadata key names vary by converter version — trust the M0 dump,
-     not this document
-  T10 incremental prefill positions: absolute position = cache.tokens(),
-     continuous across turns (RoPE needs the true absolute position)
-
-## 5. Testing strategy
-  Property (in-binary, every build): RoPE offset identity; RMSNorm scale
-    invariance; quant block round-trips; softmax sums to 1.
-  Golden (tests/, scripts): tokenizer parity corpus; logit_diff vs
-    committed reference dumps; 200-token greedy transcripts per quant.
-  E2E (manual then scripted): multi-turn chat sanity; needle-in-haystack
-    at 4K/16K once perf allows; /stats numbers vs perf model.
-  Rule: any numerics-touching change reruns logit_diff before merge.
+  T9 metadata key names vary by converter version — trust the dump
+  T10 absolute positions are continuous across turns (RoPE needs the true
+     absolute position, not a per-turn offset)
 
 ## 6. Explicitly out of scope (this phase)
-GPU/HIP (M5's kernel seams are the future port surface), speculative
-decoding, batching multiple sessions, Qwen3/QK-norm (next architecture:
-config + one norm call site — the design bet to validate AFTER Llama
-ships), MoE models, sliding-window attention.
+
+GPU/HIP backends beyond the kernel seam, speculative decoding and the Qwen MTP
+head, multi-session batching, training.
 
 ## 7. Definition of done
-`./chat model-Q4_K_M.gguf` starts in <5 s, holds a coherent multi-turn
-conversation with streaming output at >=20 tok/s on the dev machine,
-/stats reports context and speeds, and the full parity suite (F16, Q8_0,
-Q4_0, Q4_K_M) is green against llama.cpp on the same files.
+
+`./build/chat model.gguf` starts quickly, holds a coherent multi-turn
+conversation with streaming output, `/stats` reports context and speeds, and
+the parity suite is green against llama.cpp on the same files for both target
+families.

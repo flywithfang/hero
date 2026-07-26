@@ -1,89 +1,115 @@
-# LLM Inference Engine (from scratch, C++) — uniform Llama/Gemma/Qwen inference
+# nm — a modern-transformer inference engine (from scratch, C++)
 
 ## What this project is
-A pure-C++, pure-CPU inference engine. Llama-3.2 and Gemma 4 E4B GGUF inference
-(including image-text) are implemented; Gemma MoE and Qwen 3.5/3.6 are the
-next target families. It is built by the owner (Winston) as a
-derive-then-implement learning project. Every architectural component was
-derived by hand with small traceable numbers before implementation. Follow
-INFERENCE_PLAN.md for milestones; this file is the standing context.
+A pure-C++, pure-CPU inference engine for **modern** transformer decoders.
+Target families: **Gemma 4** (E4B implemented incl. vision; 12B Unified and
+26B-A4B next) and **Qwen 3.5** (4B/9B: architecture, loader and chat
+implemented, awaiting a checkpoint for the parity gate). Older families have
+been removed: the point of the codebase is the core math and the transformer
+abstractions, not breadth of model support.
+
+It is built by the owner (Winston) as a derive-then-implement learning project.
+Every architectural component was derived by hand with small traceable numbers
+before implementation. `INFERENCE_PLAN.md` holds the plan; this file is the
+standing context.
 
 ## Working style (important)
 - Numbers first, then code. When a new concept appears, show a tiny worked
   example before implementing. Precision over hand-waving; push back on
   imprecision.
-- FIDELITY FIRST: the checkpoint dictates anatomy. No perf work before
-  greedy parity with llama.cpp / transformers on the same weights.
-- Any numerics-touching change reruns the logit_diff harness.
+- FIDELITY FIRST: the checkpoint dictates anatomy. No perf work before greedy
+  parity with llama.cpp / transformers on the same weights.
+- Any numerics-touching change reruns the parity harness (`tools/gemma4_text`
+  for logits/greedy, `tools/tokenizer_parity.py` for token ids).
 
-## Current state
-- `src/transformer.hpp` is the model-neutral architecture spine derived from
-  `General_Multimodal_Transformer_Architecture_Wide.pdf`: one decoder-width
-  residual stream, typed token-mixer/channel-mixer residual branches, optional layer
-  tail, immutable `TransformerModel`, and mutable `TransformerSession`.
-  Llama and Gemma E4B both instantiate it; family files contain specifications
-  and cache/layer policy rather than separate forward runtimes.
-- Gemma 4 E4B text and vision inference are implemented in immutable
-  assemblies. The official Q4_0 text and Q8_0 mmproj fixtures match llama.cpp
-  greedy image-text output. `EmbeddingSegment<D>` is the modality/decoder seam;
-  A4B MoE should reuse it and replace only the decoder FFN assembly and loader.
-- `build/chat` is model-neutral: `ChatModel` adapters are selected from GGUF
-  architecture/anatomy. Llama and Gemma E4B share one REPL; Gemma optionally
-  owns its vision adapter and supports staged images across multi-turn chat.
-- `gpt_pipeline.cpp` is historical concept code, not the production type
-  system. Production code lives in `src/transformer.hpp`, family specifications,
-  and family loaders; do not copy new models into another standalone pipeline.
-- INFERENCE_PLAN.md: the implementation plan (M0 GGUF dump -> M1 fp16
-  fidelity -> M2 tokenizer+chat -> M3 Q8_0/Q4_0 -> M4 K-quants -> M5 perf
-  -> M6 polish). Follow its gates in order.
+## Where the code is
+- `src/core.hpp` — storage + algebra. `MatT<In,Out>` is the ggml `[in,out]`
+  weight layout, zero-copy over mmap; `par_for`/`par_map` are the parallel seam.
+- `src/quant.hpp`, `src/quant_i8.hpp` — GGUF block formats, `Weight<In,Out>`
+  matvec/matmul dispatch, int8-activation kernels.
+- `src/components.hpp` — config-free weight-carrying components: `Linear`,
+  `ClippedLinear`, `RMSNorm`, `RMSNormNoScale`, `GatedMLP` (SwiGLU),
+  `GeluGatedMLP`, `MoE` (expert body is a template parameter).
+- `src/attention.hpp` — **the model-neutral token-mixing core**: `KVCache`
+  (full-retention or sliding ring), `key_is_visible` (the mask, defined once),
+  `attend`/`attend_head`/`attend_and_cache` (GQA as gather-and-reduce),
+  `RotaryEmbedding` (half-split pairing, optional partial rotation),
+  `rotate_heads`, `PerHeadNorm`. Score scale is a parameter, not a constant:
+  families that fold 1/sqrt(HeadDim) into a learned Q norm pass 1.0.
+- `src/recurrent.hpp` — **the other token mixer**: `CausalConv1dState`,
+  `DeltaNetState`, `gated_delta_step`, `softplus`, `l2_normalize`. Attention
+  remembers a cache that grows with T; a delta network remembers a fixed-size
+  state matrix. Both are "communication across tokens".
+- `src/transformer.hpp` — the architecture-neutral spine: one decoder-width
+  residual stream, typed residual branches, immutable callable `Transformer`,
+  explicit prefix-indexed `PrefixCache`.
+- `src/qwen35.hpp` + `src/qwen35_loader.hpp` — Qwen 3.5: 4B/9B configs, gated
+  attention, the gated delta network, and the 3:1 hybrid layer schedule. Both
+  layer kinds bind the SAME canonical `TransformerBlock`; only the mixer type
+  differs. This is the payoff for calling it a token mixer.
+- `src/gemma4.hpp` + `src/gemma4_vision.hpp` — Gemma-specific anatomy only:
+  configuration, the two attention shapes, KV sharing, PLE, logit softcap, the
+  decoder layer equation, and the ViT.
+- `src/tokenizer.{hpp,cpp}` — BPE in two dialects (see below).
+- `tools/` — `chat` (model-neutral REPL), `gguf_dump`, `gemma4_*` inspection and
+  parity tools, plus two python helpers: `tokenizer_parity.py` (ids vs
+  `llama-tokenize`) and `gen_unicode_data.py` (regenerates the category tables).
 
 ## Design rules (do not violate)
 1. Five strata: storage / algebra / components / transformer+specifications /
-   runtime. `TransformerModel` is immutable; `TransformerSession` exclusively
-   owns mutable cache state. Layout knowledge lives ONLY in storage types
-   (Mat::operator(), PastView).
+   application runtime. `Transformer` is called as `T(input, prefix_cache)`.
+   `PrefixCache` is explicit derived work for a verified complete-input prefix;
+   `Architecture::PrefixState` is its model-specific inner storage. It can
+   change cost, never semantics. Conversation history and sampling live outside
+   the transformer. Layout knowledge lives ONLY in storage types
+   (`Mat::operator()`, `KVCache`).
 2. Components take dimensions (template params); specifications satisfy the
-   `TransformerArchitecture` contract. Token I/O satisfies `TokenInputOutput`.
+   `TransformerArchitecture` contract; token I/O satisfies `TokenInputOutput`.
    Model differences are expressed as component/policy types and layer
-   schedules, not flat anatomy booleans.
-   Hyperparameters compile-time; weights runtime data; T is the only runtime
-   dimension.
+   schedules, not flat anatomy booleans. Hyperparameters compile-time; weights
+   runtime data; T is the only runtime dimension.
 3. Strong types where confusion is plausible AND type-detectable
-   (TokenId/Position, QHead/KvHead + group() as sole constructor). No
-   role-typed vectors where dimensions already discriminate.
-4. par_map = pure map (partition in, value out, by-value view captures,
-   placement owned by the algorithm). par_for only for non-map loops
-   (e.g. MoE reduction) with a comment. This is the thread-pool seam.
+   (`TokenId`/`Position`, `QHead`/`KvHead`). No role-typed vectors where
+   dimensions already discriminate.
+4. `par_map` = pure map (partition in, value out, by-value view captures,
+   placement owned by the algorithm). `par_for` only for non-map loops
+   (batched attention, MoE reduction) with a comment. This is the thread-pool
+   seam, and the future hardware-matrix-accelerator seam.
 5. The four attention LAWS: q-dim==k-dim (Dqk); v-dim free (Dv);
    Wo in = Hq*Dv; Wo out = D. Everything else is designer freedom.
    Hq*Dqk == D is a convention some models break (Gemma) — never assume it.
-6. Executable property tests stay in the build: RoPE offset identity,
-   RMSNorm scale invariance; extend with tokenizer/quant round-trips.
+6. Anything genuinely shared by modern decoders belongs in `attention.hpp` or
+   `components.hpp` under a neutral name. A `Gemma`/`Qwen` prefix means "this
+   really is family anatomy", not "this is where I happened to write it".
+7. Executable property tests stay in the build: RoPE offset identity, RMSNorm
+   scale invariance, attention against its own equation, PrefixCache purity.
 
 ## Established facts (derived and verified; don't re-litigate)
 - params ~= V*D*(tied?1:2) + L*(D*QW + D*KW + D*VW + OW*D + MLP_MATS*D*FF);
-  MoE: (NE+SHARED)*ff + router. Verified vs advertised sizes in static_assert.
-- KV cache/token = L*(KW+VW) floats = L*Hkv*(Dqk+Dv). Llama32-1B: 32 KB fp16.
-- Prefill compute-bound (~T^2/2 attention); decode bandwidth-bound
-  (re-reads all weights + whole cache per token). Optimize bytes, not FLOPs,
-  in decode.
-- RoPE pairing is model-specific (Llama GGUF uses interleaved/NORM pairing);
-  k is cached pre-rotated and v is never rotated;
-  theta_i = base^(-i/(Dqk/2)); Llama-3.2 adds frequency rescaling
-  (factor 32, orig ctx 8192) applied before table build.
-- Known traps T1-T10 listed in INFERENCE_PLAN.md section 4 (transposes,
-  rope pairing, tokenizer regex, special tokens, tied unembed, fp32
-  accum, template whitespace, GGUF alignment, metadata names, absolute
-  positions across turns).
+  MoE: (NE+SHARED)*ff + router.
+- KV cache/token = L*(KW+VW) floats = L*Hkv*(Dqk+Dv). This is why Gemma 4
+  shares K/V across its last layers and windows most of the rest.
+- Prefill compute-bound (~T^2/2 attention); decode bandwidth-bound (re-reads
+  all weights + whole cache per token). Optimize bytes, not FLOPs, in decode.
+- RoPE pairing is a storage convention, not a model property: half-split
+  (HF/NEOX) vs interleaved depends on whether conversion permuted Q/K.
+  `RotaryEmbedding` implements half-split, which is what Gemma 4 GGUFs need.
+  k is cached pre-rotated; v is never rotated; theta_i = base^(-2i/HeadDim).
+- Qwen 3.5 is 3:1 gated-DeltaNet to gated-attention. Its recurrent layers carry
+  Hv*Dk*Dv floats per layer CONSTANT in T (2 MB at 32x128x128) instead of a
+  cache that grows — that is the whole point of the hybrid.
+- Two Qwen decisions are derived from llama.cpp but unconfirmed against
+  weights, both deliberately one-liners: key heads are TILED across value heads
+  (`h % Hk`, not `h / group`), and MRoPE collapses to partial RoPE only because
+  text positions are equal across sections. See INFERENCE_PLAN.md gate Q2.
+- Known traps T1–T10 are listed in INFERENCE_PLAN.md section 5.
 
 ## Conventions
-- C++20, no third-party deps (mmap and macOS system frameworks are ok). Keep property tests
-  green in main/tests. Comments carry cost tags [COMPUTE][BANDWIDTH][GROWS-T].
+- C++20, no third-party deps (mmap and macOS system frameworks are ok).
 - Scalar accumulation fp32 always; fp16/quant are storage formats.
-- Reference oracles: llama.cpp (greedy tokens, tokenizer) and HF
-  transformers (logit dumps) on the SAME gguf/weights.
-
-## Roadmap after this phase (context, not tasks)
-Gemma 4 MoE via a concrete MoE channel mixer; Qwen 3.5/3.6 via heterogeneous
-token-mixer and channel-mixer layer schedules; Q8_0 KV/cache-state storage;
-then accelerated matvec kernels and training experiments.
+- Comments carry cost tags [COMPUTE][BANDWIDTH][GROWS-T].
+- Reference oracles: llama.cpp (greedy tokens, tokenizer, dequant bytes) and HF
+  transformers (logit dumps) on the SAME gguf/weights. The user's llama.cpp
+  checkout is at `~/projects/detective-english/sm/llama.cpp` and already
+  implements `gemma4` and `qwen35`/`qwen35moe` — read it when deriving a new
+  family's anatomy.

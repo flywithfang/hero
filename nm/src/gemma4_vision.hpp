@@ -40,6 +40,17 @@ public:
         return result;
     }
 
+    Matrix<D> grid(size_t width, size_t height) const {
+        if (width > Rows || height > Rows)
+            throw std::out_of_range(
+                "PositionTable2D: grid exceeds table");
+        Matrix<D> result(width * height);
+        for (size_t y = 0; y < height; ++y)
+            for (size_t x = 0; x < width; ++x)
+                result.set_row(y * width + x, at(x, y));
+        return result;
+    }
+
 private:
     const Scalar* values_;
     std::shared_ptr<const void> keepalive_;
@@ -71,6 +82,97 @@ private:
     }
 };
 
+template <size_t Heads, size_t HeadDim, size_t Base>
+void apply_vision_rope_2d(
+    Matrix<Heads * HeadDim>& queries,
+    Matrix<Heads * HeadDim>& keys,
+    size_t patches_x,
+    size_t patches_y) {
+    if (queries.rows() != patches_x * patches_y ||
+        keys.rows() != queries.rows())
+        throw std::invalid_argument(
+            "apply_vision_rope_2d: patch grid mismatch");
+    VisionRope2D<HeadDim, Base> rope;
+    for (size_t token = 0; token < queries.rows(); ++token) {
+        const size_t x = token % patches_x;
+        const size_t y = token / patches_x;
+        for (size_t head = 0; head < Heads; ++head) {
+            rope.apply(
+                MutVecView<HeadDim>{
+                    queries.data() + token * Heads * HeadDim +
+                    head * HeadDim},
+                x, y);
+            rope.apply(
+                MutVecView<HeadDim>{
+                    keys.data() + token * Heads * HeadDim +
+                    head * HeadDim},
+                x, y);
+        }
+    }
+}
+
+template <size_t Patch>
+Matrix<Patch * Patch * 3> patchify_rgb(
+    std::span<const uint8_t> pixels,
+    size_t width,
+    size_t height) {
+    if (width % Patch != 0 || height % Patch != 0 ||
+        pixels.size() != width * height * 3)
+        throw std::invalid_argument("patchify_rgb: invalid image shape");
+    const size_t patches_x = width / Patch;
+    const size_t patches_y = height / Patch;
+    Matrix<Patch * Patch * 3> patches(patches_x * patches_y);
+    par_for(patches.rows(), [&](size_t patch_index) {
+        const size_t patch_y = patch_index / patches_x;
+        const size_t patch_x = patch_index % patches_x;
+        MutVecView<Patch * Patch * 3> patch =
+            patches.row_mut(patch_index);
+        for (size_t channel = 0; channel < 3; ++channel)
+            for (size_t y = 0; y < Patch; ++y)
+                for (size_t x = 0; x < Patch; ++x) {
+                    const size_t source =
+                        ((patch_y * Patch + y) * width +
+                         patch_x * Patch + x) *
+                            3 +
+                        channel;
+                    const size_t target =
+                        x + Patch * (y + Patch * channel);
+                    patch[target] =
+                        2.f * (Scalar(pixels[source]) / 255.f) - 1.f;
+                }
+    });
+    return patches;
+}
+
+template <size_t Pool, size_t Channels>
+Matrix<Channels> average_pool_2d(
+    MatrixView<Channels> input,
+    size_t width,
+    size_t height) {
+    if (input.rows() != width * height ||
+        width % Pool != 0 || height % Pool != 0)
+        throw std::invalid_argument(
+            "average_pool_2d: invalid input shape");
+    const size_t output_width = width / Pool;
+    const size_t output_height = height / Pool;
+    Matrix<Channels> output(output_width * output_height);
+    par_for(output.rows(), [&](size_t output_index) {
+        const size_t output_y = output_index / output_width;
+        const size_t output_x = output_index % output_width;
+        MutVecView<Channels> pooled = output.row_mut(output_index);
+        for (size_t y = 0; y < Pool; ++y)
+            for (size_t x = 0; x < Pool; ++x) {
+                const VecView<Channels> source = input.row(
+                    (output_y * Pool + y) * width +
+                    output_x * Pool + x);
+                const Scalar weight = 1.f / Scalar(Pool * Pool);
+                for (size_t channel = 0; channel < Channels; ++channel)
+                    pooled[channel] += weight * source[channel];
+            }
+    });
+    return output;
+}
+
 template <size_t D, size_t H, size_t HeadDim, size_t FF>
 class GemmaVisionLayer {
     static_assert(D == H * HeadDim);
@@ -97,59 +199,35 @@ public:
           ffn_up_(std::move(ffn_up)), ffn_down_(std::move(ffn_down)),
           ffn_post_norm_(std::move(ffn_post_norm)) {}
 
-    TokenMatrix<D> operator()(const TokenMatrix<D>& input, size_t patches_x,
-                              size_t patches_y) const {
+    Matrix<D> operator()(MatrixView<D> input, size_t patches_x,
+                         size_t patches_y) const {
         if (input.rows() != patches_x * patches_y)
             throw std::invalid_argument("GemmaVisionLayer: patch grid mismatch");
-        const size_t tokens = input.rows();
-        TokenMatrix<D> queries(tokens), keys(tokens), values(tokens);
-        VisionRope2D<HeadDim, 100> rope;
+        Matrix<D> normalized = input_norm_(input);
+        Matrix<D> queries = query_norm_(query_(normalized.view()));
+        Matrix<D> keys = key_norm_(key_(normalized.view()));
+        Matrix<D> values = transform_heads<H, HeadDim>(
+            value_(normalized.view()).view(),
+            [&](VecView<HeadDim> head) { return value_norm_(head); });
 
-        for (size_t t = 0; t < tokens; ++t) {
-            Vec<D> normalized = input_norm_(input.row(t));
-            Vec<D> q = query_(normalized);
-            Vec<D> k = key_(normalized);
-            Vec<D> v = value_(normalized);
-            q = query_norm_(q);
-            k = key_norm_(k);
-            for (size_t h = 0; h < H; ++h) {
-                rope.apply(slice_mut<HeadDim>(q, h * HeadDim), t % patches_x, t / patches_x);
-                rope.apply(slice_mut<HeadDim>(k, h * HeadDim), t % patches_x, t / patches_x);
-                Vec<HeadDim> vn = value_norm_(slice<HeadDim>(VecView<D>(v), h * HeadDim));
-                std::copy(vn.begin(), vn.end(), v.begin() + h * HeadDim);
-            }
-            queries.set_row(t, q); keys.set_row(t, k); values.set_row(t, v);
-        }
+        apply_vision_rope_2d<H, HeadDim, 100>(
+            queries, keys, patches_x, patches_y);
+        Matrix<D> attended = scaled_dot_product_attention<
+            H, HeadDim, HeadDim>(
+                queries.view(), keys.view(), values.view(), 1.f);
 
-        TokenMatrix<D> attention(tokens);
-        for (size_t qpos = 0; qpos < tokens; ++qpos) {
-            Vec<D> joined;
-            for (size_t h = 0; h < H; ++h) {
-                std::vector<Scalar> scores(tokens);
-                for (size_t kpos = 0; kpos < tokens; ++kpos)
-                    scores[kpos] = dot(slice<HeadDim>(queries.row(qpos), h * HeadDim),
-                                       slice<HeadDim>(keys.row(kpos), h * HeadDim));
-                softmax(scores);
-                Vec<HeadDim> head;
-                for (size_t kpos = 0; kpos < tokens; ++kpos)
-                    axpy(scores[kpos], slice<HeadDim>(values.row(kpos), h * HeadDim), head);
-                std::copy(head.begin(), head.end(), joined.begin() + h * HeadDim);
-            }
-            Vec<D> branch = output_(joined);
-            branch = attention_post_norm_(branch);
-            branch += input.row(qpos);
+        Matrix<D> attention_branch =
+            attention_post_norm_(output_(attended.view()));
+        Matrix<D> residual =
+            add(input, attention_branch.view());
 
-            Vec<D> ff_input = ffn_norm_(branch);
-            Vec<FF> gate = ffn_gate_(ff_input);
-            gelu(gate);
-            Vec<FF> up = ffn_up_(ff_input);
-            gate *= up;
-            Vec<D> ff = ffn_down_(gate);
-            ff = ffn_post_norm_(ff);
-            ff += branch;
-            attention.set_row(qpos, ff);
-        }
-        return attention;
+        Matrix<D> ffn_input = ffn_norm_(residual.view());
+        Matrix<FF> gate = ffn_gate_(ffn_input.view());
+        gelu_in_place(gate.mutable_view());
+        Matrix<FF> up = ffn_up_(ffn_input.view());
+        Matrix<D> ffn = ffn_post_norm_(
+            ffn_down_(hadamard(gate.view(), up.view()).view()));
+        return add(residual.view(), ffn.view());
     }
 
 private:
@@ -182,43 +260,29 @@ public:
         const Prepared prepared = prepare(image);
         const size_t px = prepared.width / C::PATCH;
         const size_t py = prepared.height / C::PATCH;
-        TokenMatrix<C::D> hidden(px * py);
-        for (size_t y = 0; y < py; ++y) {
-            for (size_t x = 0; x < px; ++x) {
-                Vec<C::PATCH * C::PATCH * 3> patch;
-                for (size_t channel = 0; channel < 3; ++channel)
-                    for (size_t dy = 0; dy < C::PATCH; ++dy)
-                        for (size_t dx = 0; dx < C::PATCH; ++dx) {
-                            const size_t source = ((y * C::PATCH + dy) * prepared.width +
-                                                   x * C::PATCH + dx) * 3 + channel;
-                            const size_t target = dx + C::PATCH * (dy + C::PATCH * channel);
-                            patch[target] = 2.f * (Scalar(prepared.pixels[source]) / 255.f) - 1.f;
-                        }
-                Vec<C::D> token = patch_embedding_.matvec(patch);
-                Vec<C::D> position = positions_.at(x, y);
-                token += position;
-                hidden.set_row(y * px + x, token);
-            }
-        }
-        for (const Layer& layer : layers_) hidden = layer(hidden, px, py);
+        Matrix<C::PATCH * C::PATCH * 3> patches =
+            patchify_rgb<C::PATCH>(
+                prepared.pixels, prepared.width, prepared.height);
+        Matrix<C::D> patch_tokens =
+            patch_embedding_.matmul(patches.view());
+        Matrix<C::D> positions = positions_.grid(px, py);
+        Matrix<C::D> hidden =
+            add(patch_tokens.view(), positions.view());
+        for (const Layer& layer : layers_)
+            hidden = layer(hidden.view(), px, py);
 
         const size_t out_x = px / C::POOL, out_y = py / C::POOL;
         if (out_x == 0 || out_y == 0)
             throw std::invalid_argument("Gemma4E4BVisionEncoder: image produces no pooled tokens");
-        TokenMatrix<C::OUT> output(out_x * out_y);
+        Matrix<C::D> pooled =
+            average_pool_2d<C::POOL>(hidden.view(), px, py);
+        scale_in_place(
+            pooled.mutable_view(), std::sqrt(Scalar(C::D)));
         RMSNormNoScale<C::D> pre_projection(C::EPS);
-        for (size_t oy = 0; oy < out_y; ++oy) {
-            for (size_t ox = 0; ox < out_x; ++ox) {
-                Vec<C::D> pooled;
-                for (size_t dy = 0; dy < C::POOL; ++dy)
-                    for (size_t dx = 0; dx < C::POOL; ++dx)
-                        axpy(1.f / Scalar(C::POOL * C::POOL),
-                             hidden.row((oy * C::POOL + dy) * px + ox * C::POOL + dx), pooled);
-                for (size_t i = 0; i < C::D; ++i) pooled[i] *= std::sqrt(Scalar(C::D));
-                Vec<C::D> normalized = pre_projection(pooled);
-                output.set_row(oy * out_x + ox, projection_(normalized));
-            }
-        }
+        Matrix<C::D> normalized =
+            pre_projection(pooled.view());
+        Matrix<C::OUT> output =
+            projection_(normalized.view());
         return EmbeddingSegment<C::OUT>(Modality::Image, std::move(output));
     }
 

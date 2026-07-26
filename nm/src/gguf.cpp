@@ -79,11 +79,12 @@ GT u32_to_gt(uint32_t v) {
     switch (v) {
         case 0: return GT::F32;  case 1: return GT::F16;
         case 2: return GT::Q4_0; case 8: return GT::Q8_0;
-        case 12: return GT::Q4_K; case 14: return GT::Q6_K;
+        case 12: return GT::Q4_K; case 13: return GT::Q5_K; case 14: return GT::Q6_K;
         case 30: return GT::BF16;
         default:
-            throw std::runtime_error("GGUF: unsupported ggml_type " + std::to_string(v) +
-                                     " (this engine reads F32/F16/BF16/Q4_0/Q8_0/Q4_K/Q6_K)");
+            throw std::runtime_error(
+                "GGUF: unsupported ggml_type " + std::to_string(v) +
+                " (this engine reads F32/F16/BF16/Q4_0/Q8_0/Q4_K/Q5_K/Q6_K)");
     }
 }
 

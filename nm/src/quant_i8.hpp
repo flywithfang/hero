@@ -291,6 +291,13 @@ inline float vec_dot_q6_K_q8_K(size_t n, const block_q6_K* x, const block_q8_K* 
 #endif
 }
 
+// Which weight types have an int8-activation kernel. Q5_K currently does not:
+// it falls back to the fp32-activation dequant-in-dot path, which is this
+// engine's numerics reference, so the result is correct and only slower.
+inline bool has_i8_kernel(GT t) {
+    return t == GT::Q8_0 || t == GT::Q4_0 || t == GT::Q4_K || t == GT::Q6_K;
+}
+
 // ---- quantized activation holder for one matvec ---------------------------
 // Quantize x ONCE, reuse across all Out rows (the llama.cpp strategy).
 struct ActQ {
@@ -325,7 +332,7 @@ Vec<Out> Weight<In, Out>::matvec(VecView<In> x) const {
         return y;
     }
     const size_t rb = type_size_bytes(t, In);
-    if (!nm_fp32_act()) {                          // int8 activations (default)
+    if (!nm_fp32_act() && has_i8_kernel(t)) {      // int8 activations (default)
         // Plain local, captured by reference: workers must read THIS act.
         // (A thread_local here would hand each worker its own empty instance.)
         ActQ act;                                  // quantized once, pre-par_for
@@ -358,6 +365,10 @@ Vec<Out> Weight<In, Out>::matvec(VecView<In> x) const {
                 const block_q4_K* b = (const block_q4_K*)row;
                 for (size_t i = 0; i < In / QK_K; ++i) acc += dot_block_q4_K(b[i], &x[i*QK_K]);
                 break; }
+            case GT::Q5_K: {
+                const block_q5_K* b = (const block_q5_K*)row;
+                for (size_t i = 0; i < In / QK_K; ++i) acc += dot_block_q5_K(b[i], &x[i*QK_K]);
+                break; }
             case GT::Q6_K: {
                 const block_q6_K* b = (const block_q6_K*)row;
                 for (size_t i = 0; i < In / QK_K; ++i) acc += dot_block_q6_K(b[i], &x[i*QK_K]);
@@ -365,6 +376,136 @@ Vec<Out> Weight<In, Out>::matvec(VecView<In> x) const {
             default: break;
         }
         y[o] = acc;
+    });
+    return y;
+}
+
+// Mathematical interface for X[T,In] @ W[In,Out]. Activations are prepared
+// once, then each worker holds one output/weight row stationary while applying
+// it to all T activation rows. This streams W once per batch instead of once
+// per token. A tiled SME/GPU backend can replace this reference kernel without
+// changing components or architectures.
+template <size_t In, size_t Out>
+Matrix<Out> Weight<In, Out>::matmul(MatrixView<In> x) const {
+    Matrix<Out> y(x.rows());
+    if (x.rows() == 0) return y;
+
+    const GT type = type_;
+    if (type == GT::F32) {
+        par_for(Out, [&](size_t output) {
+            const VecView<In> weight = f32_.row(output);
+            for (size_t row = 0; row < x.rows(); ++row)
+                y.data()[row * Out + output] =
+                    dot(x.row(row), weight);
+        });
+        return y;
+    }
+
+    const size_t row_bytes = type_size_bytes(type, In);
+    if (type != GT::Q8_0 && type != GT::Q4_0 && type != GT::Q4_K &&
+        type != GT::Q5_K && type != GT::Q6_K)
+        throw std::runtime_error(
+            "Weight::matmul: unsupported quantized type");
+    if (!nm_fp32_act() && has_i8_kernel(type)) {
+        std::vector<ActQ> activations(x.rows());
+        par_for(x.rows(), [&](size_t row) {
+            activations[row].from(x.row(row).begin(), In, type);
+        });
+        par_for(Out, [&](size_t output) {
+            const uint8_t* weight_row = qp_ + output * row_bytes;
+            for (size_t row = 0; row < x.rows(); ++row) {
+                const ActQ& activation = activations[row];
+                Scalar result = 0;
+                switch (type) {
+                    case GT::Q8_0:
+                        result = vec_dot_q8_0_q8_0(
+                            In,
+                            reinterpret_cast<const block_q8_0*>(weight_row),
+                            activation.q8.data());
+                        break;
+                    case GT::Q4_0:
+                        result = vec_dot_q4_0_q8_0(
+                            In,
+                            reinterpret_cast<const block_q4_0*>(weight_row),
+                            activation.q8.data());
+                        break;
+                    case GT::Q4_K:
+                        result = vec_dot_q4_K_q8_K(
+                            In,
+                            reinterpret_cast<const block_q4_K*>(weight_row),
+                            activation.qk.data());
+                        break;
+                    case GT::Q6_K:
+                        result = vec_dot_q6_K_q8_K(
+                            In,
+                            reinterpret_cast<const block_q6_K*>(weight_row),
+                            activation.qk.data());
+                        break;
+                    default:
+                        break;
+                }
+                y.data()[row * Out + output] = result;
+            }
+        });
+        return y;
+    }
+
+    par_for(Out, [&](size_t output) {
+        const uint8_t* weight_row = qp_ + output * row_bytes;
+        for (size_t row = 0; row < x.rows(); ++row) {
+            const VecView<In> activation = x.row(row);
+            Scalar result = 0;
+            switch (type) {
+                case GT::Q8_0: {
+                    const auto* blocks =
+                        reinterpret_cast<const block_q8_0*>(weight_row);
+                    for (size_t block = 0; block < In / QK8_0; ++block)
+                        result += dot_block_q8_0(
+                            blocks[block],
+                            &activation[block * QK8_0]);
+                    break;
+                }
+                case GT::Q4_0: {
+                    const auto* blocks =
+                        reinterpret_cast<const block_q4_0*>(weight_row);
+                    for (size_t block = 0; block < In / QK4_0; ++block)
+                        result += dot_block_q4_0(
+                            blocks[block],
+                            &activation[block * QK4_0]);
+                    break;
+                }
+                case GT::Q4_K: {
+                    const auto* blocks =
+                        reinterpret_cast<const block_q4_K*>(weight_row);
+                    for (size_t block = 0; block < In / QK_K; ++block)
+                        result += dot_block_q4_K(
+                            blocks[block],
+                            &activation[block * QK_K]);
+                    break;
+                }
+                case GT::Q5_K: {
+                    const auto* blocks =
+                        reinterpret_cast<const block_q5_K*>(weight_row);
+                    for (size_t block = 0; block < In / QK_K; ++block)
+                        result += dot_block_q5_K(
+                            blocks[block],
+                            &activation[block * QK_K]);
+                    break;
+                }
+                case GT::Q6_K: {
+                    const auto* blocks =
+                        reinterpret_cast<const block_q6_K*>(weight_row);
+                    for (size_t block = 0; block < In / QK_K; ++block)
+                        result += dot_block_q6_K(
+                            blocks[block],
+                            &activation[block * QK_K]);
+                    break;
+                }
+                default:
+                    break;
+            }
+            y.data()[row * Out + output] = result;
+        }
     });
     return y;
 }

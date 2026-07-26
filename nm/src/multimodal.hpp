@@ -6,6 +6,7 @@
 // later Gemma 4 A4B MoE decoder.
 #pragma once
 #include "core.hpp"
+#include <atomic>
 #include <variant>
 
 enum class Modality : uint8_t { Text, Image, Audio };
@@ -125,6 +126,9 @@ public:
     }
 
     size_t tokens() const { return embeddings_.rows(); }
+    size_t first_position() const { return first_position_; }
+    uint64_t sequence_id() const { return sequence_id_; }
+    MatrixView<D> matrix() const { return embeddings_.view(); }
     VecView<D> embedding(size_t i) const { return embeddings_.row(i); }
     Position position(size_t i) const {
         if (i >= tokens()) throw std::out_of_range("EmbeddedSequence: token out of range");
@@ -135,12 +139,97 @@ public:
         if (i >= tokens()) throw std::out_of_range("EmbeddedSequence: token out of range");
         return ple_token_identities_[i];
     }
+    std::span<const TokenId> ple_token_identities() const {
+        return ple_token_identities_;
+    }
+    Modality modality(size_t i) const {
+        if (i >= tokens())
+            throw std::out_of_range(
+                "EmbeddedSequence: token out of range");
+        for (const SequenceSpan& span : spans_)
+            if (span.contains(i)) return span.modality();
+        throw std::logic_error(
+            "EmbeddedSequence: token is outside every span");
+    }
+
+    EmbeddedSequence suffix(size_t first_token) const {
+        if (first_token >= tokens())
+            throw std::out_of_range(
+                "EmbeddedSequence: empty suffix");
+
+        Matrix<D> embeddings(tokens() - first_token);
+        std::copy(
+            embeddings_.data() + first_token * D,
+            embeddings_.data() + tokens() * D,
+            embeddings.data());
+
+        std::vector<SequenceSpan> spans;
+        for (const SequenceSpan& span : spans_) {
+            if (span.end() <= first_token) continue;
+            const size_t begin =
+                std::max(span.begin(), first_token) - first_token;
+            const size_t end = span.end() - first_token;
+            spans.emplace_back(span.modality(), begin, end);
+        }
+
+        std::vector<TokenId> identities(
+            ple_token_identities_.begin() + first_token,
+            ple_token_identities_.end());
+        return EmbeddedSequence(
+            std::move(embeddings), std::move(spans),
+            std::move(identities),
+            first_position_ + first_token);
+    }
+
+    void append(EmbeddingSegment<D> segment,
+                TokenId non_text_ple_identity = TokenId{0}) {
+        const size_t appended = segment.embeddings().rows();
+        if (appended >
+            std::numeric_limits<size_t>::max() - tokens())
+            throw std::length_error(
+                "EmbeddedSequence: token count overflows");
+
+        const size_t begin = tokens();
+        Matrix<D> combined(begin + appended);
+        std::copy(
+            embeddings_.data(), embeddings_.data() + begin * D,
+            combined.data());
+        std::copy(
+            segment.embeddings().data(),
+            segment.embeddings().data() + appended * D,
+            combined.data() + begin * D);
+        std::vector<SequenceSpan> spans = spans_;
+        spans.emplace_back(
+            segment.modality(), begin, begin + appended);
+        std::vector<TokenId> identities =
+            ple_token_identities_;
+        if (segment.modality() == Modality::Text) {
+            identities.insert(
+                identities.end(),
+                segment.token_identities().begin(),
+                segment.token_identities().end());
+        } else {
+            identities.insert(
+                identities.end(),
+                appended, non_text_ple_identity);
+        }
+
+        embeddings_ = std::move(combined);
+        spans_ = std::move(spans);
+        ple_token_identities_ = std::move(identities);
+    }
 
 private:
+    static uint64_t next_sequence_id() {
+        static std::atomic<uint64_t> next{1};
+        return next.fetch_add(1, std::memory_order_relaxed);
+    }
+
     TokenMatrix<D> embeddings_;
     std::vector<SequenceSpan> spans_;
     std::vector<TokenId> ple_token_identities_;
     size_t first_position_;
+    uint64_t sequence_id_ = next_sequence_id();
 };
 
 template <size_t D>

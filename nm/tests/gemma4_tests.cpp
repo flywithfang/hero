@@ -3,7 +3,10 @@
 #include <type_traits>
 
 static_assert(TransformerArchitecture<Gemma4E4BArchitecture>);
-static_assert(!std::is_default_constructible_v<Gemma4E4BTextModel>);
+static_assert(!std::is_default_constructible_v<
+              Gemma4E4BTextWeights>);
+static_assert(!std::is_default_constructible_v<
+              Gemma4E4BTransformer>);
 
 static int g_fail = 0;
 static void check(bool ok, const char* msg) {
@@ -46,9 +49,9 @@ int main() {
         check(delta < 1e-5f, "scale-free RMSNorm is scale invariant");
     }
 
-    std::printf("== proportional RoPE ==\n");
+    std::printf("== partial RoPE ==\n");
     {
-        GemmaProportionalRope<8, 1, 2, 10000> rope;
+        RotaryEmbedding<8, 10000, 1, 2> rope;
         static_assert(decltype(rope)::rotary_planes() == 2);
         Vec<8> value;
         for (size_t i = 0; i < 8; ++i) value[i] = Scalar(i + 1);
@@ -58,12 +61,12 @@ int main() {
               value[6] == original[6] && value[7] == original[7],
               "non-RoPE planes are exactly unchanged");
         check(value[0] != original[0] && value[4] != original[4],
-              "configured proportional prefix rotates");
+              "the configured rotary prefix rotates");
     }
 
     std::printf("== heterogeneous K/V cache and Gemma attention ==\n");
     {
-        GemmaKVCache<1, 2> full;
+        KVCache<1, 2> full;
         Vec<2> k0, v0, k1, v1;
         k0[0] = 1; k0[1] = 0; v0[0] = 10; v0[1] = 20;
         k1[0] = 0; k1[1] = 1; v1[0] = 30; v1[1] = 40;
@@ -71,16 +74,16 @@ int main() {
         full.append(Position{1}, k1, v1);
         Vec<4> q;
         q[0] = 1; q[1] = 0; q[2] = 1; q[3] = 0;
-        Vec<4> global = gemma_attend<2, 1, 2>(q, full, Position{1});
+        Vec<4> global = attend<2, 1, 2>(q, full, Position{1});
         const Scalar p0 = std::exp(1.f) / (std::exp(1.f) + 1.f);
         check(std::fabs(global[0] - (p0 * 10 + (1 - p0) * 30)) < 1e-5f &&
               global[0] == global[2],
               "GQA heads share KV and attention uses scale 1.0");
-        Vec<4> local = gemma_attend<2, 1, 2>(q, full, Position{1}, 1);
+        Vec<4> local = attend<2, 1, 2>(q, full, Position{1}, 1);
         check(local[0] == 30 && local[1] == 40,
               "sliding attention excludes positions outside its window");
 
-        GemmaKVCache<1, 2> ring(2);
+        KVCache<1, 2> ring(2);
         Vec<2> k2, v2; k2[0] = 2; k2[1] = 2; v2[0] = 50; v2[1] = 60;
         ring.append(Position{0}, k0, v0);
         ring.append(Position{1}, k1, v1);
@@ -118,25 +121,115 @@ int main() {
                                 zero_linear<2, 2>());
         GemmaPerLayerResidual<2, 1> ple(zero_linear<2, 1>(), zero_linear<1, 2>(),
                                                unit_norm<2>());
-        using Definition = GemmaDenseDecoderLayerDefinition<2, 2, 1, MockAttention>;
-        GemmaDenseDecoderLayer<2, 2, 1, MockAttention> layer(
-            Definition::TokenMixerBranch(
-                unit_norm<2>(), MockAttention{},
-                PostNormalize<RMSNorm<2>>(unit_norm<2>())),
-            Definition::ChannelMixerBranch(
-                unit_norm<2>(), std::move(mlp),
-                PostNormalize<RMSNorm<2>>(unit_norm<2>())),
-            Definition::Tail(std::move(ple), 2.f));
+        GemmaDenseDecoderLayer<2, 2, MockAttention,
+                               GemmaPerLayerTail<2, 1>> layer(
+            unit_norm<2>(),
+            MockAttention{},
+            unit_norm<2>(),
+            unit_norm<2>(),
+            std::move(mlp),
+            unit_norm<2>(),
+            GemmaPerLayerTail<2, 1>(std::move(ple), 2.f));
         Vec<2> x; x[0] = 3; x[1] = -4;
         Vec<1> per_layer; per_layer[0] = 7;
         Vec<2> y = layer.forward(
             x, VecView<1>(per_layer),
-            [](const MockAttention&, VecView<2>) { return Vec<2>{}; },
-            [](const auto& channel, VecView<2> normalized) {
-                return channel(normalized);
-            });
+            [](const MockAttention&, VecView<2>) { return Vec<2>{}; });
         check(y[0] == 6 && y[1] == -8,
-              "post-norm attention/FF/PLE residuals precede layer scaling");
+              "scalar post-norm attention/FF/PLE residuals precede layer scaling");
+
+        Matrix<2> batch(1);
+        batch.set_row(0, x);
+        Matrix<1> batch_per_layer(1);
+        batch_per_layer.set_row(0, per_layer);
+        Matrix<2> batch_output = layer.forward(
+            batch.view(), batch_per_layer.view(),
+            [](const MockAttention&, MatrixView<2> normalized) {
+                return Matrix<2>(normalized.rows());
+            });
+        check(batch_output.row(0)[0] == 6 &&
+                  batch_output.row(0)[1] == -8,
+              "matrix forward states the same Gemma layer equation");
+
+        // The same layer with no PLE at all: 12B's tail type. The FF residual
+        // is the layer output, unscaled.
+        GemmaDenseDecoderLayer<2, 2, MockAttention, GemmaNoTail<2>> tailless(
+            unit_norm<2>(), MockAttention{}, unit_norm<2>(), unit_norm<2>(),
+            GeluGatedMLP<2, 2>(zero_linear<2, 2>(), zero_linear<2, 2>(),
+                               zero_linear<2, 2>()),
+            unit_norm<2>(), GemmaNoTail<2>{});
+        Vec<2> plain = tailless.forward(
+            x, NoLayerInput{},
+            [](const MockAttention&, VecView<2>) { return Vec<2>{}; });
+        check(plain[0] == 3 && plain[1] == -4,
+              "a layer with no PLE tail returns the FF residual unscaled");
+        check(sizeof(GemmaDenseDecoderLayer<2, 2, MockAttention, GemmaNoTail<2>>) <
+                  sizeof(GemmaDenseDecoderLayer<2, 2, MockAttention,
+                                                GemmaPerLayerTail<2, 1>>),
+              "the absent tail costs no space");
+    }
+
+    std::printf("== Gemma 4 12B anatomy ==\n");
+    {
+        using C = Gemma4_12BTextConfig;
+        size_t sliding = 0, global = 0;
+        for (size_t l = 0; l < C::L; ++l)
+            (C::attention_kind(l) == GemmaAttentionKind::Full ? global : sliding)++;
+        check(sliding == 40 && global == 8, "12B is 40 sliding + 8 global layers");
+        check(C::attention_kind(C::L - 1) == GemmaAttentionKind::Full,
+              "the final layer is global, as the model card requires");
+        check(C::kv_heads(0) == 8 && C::kv_heads(5) == 1,
+              "KV head count differs per attention kind (8 sliding, 1 global)");
+        check(C::kv_kind(0) == GemmaKVKind::Owned &&
+              C::kv_kind(5) == GemmaKVKind::Unified,
+              "global layers use unified K/V, sliding layers own both");
+        const double params = double(gemma_dense_param_count<C>());
+        check(params > 11.7e9 && params < 12.1e9,
+              "parameter count lands on the advertised ~11.95B");
+
+        // Every Gemma 4 layer carries a scalar output scale; 12B has no PLE
+        // but still has that, so its tail is scale-only rather than absent.
+        GemmaLayerScaleTail<2> scale_tail(0.5f);
+        Vec<2> h; h[0] = 6.f; h[1] = -8.f;
+        Vec<2> scaled = scale_tail(std::move(h));
+        check(scaled[0] == 3.f && scaled[1] == -4.f,
+              "the layer output scale is applied last");
+
+        Gemma4_12BCache cache;
+        check(cache.local(0).capacity() == C::SLIDING_WINDOW,
+              "sliding layers own a bounded ring, so their cost stops growing");
+        check(cache.global(5).capacity() == 0,
+              "global layers retain everything");
+    }
+
+    std::printf("== unified K/V takes one projection two ways ==\n");
+    {
+        // One head of width 2. W_k maps x -> (x0, x1). The key gets the learned
+        // per-head RMSNorm; the value gets the scale-free one on the SAME raw
+        // projection output, so the two differ only by that learned scale.
+        MatT<2, 2> w = MatT<2, 2>::owning();
+        w.raw()[0] = 1.f; w.raw()[1] = 0.f;   // out 0 = x0
+        w.raw()[2] = 0.f; w.raw()[3] = 1.f;   // out 1 = x1
+        Vec<2> gamma; gamma[0] = 3.f; gamma[1] = 3.f;
+        GemmaUnifiedKeyValue<2, 1, 2> kv(
+            Linear<2, 2>(Weight<2, 2>(std::move(w))),
+            PerHeadNorm<1, 2, RMSNorm<2>>(RMSNorm<2>(std::move(gamma), 1e-6f)),
+            PerHeadNorm<1, 2, RMSNormNoScale<2>>(RMSNormNoScale<2>(1e-6f)));
+
+        Matrix<2> x(1);
+        x.row_mut(0)[0] = 3.f;
+        x.row_mut(0)[1] = 4.f;
+        GemmaKeyValuePair<2> pair = kv.key_and_value(x.view());
+        // rms([3,4]) = sqrt(12.5); normalized = [0.8485, 1.1314]
+        const Scalar inv = 1.f / std::sqrt(12.5f);
+        check(std::fabs(pair.value.row(0)[0] - 3.f * inv) < 1e-5f &&
+              std::fabs(pair.value.row(0)[1] - 4.f * inv) < 1e-5f,
+              "the value is the raw projection with the scale-free norm");
+        check(std::fabs(pair.key.row(0)[0] - 3.f * 3.f * inv) < 1e-5f,
+              "the key is the same projection with the learned scale");
+        Matrix<2> separate_key = kv.key(x.view());
+        check(separate_key.row(0)[0] == pair.key.row(0)[0],
+              "key() and key_and_value() agree");
     }
 
     std::printf("\n%s (%d failures)\n", g_fail ? "GEMMA4 TESTS FAILED" : "ALL GEMMA4 TESTS PASSED", g_fail);

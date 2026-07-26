@@ -52,7 +52,8 @@ int main() {
 
     std::printf("== block sizes ==\n");
     check(sizeof(block_q4_0)==18 && sizeof(block_q8_0)==34 &&
-          sizeof(block_q4_K)==144 && sizeof(block_q6_K)==210, "struct sizes match ggml");
+          sizeof(block_q4_K)==144 && sizeof(block_q5_K)==176 &&
+          sizeof(block_q6_K)==210, "struct sizes match ggml");
 
     std::printf("== Q8_0 round-trip ==\n");
     {
@@ -101,6 +102,28 @@ int main() {
           Scalar k = dot_block_q4_K(blk, x.data());
           Scalar r = 0; for (int i=0;i<256;++i) r += w[i]*x[i];
           check(rel(k,r) < 1e-4f, "Q4_K kernel == dequant-dot"); }
+        // Q5_K — Q4_K plus the high-bit plane; check the fifth bit actually
+        // moves the value by exactly 16 quanta before scaling.
+        { block_q5_K blk; auto w = rand_block_and_dequant(GT::Q5_K, blk);
+          std::vector<Scalar> x(256); for (auto& v:x) v=frand(-2,2);
+          Scalar k = dot_block_q5_K(blk, x.data());
+          Scalar r = 0; for (int i=0;i<256;++i) r += w[i]*x[i];
+          check(rel(k,r) < 1e-4f, "Q5_K kernel == dequant-dot"); }
+        { // the high plane is worth exactly +16 raw quanta on the low nibble
+          block_q5_K blk{};
+          blk.d = fp32_to_fp16(1.f); blk.dmin = fp32_to_fp16(0.f);
+          for (auto& sc : blk.scales) sc = 0;
+          blk.scales[0] = 1;                  // sub-block 0 scale = 1, min = 0
+          for (auto& q : blk.qs) q = 0;
+          for (auto& q : blk.qh) q = 0;
+          blk.qs[0] = 3;                      // low nibble of element 0 = 3
+          std::vector<Scalar> low(256), high(256);
+          dequant_to_f32(GT::Q5_K, &blk, low.data(), 256);
+          blk.qh[0] = 1;                      // set element 0's fifth bit
+          dequant_to_f32(GT::Q5_K, &blk, high.data(), 256);
+          check(std::fabs(low[0] - 3.f) < 1e-5f &&
+                std::fabs(high[0] - 19.f) < 1e-5f,
+                "the Q5_K high plane adds exactly 16 to the 4-bit value"); }
         // Q6_K
         { block_q6_K blk; auto w = rand_block_and_dequant(GT::Q6_K, blk);
           std::vector<Scalar> x(256); for (auto& v:x) v=frand(-2,2);

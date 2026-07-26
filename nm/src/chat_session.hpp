@@ -6,7 +6,10 @@
 #include <optional>
 #include <string_view>
 
-enum class ChatModelKind : uint8_t { Llama32_1B, Llama32_3B, Llama3_8B, Gemma4E4B };
+// One entry per compiled adapter. A checkpoint is matched on the architecture
+// string plus the anatomy that distinguishes sizes within a family, never on
+// the file name, so a re-quantized or renamed GGUF still selects correctly.
+enum class ChatModelKind : uint8_t { Gemma4E4B, Gemma4_12B, Qwen35_4B, Qwen35_9B };
 
 struct ChatModelIdentity {
     std::string architecture;
@@ -15,17 +18,17 @@ struct ChatModelIdentity {
 };
 
 inline std::optional<ChatModelKind> detect_chat_model(const ChatModelIdentity& model) {
-    if (model.architecture == "llama") {
-        if (model.embedding_length == 2048 && model.block_count == 16)
-            return ChatModelKind::Llama32_1B;
-        if (model.embedding_length == 3072 && model.block_count == 28)
-            return ChatModelKind::Llama32_3B;
-        if (model.embedding_length == 4096 && model.block_count == 32)
-            return ChatModelKind::Llama3_8B;
+    if (model.architecture == "gemma4") {
+        if (model.embedding_length == 2560 && model.block_count == 42)
+            return ChatModelKind::Gemma4E4B;
+        if (model.embedding_length == 3840 && model.block_count == 48)
+            return ChatModelKind::Gemma4_12B;
     }
-    if (model.architecture == "gemma4" && model.embedding_length == 2560 &&
-        model.block_count == 42)
-        return ChatModelKind::Gemma4E4B;
+    // Qwen 3.5 4B and 9B share L=32, so width is what separates them.
+    if (model.architecture == "qwen35" && model.block_count == 32) {
+        if (model.embedding_length == 2560) return ChatModelKind::Qwen35_4B;
+        if (model.embedding_length == 4096) return ChatModelKind::Qwen35_9B;
+    }
     return std::nullopt;
 }
 
@@ -56,6 +59,22 @@ inline GemmaChatTurn render_gemma_chat_turn(std::string_view user, bool first,
     if (has_image) turn.after_image = "<image|>";
     turn.after_image += user;
     turn.after_image += "<turn|>\n<|turn>model\n";
+    return turn;
+}
+
+// ChatML, the Qwen-family template. Rendered as text and then tokenized with
+// parse_special so the control tokens match whole (trap T4).
+inline std::string render_chatml_turn(std::string_view user, bool first,
+                                      std::string_view system) {
+    std::string turn;
+    if (first && !system.empty()) {
+        turn += "<|im_start|>system\n";
+        turn += system;
+        turn += "<|im_end|>\n";
+    }
+    turn += "<|im_start|>user\n";
+    turn += user;
+    turn += "<|im_end|>\n<|im_start|>assistant\n";
     return turn;
 }
 

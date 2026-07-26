@@ -1,3 +1,9 @@
 .DS_Store
 **/.cache/
 **/build/
+
+# Model weights are large and refetchable; never commit them.
+*.gguf
+*.safetensors
+*.bin
+*.log

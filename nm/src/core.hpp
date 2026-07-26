@@ -118,17 +118,81 @@ struct MutVecView {
     Scalar* end() const { return p + N; }
 };
 
-// Runtime token count x compile-time channel width. Unlike model parameters,
-// activations are intentionally writable scratch; shape and ownership remain
-// private and construction establishes the complete storage invariant.
+// Runtime rows x compile-time columns. This is the activation tensor carried
+// through the model: [tokens, channels] for decoder activations and
+// [queries, projected channels] for attention intermediates.
 template <size_t C>
-class TokenMatrix {
+class Matrix;
+
+template <size_t C>
+class MatrixView {
 public:
-    explicit TokenMatrix(size_t rows)
+    MatrixView(const Scalar* data, size_t rows) : data_(data), rows_(rows) {
+        if (rows_ != 0 && data_ == nullptr)
+            throw std::invalid_argument("MatrixView: null data");
+    }
+    MatrixView(const Matrix<C>& matrix)
+        : MatrixView(matrix.data(), matrix.rows()) {}
+
+    size_t rows() const { return rows_; }
+    static constexpr size_t cols() { return C; }
+    VecView<C> row(size_t i) const {
+        check_row(i);
+        return VecView<C>(data_ + i * C);
+    }
+    const Scalar* data() const { return data_; }
+
+private:
+    void check_row(size_t i) const {
+        if (i >= rows_) throw std::out_of_range("MatrixView: row out of range");
+    }
+
+    const Scalar* data_;
+    size_t rows_;
+};
+
+template <size_t C>
+class MutableMatrixView {
+public:
+    MutableMatrixView(Scalar* data, size_t rows) : data_(data), rows_(rows) {
+        if (rows_ != 0 && data_ == nullptr)
+            throw std::invalid_argument("MutableMatrixView: null data");
+    }
+
+    size_t rows() const { return rows_; }
+    static constexpr size_t cols() { return C; }
+    VecView<C> row(size_t i) const {
+        check_row(i);
+        return VecView<C>(data_ + i * C);
+    }
+    MutVecView<C> row_mut(size_t i) const {
+        check_row(i);
+        return MutVecView<C>{data_ + i * C};
+    }
+    Scalar* data() const { return data_; }
+
+private:
+    void check_row(size_t i) const {
+        if (i >= rows_)
+            throw std::out_of_range("MutableMatrixView: row out of range");
+    }
+
+    Scalar* data_;
+    size_t rows_;
+};
+
+template <size_t C>
+class Matrix {
+public:
+    explicit Matrix(size_t rows)
         : rows_(rows), data_(element_count(rows), Scalar(0)) {}
 
     size_t rows() const { return rows_; }
     static constexpr size_t cols() { return C; }
+    MatrixView<C> view() const { return MatrixView<C>(data_.data(), rows_); }
+    MutableMatrixView<C> mutable_view() {
+        return MutableMatrixView<C>(data_.data(), rows_);
+    }
 
     VecView<C> row(size_t i) const {
         check_row(i);
@@ -142,22 +206,29 @@ public:
         MutVecView<C> dst = row_mut(i);
         std::copy(value.begin(), value.end(), dst.begin());
     }
+    const Scalar* data() const { return data_.data(); }
+    Scalar* data() { return data_.data(); }
 
 private:
     static size_t element_count(size_t rows) {
         if constexpr (C != 0) {
             if (rows > std::numeric_limits<size_t>::max() / C)
-                throw std::length_error("TokenMatrix: shape overflows size_t");
+                throw std::length_error("Matrix: shape overflows size_t");
         }
         return rows * C;
     }
     void check_row(size_t i) const {
-        if (i >= rows_) throw std::out_of_range("TokenMatrix: row out of range");
+        if (i >= rows_) throw std::out_of_range("Matrix: row out of range");
     }
 
     size_t rows_;
     std::vector<Scalar> data_;
 };
+
+// Transitional source compatibility for modality/vision code. New algebra and
+// model code should name the mathematical object directly as Matrix<C>.
+template <size_t C>
+using TokenMatrix = Matrix<C>;
 
 template <size_t R, size_t C>
 struct Mat {                               // concept layout: y = x·W
@@ -169,29 +240,14 @@ struct Mat {                               // concept layout: y = x·W
     Scalar* raw() { return p.get(); }
 };
 
-template <size_t C>
-struct RowStore {                          // runtime rows x compile-time cols
-    std::vector<Scalar> data;
-    size_t rows = 0;
-    VecView<C> row(size_t i) const { return VecView<C>(&data[i * C]); }
-    void append(VecView<C> v) { data.insert(data.end(), v.begin(), v.end()); ++rows; }
-};
-
 enum class TokenId : int32_t {};
 struct Position { size_t i; };
 
-// Two head-index types that must never be confused (GQA). group() in Attention
-// is the sole constructor of a KvHead from a QHead.
+// Two head-index types that must never be confused (GQA). A KvHead is only
+// ever constructed by dividing a query-head index by the group size, which
+// attention.hpp does in exactly one place.
 struct QHead  { size_t i; };
 struct KvHead { size_t i; };
-
-template <size_t Hkv, size_t Dqk, size_t Dv>
-struct PastView {
-    const RowStore<Hkv * Dqk>& K;
-    const RowStore<Hkv * Dv>&  V;
-    VecView<Dqk> key  (size_t j, KvHead g) const;
-    VecView<Dv>  value(size_t j, KvHead g) const;
-};
 
 // ================= stratum 1: algebra ======================================
 
@@ -213,6 +269,205 @@ template <size_t N> Scalar dot(VecView<N> a, VecView<N> b) {
 template <size_t N> void axpy(Scalar a, VecView<N> x, Vec<N>& y) {
     for (size_t i = 0; i < N; ++i) y[i] += a * x[i];
 }
+
+template <size_t N>
+Vec<N> hadamard(VecView<N> left, VecView<N> right) {
+    Vec<N> output;
+    for (size_t i = 0; i < N; ++i)
+        output[i] = left[i] * right[i];
+    return output;
+}
+
+template <size_t N>
+void scale_in_place(Vec<N>& vector, Scalar scale) {
+    for (size_t i = 0; i < N; ++i)
+        vector[i] *= scale;
+}
+
+template <size_t N>
+Vec<N> scaled_sum(VecView<N> left, VecView<N> right, Scalar scale) {
+    Vec<N> output = left + right;
+    scale_in_place(output, scale);
+    return output;
+}
+
+template <size_t N>
+Matrix<N> copy(MatrixView<N> input) {
+    Matrix<N> output(input.rows());
+    std::copy(input.data(), input.data() + input.rows() * N, output.data());
+    return output;
+}
+
+template <size_t N>
+Matrix<N> add(MatrixView<N> left, MatrixView<N> right) {
+    if (left.rows() != right.rows())
+        throw std::invalid_argument("add: matrix row mismatch");
+    Matrix<N> output(left.rows());
+    const size_t elements = left.rows() * N;
+    for (size_t i = 0; i < elements; ++i)
+        output.data()[i] = left.data()[i] + right.data()[i];
+    return output;
+}
+
+template <size_t N>
+void add_in_place(MutableMatrixView<N> output, MatrixView<N> addend) {
+    if (output.rows() != addend.rows())
+        throw std::invalid_argument("add_in_place: matrix row mismatch");
+    const size_t elements = output.rows() * N;
+    for (size_t i = 0; i < elements; ++i)
+        output.data()[i] += addend.data()[i];
+}
+
+template <size_t N>
+void add_bias_in_place(MutableMatrixView<N> output, VecView<N> bias) {
+    for (size_t row = 0; row < output.rows(); ++row)
+        for (size_t channel = 0; channel < N; ++channel)
+            output.row_mut(row)[channel] += bias[channel];
+}
+
+template <size_t N>
+Matrix<N> hadamard(MatrixView<N> left, MatrixView<N> right) {
+    if (left.rows() != right.rows())
+        throw std::invalid_argument("hadamard: matrix row mismatch");
+    Matrix<N> output(left.rows());
+    const size_t elements = left.rows() * N;
+    for (size_t i = 0; i < elements; ++i)
+        output.data()[i] = left.data()[i] * right.data()[i];
+    return output;
+}
+
+template <size_t N>
+Vec<N> clamp(VecView<N> input, Scalar minimum, Scalar maximum) {
+    if (minimum > maximum)
+        throw std::invalid_argument("clamp: reversed interval");
+    Vec<N> output;
+    for (size_t channel = 0; channel < N; ++channel)
+        output[channel] = std::clamp(input[channel], minimum, maximum);
+    return output;
+}
+
+template <size_t N>
+Matrix<N> clamp(MatrixView<N> input, Scalar minimum, Scalar maximum) {
+    if (minimum > maximum)
+        throw std::invalid_argument("clamp: reversed interval");
+    Matrix<N> output(input.rows());
+    const size_t elements = input.rows() * N;
+    for (size_t i = 0; i < elements; ++i)
+        output.data()[i] = std::clamp(input.data()[i], minimum, maximum);
+    return output;
+}
+
+template <size_t Width, size_t Total>
+Matrix<Width> slice_columns(MatrixView<Total> input, size_t first_column) {
+    if (first_column > Total || Width > Total - first_column)
+        throw std::out_of_range("slice_columns: column range out of bounds");
+    Matrix<Width> output(input.rows());
+    for (size_t row = 0; row < input.rows(); ++row)
+        std::copy(input.row(row).begin() + first_column,
+                  input.row(row).begin() + first_column + Width,
+                  output.row_mut(row).begin());
+    return output;
+}
+
+template <size_t Heads, size_t HeadDim, class Transform>
+Vec<Heads * HeadDim> transform_heads(
+    VecView<Heads * HeadDim> input, Transform&& transform) {
+    Vec<Heads * HeadDim> output;
+    for (size_t head = 0; head < Heads; ++head) {
+        Vec<HeadDim> transformed =
+            std::invoke(transform, VecView<HeadDim>(
+                input.begin() + head * HeadDim));
+        std::copy(transformed.begin(), transformed.end(),
+                  output.begin() + head * HeadDim);
+    }
+    return output;
+}
+
+template <size_t Heads, size_t HeadDim, class Transform>
+Matrix<Heads * HeadDim> transform_heads(
+    MatrixView<Heads * HeadDim> input, Transform&& transform) {
+    Matrix<Heads * HeadDim> output(input.rows());
+    for (size_t row = 0; row < input.rows(); ++row) {
+        Vec<Heads * HeadDim> transformed = transform_heads<Heads, HeadDim>(
+            input.row(row), transform);
+        output.set_row(row, transformed);
+    }
+    return output;
+}
+
+template <size_t N>
+void scale_in_place(MutableMatrixView<N> matrix, Scalar scale) {
+    const size_t elements = matrix.rows() * N;
+    for (size_t i = 0; i < elements; ++i)
+        matrix.data()[i] *= scale;
+}
+
+template <size_t N>
+Matrix<N> scaled_sum(MatrixView<N> left, MatrixView<N> right,
+                     Scalar scale) {
+    Matrix<N> output = add(left, right);
+    scale_in_place(output.mutable_view(), scale);
+    return output;
+}
+
+template <size_t N>
+Matrix<N> rms_norm(MatrixView<N> input, VecView<N> gamma, Scalar eps) {
+    Matrix<N> output(input.rows());
+    for (size_t row = 0; row < input.rows(); ++row) {
+        Scalar mean_square = 0;
+        for (size_t channel = 0; channel < N; ++channel)
+            mean_square += input.row(row)[channel] * input.row(row)[channel];
+        const Scalar inverse_rms =
+            1.f / std::sqrt(mean_square / Scalar(N) + eps);
+        for (size_t channel = 0; channel < N; ++channel)
+            output.row_mut(row)[channel] =
+                gamma[channel] * input.row(row)[channel] * inverse_rms;
+    }
+    return output;
+}
+
+template <size_t N>
+Vec<N> rms_norm(VecView<N> input, VecView<N> gamma, Scalar eps) {
+    Scalar mean_square = 0;
+    for (size_t channel = 0; channel < N; ++channel)
+        mean_square += input[channel] * input[channel];
+    const Scalar inverse_rms =
+        1.f / std::sqrt(mean_square / Scalar(N) + eps);
+    Vec<N> output;
+    for (size_t channel = 0; channel < N; ++channel)
+        output[channel] = gamma[channel] * input[channel] * inverse_rms;
+    return output;
+}
+
+template <size_t N>
+Matrix<N> rms_norm(MatrixView<N> input, Scalar eps) {
+    Matrix<N> output(input.rows());
+    for (size_t row = 0; row < input.rows(); ++row) {
+        Scalar mean_square = 0;
+        for (size_t channel = 0; channel < N; ++channel)
+            mean_square += input.row(row)[channel] * input.row(row)[channel];
+        const Scalar inverse_rms =
+            1.f / std::sqrt(mean_square / Scalar(N) + eps);
+        for (size_t channel = 0; channel < N; ++channel)
+            output.row_mut(row)[channel] =
+                input.row(row)[channel] * inverse_rms;
+    }
+    return output;
+}
+
+template <size_t N>
+Vec<N> rms_norm(VecView<N> input, Scalar eps) {
+    Scalar mean_square = 0;
+    for (size_t channel = 0; channel < N; ++channel)
+        mean_square += input[channel] * input[channel];
+    const Scalar inverse_rms =
+        1.f / std::sqrt(mean_square / Scalar(N) + eps);
+    Vec<N> output;
+    for (size_t channel = 0; channel < N; ++channel)
+        output[channel] = input[channel] * inverse_rms;
+    return output;
+}
+
 template <size_t W_, size_t N>
 VecView<W_> slice(VecView<N> v, size_t off) {
     static_assert(W_ <= N);
@@ -222,15 +477,6 @@ template <size_t W_, size_t N>
 MutVecView<W_> slice_mut(Vec<N>& v, size_t off) {
     static_assert(W_ <= N);
     return MutVecView<W_>{&v[off]};
-}
-
-template <size_t Hkv, size_t Dqk, size_t Dv>
-VecView<Dqk> PastView<Hkv, Dqk, Dv>::key(size_t j, KvHead g) const {
-    return slice<Dqk>(K.row(j), g.i * Dqk);
-}
-template <size_t Hkv, size_t Dqk, size_t Dv>
-VecView<Dv> PastView<Hkv, Dqk, Dv>::value(size_t j, KvHead g) const {
-    return slice<Dv>(V.row(j), g.i * Dv);
 }
 
 inline void softmax(std::span<Scalar> s) {
@@ -244,11 +490,34 @@ template <size_t N> void gelu(Vec<N>& v) {
         v[i] = 0.5f * x * (1.f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
     }
 }
+inline Scalar sigmoid(Scalar x) { return 1.f / (1.f + std::exp(-x)); }
+
 template <size_t N> void silu(Vec<N>& v) {            // z·sigmoid(z)
     for (size_t i = 0; i < N; ++i) v[i] = v[i] / (1.f + std::exp(-v[i]));
 }
 template <size_t N> void operator*=(Vec<N>& y, const Vec<N>& x) {
     for (size_t i = 0; i < N; ++i) y[i] *= x[i];       // Hadamard
+}
+
+template <size_t N>
+void gelu_in_place(MutableMatrixView<N> matrix) {
+    const size_t elements = matrix.rows() * N;
+    for (size_t i = 0; i < elements; ++i) {
+        const Scalar x = matrix.data()[i];
+        matrix.data()[i] =
+            0.5f * x *
+            (1.f + std::tanh(0.7978845608f *
+                             (x + 0.044715f * x * x * x)));
+    }
+}
+
+template <size_t N>
+void silu_in_place(MutableMatrixView<N> matrix) {
+    const size_t elements = matrix.rows() * N;
+    for (size_t i = 0; i < elements; ++i) {
+        const Scalar x = matrix.data()[i];
+        matrix.data()[i] = x / (1.f + std::exp(-x));
+    }
 }
 
 // ---- the parallel seams (M5 replaces the bodies with a thread pool) --------
@@ -265,6 +534,54 @@ Vec<H * Dim> par_map(F&& f) {
         std::copy(r.begin(), r.end(), &out[h * Dim]);
     });
     return out;
+}
+
+// Dense multi-head attention:
+//   softmax_rows(scale * Q K^T) V
+// Q/K/V are [tokens, heads * head_dimension]. Some architectures normalize
+// Q/K and use a scale of one (Gemma vision); conventional attention passes
+// 1/sqrt(head_dimension). This reference kernel preserves the mathematical
+// interface while a backend may fuse and tile the operation.
+template <size_t Heads, size_t QueryKeyDim, size_t ValueDim>
+Matrix<Heads * ValueDim> scaled_dot_product_attention(
+    MatrixView<Heads * QueryKeyDim> queries,
+    MatrixView<Heads * QueryKeyDim> keys,
+    MatrixView<Heads * ValueDim> values,
+    Scalar scale) {
+    if (keys.rows() != values.rows())
+        throw std::invalid_argument(
+            "scaled_dot_product_attention: K/V row mismatch");
+
+    Matrix<Heads * ValueDim> output(queries.rows());
+    par_for(queries.rows() * Heads, [&](size_t task) {
+        const size_t query_row = task / Heads;
+        const size_t head = task % Heads;
+        const VecView<QueryKeyDim> query =
+            slice<QueryKeyDim>(
+                queries.row(query_row), head * QueryKeyDim);
+
+        std::vector<Scalar> scores(keys.rows());
+        for (size_t key_row = 0; key_row < keys.rows(); ++key_row)
+            scores[key_row] =
+                scale * dot(
+                    query,
+                    slice<QueryKeyDim>(
+                        keys.row(key_row), head * QueryKeyDim));
+        softmax(scores);
+
+        Vec<ValueDim> attended;
+        for (size_t key_row = 0; key_row < keys.rows(); ++key_row)
+            axpy(
+                scores[key_row],
+                slice<ValueDim>(
+                    values.row(key_row), head * ValueDim),
+                attended);
+        std::copy(
+            attended.begin(), attended.end(),
+            output.data() +
+                (query_row * Heads + head) * ValueDim);
+    });
+    return output;
 }
 
 // ---- MatT<In,Out>: the ggml/llama.cpp weight layout (row = output) ---------

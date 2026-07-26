@@ -10,16 +10,25 @@ static void check(bool condition, const char* message) {
 
 int main(int argc, char** argv) {
     std::printf("== model selection ==\n");
-    check(detect_chat_model({"llama", 2048, 16}) == ChatModelKind::Llama32_1B,
-          "Llama 3.2 1B is selected from GGUF anatomy");
-    check(detect_chat_model({"llama", 3072, 28}) == ChatModelKind::Llama32_3B,
-          "Llama 3.2 3B is selected from GGUF anatomy");
-    check(detect_chat_model({"llama", 4096, 32}) == ChatModelKind::Llama3_8B,
-          "Llama 3 8B is selected from GGUF anatomy");
     check(detect_chat_model({"gemma4", 2560, 42}) == ChatModelKind::Gemma4E4B,
           "Gemma 4 E4B is selected from GGUF anatomy");
     check(!detect_chat_model({"gemma4", 4096, 42}),
-          "unsupported anatomy is rejected rather than guessed");
+          "an unimplemented size in a known family is rejected, not guessed");
+    check(detect_chat_model({"qwen35", 2560, 32}) == ChatModelKind::Qwen35_4B,
+          "Qwen 3.5 4B is selected from GGUF anatomy");
+    check(detect_chat_model({"qwen35", 4096, 32}) == ChatModelKind::Qwen35_9B,
+          "Qwen 3.5 9B is separated from 4B by width, since both are L=32");
+    check(!detect_chat_model({"qwen35", 2560, 42}),
+          "a known architecture at an unimplemented depth is rejected");
+
+    std::printf("== ChatML rendering ==\n");
+    check(render_chatml_turn("Hi", true, "Be brief.") ==
+          "<|im_start|>system\nBe brief.<|im_end|>\n"
+          "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n",
+          "first turn renders the system block then opens the assistant turn");
+    check(render_chatml_turn("More", false, "ignored") ==
+          "<|im_start|>user\nMore<|im_end|>\n<|im_start|>assistant\n",
+          "later turns do not repeat the system block");
 
     std::printf("== Gemma chat rendering ==\n");
     {

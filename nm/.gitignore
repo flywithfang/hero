@@ -1,3 +1,9 @@
 /build/
+/build-*/
 *.o
 *.a
+# Checkpoints are big and refetchable; the script and notes that fetch them
+# are not, so ignore the weights rather than the whole directory.
+/models/*.gguf
+/models/.cache/
+/models/download.log

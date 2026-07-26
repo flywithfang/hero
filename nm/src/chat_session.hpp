@@ -19,10 +19,8 @@ struct ChatModelIdentity {
 
 inline std::optional<ChatModelKind> detect_chat_model(const ChatModelIdentity& model) {
     if (model.architecture == "gemma4") {
-        if (model.embedding_length == 2560 && model.block_count == 42)
-            return ChatModelKind::Gemma4E4B;
-        if (model.embedding_length == 3840 && model.block_count == 48)
-            return ChatModelKind::Gemma4_12B;
+        if (model.embedding_length == 2560 && model.block_count == 42) return ChatModelKind::Gemma4E4B;
+        if (model.embedding_length == 3840 && model.block_count == 48) return ChatModelKind::Gemma4_12B;
     }
     // Qwen 3.5 4B and 9B share L=32, so width is what separates them.
     if (model.architecture == "qwen35" && model.block_count == 32) {
@@ -46,8 +44,7 @@ struct GemmaChatTurn {
     std::string after_image;
 };
 
-inline GemmaChatTurn render_gemma_chat_turn(std::string_view user, bool first,
-                                            std::string_view system, bool has_image) {
+inline GemmaChatTurn render_gemma_chat_turn(std::string_view user, bool first, std::string_view system, bool has_image) {
     GemmaChatTurn turn;
     if (first) {
         turn.before_image = "<|turn>system\n<|think|>\n";
@@ -64,8 +61,7 @@ inline GemmaChatTurn render_gemma_chat_turn(std::string_view user, bool first,
 
 // ChatML, the Qwen-family template. Rendered as text and then tokenized with
 // parse_special so the control tokens match whole (trap T4).
-inline std::string render_chatml_turn(std::string_view user, bool first,
-                                      std::string_view system) {
+inline std::string render_chatml_turn(std::string_view user, bool first, std::string_view system) {
     std::string turn;
     if (first && !system.empty()) {
         turn += "<|im_start|>system\n";
@@ -84,12 +80,8 @@ struct ChatStats {
     double prefill_seconds = 0;
     double decode_seconds = 0;
     double vision_seconds = 0;
-    double prefill_tps() const {
-        return prefill_seconds > 0 ? double(prefill_tokens) / prefill_seconds : 0;
-    }
-    double decode_tps() const {
-        return decode_seconds > 0 ? double(generated_tokens) / decode_seconds : 0;
-    }
+    double prefill_tps() const { return prefill_seconds > 0 ? double(prefill_tokens) / prefill_seconds : 0; }
+    double decode_tps() const { return decode_seconds > 0 ? double(generated_tokens) / decode_seconds : 0; }
 };
 
 struct ChatTurnResult {
@@ -155,6 +147,5 @@ public:
     virtual size_t context_limit() const = 0;
     virtual const ChatStats& stats() const = 0;
     virtual void reset() = 0;
-    virtual ChatTurnResult respond(std::string_view user, const RGBImage* image,
-                                   size_t max_new, const ChatTokenSink& sink) = 0;
+    virtual ChatTurnResult respond(std::string_view user, const RGBImage* image, size_t max_new, const ChatTokenSink& sink) = 0;
 };

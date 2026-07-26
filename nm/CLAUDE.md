@@ -106,6 +106,12 @@ standing context.
 
 ## Conventions
 - C++20, no third-party deps (mmap and macOS system frameworks are ok).
+- FORMATTING: a parameter list is NEVER broken across lines. Every function,
+  method and constructor keeps all its parameters on one line, however long.
+  `.clang-format` enforces this with `ColumnLimit: 1000`; write new signatures
+  that way rather than relying on the format pass. (`ColumnLimit: 0` is NOT the
+  setting for this — it preserves existing breaks instead of joining them.)
+  Generated tables are fenced with `// clang-format off`.
 - Scalar accumulation fp32 always; fp16/quant are storage formats.
 - Comments carry cost tags [COMPUTE][BANDWIDTH][GROWS-T].
 - Reference oracles: llama.cpp (greedy tokens, tokenizer, dequant bytes) and HF

@@ -18,10 +18,8 @@
 template <size_t In, size_t Out>
 class Linear {
 public:
-    explicit Linear(Weight<In, Out> weight)
-        : weight_(std::move(weight)) {}
-    Linear(Weight<In, Out> weight, Vec<Out> bias)
-        : weight_(std::move(weight)), bias_(std::move(bias)), has_bias_(true) {}
+    explicit Linear(Weight<In, Out> weight) : weight_(std::move(weight)) {}
+    Linear(Weight<In, Out> weight, Vec<Out> bias) : weight_(std::move(weight)), bias_(std::move(bias)), has_bias_(true) {}
 
     Vec<Out> operator()(VecView<In> x) const {
         Vec<Out> y = weight_.matvec(x);
@@ -30,14 +28,13 @@ public:
     }
     Matrix<Out> operator()(MatrixView<In> x) const {
         Matrix<Out> y = weight_.matmul(x);
-        if (has_bias_)
-            add_bias_in_place(y.mutable_view(), VecView<Out>(bias_));
+        if (has_bias_) add_bias_in_place(y.mutable_view(), VecView<Out>(bias_));
         return y;
     }
 
 private:
     Weight<In, Out> weight_;
-    Vec<Out> bias_;                    // zero unless a bias tensor is loaded
+    Vec<Out> bias_;  // zero unless a bias tensor is loaded
     bool has_bias_ = false;
 };
 
@@ -47,23 +44,17 @@ private:
 template <size_t In, size_t Out>
 class ClippedLinear {
 public:
-    ClippedLinear(Linear<In, Out> linear, Scalar input_min, Scalar input_max,
-                  Scalar output_min, Scalar output_max)
-        : linear_(std::move(linear)), input_min_(input_min), input_max_(input_max),
-          output_min_(output_min), output_max_(output_max) {
-        if (input_min_ > input_max_ || output_min_ > output_max_)
-            throw std::invalid_argument("ClippedLinear: reversed calibration interval");
+    ClippedLinear(Linear<In, Out> linear, Scalar input_min, Scalar input_max, Scalar output_min, Scalar output_max) : linear_(std::move(linear)), input_min_(input_min), input_max_(input_max), output_min_(output_min), output_max_(output_max) {
+        if (input_min_ > input_max_ || output_min_ > output_max_) throw std::invalid_argument("ClippedLinear: reversed calibration interval");
     }
 
     Vec<Out> operator()(VecView<In> input) const {
         Vec<In> clamped = clamp(input, input_min_, input_max_);
-        return clamp(
-            VecView<Out>(linear_(clamped)), output_min_, output_max_);
+        return clamp(VecView<Out>(linear_(clamped)), output_min_, output_max_);
     }
     Matrix<Out> operator()(MatrixView<In> input) const {
         Matrix<In> clamped = clamp(input, input_min_, input_max_);
-        return clamp(
-            linear_(clamped.view()).view(), output_min_, output_max_);
+        return clamp(linear_(clamped.view()).view(), output_min_, output_max_);
     }
 
 private:
@@ -74,19 +65,14 @@ private:
 template <size_t N>
 class RMSNorm {
 public:
-    explicit RMSNorm(Vec<N> gamma, Scalar eps = 1e-5f)
-        : gamma_(std::move(gamma)), eps_(eps) {}
+    explicit RMSNorm(Vec<N> gamma, Scalar eps = 1e-5f) : gamma_(std::move(gamma)), eps_(eps) {}
 
-    Vec<N> operator()(VecView<N> x) const {
-        return rms_norm(x, VecView<N>(gamma_), eps_);
-    }
-    Matrix<N> operator()(MatrixView<N> x) const {
-        return rms_norm(x, VecView<N>(gamma_), eps_);
-    }
+    Vec<N> operator()(VecView<N> x) const { return rms_norm(x, VecView<N>(gamma_), eps_); }
+    Matrix<N> operator()(MatrixView<N> x) const { return rms_norm(x, VecView<N>(gamma_), eps_); }
 
 private:
     Vec<N> gamma_;
-    Scalar eps_;                       // <arch>.attention.layer_norm_rms_epsilon
+    Scalar eps_;  // <arch>.attention.layer_norm_rms_epsilon
 };
 
 // Gemma applies the same RMS operation without a learned scale to V heads,
@@ -97,12 +83,8 @@ class RMSNormNoScale {
 public:
     explicit RMSNormNoScale(Scalar eps = 1e-6f) : eps_(eps) {}
 
-    Vec<N> operator()(VecView<N> x) const {
-        return rms_norm(x, eps_);
-    }
-    Matrix<N> operator()(MatrixView<N> x) const {
-        return rms_norm(x, eps_);
-    }
+    Vec<N> operator()(VecView<N> x) const { return rms_norm(x, eps_); }
+    Matrix<N> operator()(MatrixView<N> x) const { return rms_norm(x, eps_); }
 
 private:
     Scalar eps_;
@@ -114,11 +96,11 @@ private:
 template <size_t D, size_t FF>
 class GatedMLP {
 public:
-    GatedMLP(Linear<D, FF> gate, Linear<D, FF> up, Linear<FF, D> down)
-        : gate_(std::move(gate)), up_(std::move(up)), down_(std::move(down)) {}
+    GatedMLP(Linear<D, FF> gate, Linear<D, FF> up, Linear<FF, D> down) : gate_(std::move(gate)), up_(std::move(up)), down_(std::move(down)) {}
 
     Vec<D> operator()(VecView<D> x) const {
-        Vec<FF> g = gate_(x);  silu(g);
+        Vec<FF> g = gate_(x);
+        silu(g);
         Vec<FF> u = up_(x);
         g *= u;
         return down_(g);
@@ -139,11 +121,11 @@ private:
 template <size_t D, size_t FF>
 class GeluGatedMLP {
 public:
-    GeluGatedMLP(Linear<D, FF> gate, Linear<D, FF> up, Linear<FF, D> down)
-        : gate_(std::move(gate)), up_(std::move(up)), down_(std::move(down)) {}
+    GeluGatedMLP(Linear<D, FF> gate, Linear<D, FF> up, Linear<FF, D> down) : gate_(std::move(gate)), up_(std::move(up)), down_(std::move(down)) {}
 
     Vec<D> operator()(VecView<D> x) const {
-        Vec<FF> g = gate_(x); gelu(g);
+        Vec<FF> g = gate_(x);
+        gelu(g);
         Vec<FF> u = up_(x);
         g *= u;
         return down_(g);
@@ -164,32 +146,27 @@ private:
 // always-on experts. The expert body is a parameter because a family's sparse
 // FFN is its dense FFN repeated — Qwen routes SwiGLU experts, Gemma routes
 // GELU-gated ones — and only the routing is new. [BANDWIDTH]
-template <size_t D, size_t FF, size_t NE, size_t TOPK, size_t SHARED = 0,
-          class Expert = GatedMLP<D, FF>>
+template <size_t D, size_t FF, size_t NE, size_t TOPK, size_t SHARED = 0, class Expert = GatedMLP<D, FF>>
 class MoE {
     static_assert(TOPK <= NE);
+
 public:
-    MoE(Linear<D, NE> router,
-        std::array<Expert, NE> experts,
-        std::array<Expert, SHARED> shared)
-        : router_(std::move(router)), experts_(std::move(experts)),
-          shared_(std::move(shared)) {}
+    MoE(Linear<D, NE> router, std::array<Expert, NE> experts, std::array<Expert, SHARED> shared) : router_(std::move(router)), experts_(std::move(experts)), shared_(std::move(shared)) {}
 
     Vec<D> operator()(VecView<D> x) const {
         Vec<NE> s = router_(x);
         softmax(std::span<Scalar>(s.begin(), NE));
         std::array<size_t, NE> idx;
         std::iota(idx.begin(), idx.end(), 0u);
-        std::partial_sort(idx.begin(), idx.begin() + TOPK, idx.end(),
-                          [&](size_t a, size_t b) { return s[a] > s[b]; });
+        std::partial_sort(idx.begin(), idx.begin() + TOPK, idx.end(), [&](size_t a, size_t b) { return s[a] > s[b]; });
         Scalar norm = 0;
         for (size_t k = 0; k < TOPK; ++k) norm += s[idx[k]];
         Vec<D> y;
-        for (size_t k = 0; k < TOPK; ++k) {           // routed experts
+        for (size_t k = 0; k < TOPK; ++k) {  // routed experts
             Vec<D> ye = experts_[idx[k]](x);
             axpy(s[idx[k]] / norm, VecView<D>(ye), y);
         }
-        for (const auto& sh : shared_) y += sh(x);     // always-on path
+        for (const auto& sh : shared_) y += sh(x);  // always-on path
         return y;
     }
 

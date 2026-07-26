@@ -21,18 +21,21 @@ thread_local bool t_in_parallel = false;
 
 class Pool {
 public:
-    static Pool& get() { static Pool p; return p; }
+    static Pool& get() {
+        static Pool p;
+        return p;
+    }
     size_t workers() const { return nthreads_; }
 
     void run(size_t n, const std::function<void(size_t)>& f) {
         if (n == 0) return;
-        if (nthreads_ <= 1 || n == 1 || t_in_parallel) {   // serial / nested
+        if (nthreads_ <= 1 || n == 1 || t_in_parallel) {  // serial / nested
             for (size_t i = 0; i < n; ++i) f(i);
             return;
         }
-        std::unique_lock<std::mutex> job(job_m_);          // one job at a time
+        std::unique_lock<std::mutex> job(job_m_);  // one job at a time
         fn_ = &f;
-        n_  = n;
+        n_ = n;
         // Grab work in CHUNKS, not one index at a time: for the big matvecs
         // (Out up to 128256) per-index atomics dominate. ~16 chunks/worker keeps
         // load balanced while cutting atomic ops by the chunk factor.
@@ -44,14 +47,18 @@ public:
             gen_++;
         }
         cv_.notify_all();
-        work_loop();                                       // main participates
+        work_loop();  // main participates
         std::unique_lock<std::mutex> lk(done_m_);
-        done_cv_.wait(lk, [&]{ return remaining_.load(std::memory_order_acquire) == 0; });
+        done_cv_.wait(lk, [&] { return remaining_.load(std::memory_order_acquire) == 0; });
         fn_ = nullptr;
     }
 
     ~Pool() {
-        { std::lock_guard<std::mutex> lk(m_); stop_ = true; gen_++; }
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            stop_ = true;
+            gen_++;
+        }
         cv_.notify_all();
         for (auto& t : threads_) t.join();
     }
@@ -61,10 +68,10 @@ private:
         unsigned hc = std::thread::hardware_concurrency();
         nthreads_ = hc ? hc : 1;
         if (const char* e = std::getenv("NM_THREADS")) {
-            long v = std::atol(e); if (v > 0) nthreads_ = size_t(v);
+            long v = std::atol(e);
+            if (v > 0) nthreads_ = size_t(v);
         }
-        for (size_t i = 1; i < nthreads_; ++i)
-            threads_.emplace_back([this]{ worker(); });
+        for (size_t i = 1; i < nthreads_; ++i) threads_.emplace_back([this] { worker(); });
     }
 
     void work_loop() {
@@ -86,7 +93,7 @@ private:
         uint64_t seen = 0;
         for (;;) {
             std::unique_lock<std::mutex> lk(m_);
-            cv_.wait(lk, [&]{ return stop_ || gen_ != seen; });
+            cv_.wait(lk, [&] { return stop_ || gen_ != seen; });
             if (stop_) return;
             seen = gen_;
             lk.unlock();
@@ -105,9 +112,7 @@ private:
     bool stop_ = false;
 };
 
-} // namespace
+}  // namespace
 
-void par_for(size_t n, const std::function<void(size_t)>& f) {
-    Pool::get().run(n, f);
-}
+void par_for(size_t n, const std::function<void(size_t)>& f) { Pool::get().run(n, f); }
 size_t nm_num_threads() { return Pool::get().workers(); }

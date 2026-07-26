@@ -30,30 +30,26 @@ int main() {
         check(m.rows() == 2 && m.cols() == 3, "runtime rows, static channels");
         check(m.row(1)[0] == 4 && m.row(1)[2] == 6, "rows preserve values");
         bool threw = false;
-        try { (void)m.row(2); } catch (const std::out_of_range&) { threw = true; }
+        try {
+            (void)m.row(2);
+        } catch (const std::out_of_range&) {
+            threw = true;
+        }
         check(threw, "row bounds are enforced");
     }
 
     std::printf("== multimodal embedding composition ==\n");
     {
         std::vector<EmbeddingSegment<2>> segments;
-        segments.emplace_back(rows<2>({{1, 10}, {2, 20}}),
-                              std::vector<TokenId>{TokenId{11}, TokenId{12}});
+        segments.emplace_back(rows<2>({{1, 10}, {2, 20}}), std::vector<TokenId>{TokenId{11}, TokenId{12}});
         segments.emplace_back(Modality::Image, rows<2>({{3, 30}, {4, 40}, {5, 50}}));
         segments.emplace_back(rows<2>({{6, 60}}), std::vector<TokenId>{TokenId{13}});
         auto seq = compose_embeddings(std::move(segments), 100);
         check(seq.tokens() == 6, "segments concatenate to one decoder sequence");
-        check(seq.embedding(0)[0] == 1 && seq.embedding(5)[1] == 60,
-              "composition preserves segment order and values");
-        check(seq.position(0).i == 100 && seq.position(5).i == 105,
-              "absolute positions remain continuous");
-        check(seq.spans().size() == 3 && seq.spans()[1].modality() == Modality::Image &&
-              seq.spans()[1].begin() == 2 && seq.spans()[1].end() == 5,
-              "modality spans track soft-token placement");
-        check(seq.ple_token_identity(0) == TokenId{11} &&
-              seq.ple_token_identity(2) == TokenId{0} &&
-              seq.ple_token_identity(5) == TokenId{13},
-              "PLE preserves text identities and substitutes PAD for soft tokens");
+        check(seq.embedding(0)[0] == 1 && seq.embedding(5)[1] == 60, "composition preserves segment order and values");
+        check(seq.position(0).i == 100 && seq.position(5).i == 105, "absolute positions remain continuous");
+        check(seq.spans().size() == 3 && seq.spans()[1].modality() == Modality::Image && seq.spans()[1].begin() == 2 && seq.spans()[1].end() == 5, "modality spans track soft-token placement");
+        check(seq.ple_token_identity(0) == TokenId{11} && seq.ple_token_identity(2) == TokenId{0} && seq.ple_token_identity(5) == TokenId{13}, "PLE preserves text identities and substitutes PAD for soft tokens");
 
         DecoderVisibility causal(seq.tokens());
         check(causal.allows(4, 1) && !causal.allows(1, 4), "causal visibility is lower triangular");
@@ -70,8 +66,11 @@ int main() {
         });
         check(prompt.parts().size() == 2, "prompt owns ordered text and image parts");
         bool threw = false;
-        try { (void)RGBImage(2, 2, {0, 0, 0}); }
-        catch (const std::invalid_argument&) { threw = true; }
+        try {
+            (void)RGBImage(2, 2, {0, 0, 0});
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
         check(threw, "RGB image shape invariant is enforced");
     }
 

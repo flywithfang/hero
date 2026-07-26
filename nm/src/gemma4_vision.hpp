@@ -25,14 +25,12 @@ struct Gemma4E4BVisionConfig {
 template <size_t D, size_t Rows>
 class PositionTable2D {
 public:
-    PositionTable2D(const Scalar* values, std::shared_ptr<const void> keepalive)
-        : values_(values), keepalive_(std::move(keepalive)) {
+    PositionTable2D(const Scalar* values, std::shared_ptr<const void> keepalive) : values_(values), keepalive_(std::move(keepalive)) {
         if (!values_) throw std::invalid_argument("PositionTable2D: null table");
     }
 
     Vec<D> at(size_t x, size_t y) const {
-        if (x >= Rows || y >= Rows)
-            throw std::out_of_range("PositionTable2D: position exceeds table");
+        if (x >= Rows || y >= Rows) throw std::out_of_range("PositionTable2D: position exceeds table");
         Vec<D> result;
         const Scalar* px = values_ + x * D;
         const Scalar* py = values_ + (Rows + y) * D;
@@ -41,13 +39,10 @@ public:
     }
 
     Matrix<D> grid(size_t width, size_t height) const {
-        if (width > Rows || height > Rows)
-            throw std::out_of_range(
-                "PositionTable2D: grid exceeds table");
+        if (width > Rows || height > Rows) throw std::out_of_range("PositionTable2D: grid exceeds table");
         Matrix<D> result(width * height);
         for (size_t y = 0; y < height; ++y)
-            for (size_t x = 0; x < width; ++x)
-                result.set_row(y * width + x, at(x, y));
+            for (size_t x = 0; x < width; ++x) result.set_row(y * width + x, at(x, y));
         return result;
     }
 
@@ -71,8 +66,7 @@ public:
 private:
     static void apply_axis(Scalar* value, size_t position) {
         for (size_t i = 0; i < Planes; ++i) {
-            const Scalar frequency = Scalar(std::pow(double(Base),
-                -double(2 * i) / double(AxisDim)));
+            const Scalar frequency = Scalar(std::pow(double(Base), -double(2 * i) / double(AxisDim)));
             const Scalar angle = Scalar(position) * frequency;
             const Scalar c = std::cos(angle), s = std::sin(angle);
             const Scalar a = value[i], b = value[i + Planes];
@@ -83,76 +77,43 @@ private:
 };
 
 template <size_t Heads, size_t HeadDim, size_t Base>
-void apply_vision_rope_2d(
-    Matrix<Heads * HeadDim>& queries,
-    Matrix<Heads * HeadDim>& keys,
-    size_t patches_x,
-    size_t patches_y) {
-    if (queries.rows() != patches_x * patches_y ||
-        keys.rows() != queries.rows())
-        throw std::invalid_argument(
-            "apply_vision_rope_2d: patch grid mismatch");
+void apply_vision_rope_2d(Matrix<Heads * HeadDim>& queries, Matrix<Heads * HeadDim>& keys, size_t patches_x, size_t patches_y) {
+    if (queries.rows() != patches_x * patches_y || keys.rows() != queries.rows()) throw std::invalid_argument("apply_vision_rope_2d: patch grid mismatch");
     VisionRope2D<HeadDim, Base> rope;
     for (size_t token = 0; token < queries.rows(); ++token) {
         const size_t x = token % patches_x;
         const size_t y = token / patches_x;
         for (size_t head = 0; head < Heads; ++head) {
-            rope.apply(
-                MutVecView<HeadDim>{
-                    queries.data() + token * Heads * HeadDim +
-                    head * HeadDim},
-                x, y);
-            rope.apply(
-                MutVecView<HeadDim>{
-                    keys.data() + token * Heads * HeadDim +
-                    head * HeadDim},
-                x, y);
+            rope.apply(MutVecView<HeadDim>{queries.data() + token * Heads * HeadDim + head * HeadDim}, x, y);
+            rope.apply(MutVecView<HeadDim>{keys.data() + token * Heads * HeadDim + head * HeadDim}, x, y);
         }
     }
 }
 
 template <size_t Patch>
-Matrix<Patch * Patch * 3> patchify_rgb(
-    std::span<const uint8_t> pixels,
-    size_t width,
-    size_t height) {
-    if (width % Patch != 0 || height % Patch != 0 ||
-        pixels.size() != width * height * 3)
-        throw std::invalid_argument("patchify_rgb: invalid image shape");
+Matrix<Patch * Patch * 3> patchify_rgb(std::span<const uint8_t> pixels, size_t width, size_t height) {
+    if (width % Patch != 0 || height % Patch != 0 || pixels.size() != width * height * 3) throw std::invalid_argument("patchify_rgb: invalid image shape");
     const size_t patches_x = width / Patch;
     const size_t patches_y = height / Patch;
     Matrix<Patch * Patch * 3> patches(patches_x * patches_y);
     par_for(patches.rows(), [&](size_t patch_index) {
         const size_t patch_y = patch_index / patches_x;
         const size_t patch_x = patch_index % patches_x;
-        MutVecView<Patch * Patch * 3> patch =
-            patches.row_mut(patch_index);
+        MutVecView<Patch * Patch * 3> patch = patches.row_mut(patch_index);
         for (size_t channel = 0; channel < 3; ++channel)
             for (size_t y = 0; y < Patch; ++y)
                 for (size_t x = 0; x < Patch; ++x) {
-                    const size_t source =
-                        ((patch_y * Patch + y) * width +
-                         patch_x * Patch + x) *
-                            3 +
-                        channel;
-                    const size_t target =
-                        x + Patch * (y + Patch * channel);
-                    patch[target] =
-                        2.f * (Scalar(pixels[source]) / 255.f) - 1.f;
+                    const size_t source = ((patch_y * Patch + y) * width + patch_x * Patch + x) * 3 + channel;
+                    const size_t target = x + Patch * (y + Patch * channel);
+                    patch[target] = 2.f * (Scalar(pixels[source]) / 255.f) - 1.f;
                 }
     });
     return patches;
 }
 
 template <size_t Pool, size_t Channels>
-Matrix<Channels> average_pool_2d(
-    MatrixView<Channels> input,
-    size_t width,
-    size_t height) {
-    if (input.rows() != width * height ||
-        width % Pool != 0 || height % Pool != 0)
-        throw std::invalid_argument(
-            "average_pool_2d: invalid input shape");
+Matrix<Channels> average_pool_2d(MatrixView<Channels> input, size_t width, size_t height) {
+    if (input.rows() != width * height || width % Pool != 0 || height % Pool != 0) throw std::invalid_argument("average_pool_2d: invalid input shape");
     const size_t output_width = width / Pool;
     const size_t output_height = height / Pool;
     Matrix<Channels> output(output_width * output_height);
@@ -162,12 +123,9 @@ Matrix<Channels> average_pool_2d(
         MutVecView<Channels> pooled = output.row_mut(output_index);
         for (size_t y = 0; y < Pool; ++y)
             for (size_t x = 0; x < Pool; ++x) {
-                const VecView<Channels> source = input.row(
-                    (output_y * Pool + y) * width +
-                    output_x * Pool + x);
+                const VecView<Channels> source = input.row((output_y * Pool + y) * width + output_x * Pool + x);
                 const Scalar weight = 1.f / Scalar(Pool * Pool);
-                for (size_t channel = 0; channel < Channels; ++channel)
-                    pooled[channel] += weight * source[channel];
+                for (size_t channel = 0; channel < Channels; ++channel) pooled[channel] += weight * source[channel];
             }
     });
     return output;
@@ -180,53 +138,26 @@ class GemmaVisionLayer {
 public:
     using DLinear = ClippedLinear<D, D>;
 
-    GemmaVisionLayer(RMSNorm<D> input_norm, DLinear query, DLinear key,
-                     DLinear value, DLinear output,
-                     PerHeadNorm<H, HeadDim, RMSNorm<HeadDim>> query_norm,
-                     PerHeadNorm<H, HeadDim, RMSNorm<HeadDim>> key_norm,
-                     RMSNormNoScale<HeadDim> value_norm,
-                     RMSNorm<D> attention_post_norm, RMSNorm<D> ffn_norm,
-                     ClippedLinear<D, FF> ffn_gate,
-                     ClippedLinear<D, FF> ffn_up,
-                     ClippedLinear<FF, D> ffn_down,
-                     RMSNorm<D> ffn_post_norm)
-        : input_norm_(std::move(input_norm)), query_(std::move(query)),
-          key_(std::move(key)), value_(std::move(value)), output_(std::move(output)),
-          query_norm_(std::move(query_norm)), key_norm_(std::move(key_norm)),
-          value_norm_(std::move(value_norm)),
-          attention_post_norm_(std::move(attention_post_norm)),
-          ffn_norm_(std::move(ffn_norm)), ffn_gate_(std::move(ffn_gate)),
-          ffn_up_(std::move(ffn_up)), ffn_down_(std::move(ffn_down)),
-          ffn_post_norm_(std::move(ffn_post_norm)) {}
+    GemmaVisionLayer(RMSNorm<D> input_norm, DLinear query, DLinear key, DLinear value, DLinear output, PerHeadNorm<H, HeadDim, RMSNorm<HeadDim>> query_norm, PerHeadNorm<H, HeadDim, RMSNorm<HeadDim>> key_norm, RMSNormNoScale<HeadDim> value_norm, RMSNorm<D> attention_post_norm, RMSNorm<D> ffn_norm, ClippedLinear<D, FF> ffn_gate, ClippedLinear<D, FF> ffn_up, ClippedLinear<FF, D> ffn_down, RMSNorm<D> ffn_post_norm) : input_norm_(std::move(input_norm)), query_(std::move(query)), key_(std::move(key)), value_(std::move(value)), output_(std::move(output)), query_norm_(std::move(query_norm)), key_norm_(std::move(key_norm)), value_norm_(std::move(value_norm)), attention_post_norm_(std::move(attention_post_norm)), ffn_norm_(std::move(ffn_norm)), ffn_gate_(std::move(ffn_gate)), ffn_up_(std::move(ffn_up)), ffn_down_(std::move(ffn_down)), ffn_post_norm_(std::move(ffn_post_norm)) {}
 
-    Matrix<D> operator()(MatrixView<D> input, size_t patches_x,
-                         size_t patches_y) const {
-        if (input.rows() != patches_x * patches_y)
-            throw std::invalid_argument("GemmaVisionLayer: patch grid mismatch");
+    Matrix<D> operator()(MatrixView<D> input, size_t patches_x, size_t patches_y) const {
+        if (input.rows() != patches_x * patches_y) throw std::invalid_argument("GemmaVisionLayer: patch grid mismatch");
         Matrix<D> normalized = input_norm_(input);
         Matrix<D> queries = query_norm_(query_(normalized.view()));
         Matrix<D> keys = key_norm_(key_(normalized.view()));
-        Matrix<D> values = transform_heads<H, HeadDim>(
-            value_(normalized.view()).view(),
-            [&](VecView<HeadDim> head) { return value_norm_(head); });
+        Matrix<D> values = transform_heads<H, HeadDim>(value_(normalized.view()).view(), [&](VecView<HeadDim> head) { return value_norm_(head); });
 
-        apply_vision_rope_2d<H, HeadDim, 100>(
-            queries, keys, patches_x, patches_y);
-        Matrix<D> attended = scaled_dot_product_attention<
-            H, HeadDim, HeadDim>(
-                queries.view(), keys.view(), values.view(), 1.f);
+        apply_vision_rope_2d<H, HeadDim, 100>(queries, keys, patches_x, patches_y);
+        Matrix<D> attended = scaled_dot_product_attention<H, HeadDim, HeadDim>(queries.view(), keys.view(), values.view(), 1.f);
 
-        Matrix<D> attention_branch =
-            attention_post_norm_(output_(attended.view()));
-        Matrix<D> residual =
-            add(input, attention_branch.view());
+        Matrix<D> attention_branch = attention_post_norm_(output_(attended.view()));
+        Matrix<D> residual = add(input, attention_branch.view());
 
         Matrix<D> ffn_input = ffn_norm_(residual.view());
         Matrix<FF> gate = ffn_gate_(ffn_input.view());
         gelu_in_place(gate.mutable_view());
         Matrix<FF> up = ffn_up_(ffn_input.view());
-        Matrix<D> ffn = ffn_post_norm_(
-            ffn_down_(hadamard(gate.view(), up.view()).view()));
+        Matrix<D> ffn = ffn_post_norm_(ffn_down_(hadamard(gate.view(), up.view()).view()));
         return add(residual.view(), ffn.view());
     }
 
@@ -247,47 +178,35 @@ class Gemma4E4BVisionEncoder {
 public:
     using Layer = GemmaVisionLayer<C::D, C::H, C::HEAD_DIM, C::FF>;
 
-    Gemma4E4BVisionEncoder(Weight<C::PATCH * C::PATCH * 3, C::D> patch_embedding,
-                           PositionTable2D<C::D, C::POSITION_ROWS> positions,
-                           std::vector<Layer> layers, Linear<C::D, C::OUT> projection)
-        : patch_embedding_(std::move(patch_embedding)), positions_(std::move(positions)),
-          layers_(std::move(layers)), projection_(std::move(projection)) {
-        if (layers_.size() != C::L)
-            throw std::invalid_argument("Gemma4E4BVisionEncoder: wrong layer count");
+    Gemma4E4BVisionEncoder(Weight<C::PATCH * C::PATCH * 3, C::D> patch_embedding, PositionTable2D<C::D, C::POSITION_ROWS> positions, std::vector<Layer> layers, Linear<C::D, C::OUT> projection) : patch_embedding_(std::move(patch_embedding)), positions_(std::move(positions)), layers_(std::move(layers)), projection_(std::move(projection)) {
+        if (layers_.size() != C::L) throw std::invalid_argument("Gemma4E4BVisionEncoder: wrong layer count");
     }
 
     EmbeddingSegment<C::OUT> encode(const RGBImage& image) const {
         const Prepared prepared = prepare(image);
         const size_t px = prepared.width / C::PATCH;
         const size_t py = prepared.height / C::PATCH;
-        Matrix<C::PATCH * C::PATCH * 3> patches =
-            patchify_rgb<C::PATCH>(
-                prepared.pixels, prepared.width, prepared.height);
-        Matrix<C::D> patch_tokens =
-            patch_embedding_.matmul(patches.view());
+        Matrix<C::PATCH * C::PATCH * 3> patches = patchify_rgb<C::PATCH>(prepared.pixels, prepared.width, prepared.height);
+        Matrix<C::D> patch_tokens = patch_embedding_.matmul(patches.view());
         Matrix<C::D> positions = positions_.grid(px, py);
-        Matrix<C::D> hidden =
-            add(patch_tokens.view(), positions.view());
-        for (const Layer& layer : layers_)
-            hidden = layer(hidden.view(), px, py);
+        Matrix<C::D> hidden = add(patch_tokens.view(), positions.view());
+        for (const Layer& layer : layers_) hidden = layer(hidden.view(), px, py);
 
         const size_t out_x = px / C::POOL, out_y = py / C::POOL;
-        if (out_x == 0 || out_y == 0)
-            throw std::invalid_argument("Gemma4E4BVisionEncoder: image produces no pooled tokens");
-        Matrix<C::D> pooled =
-            average_pool_2d<C::POOL>(hidden.view(), px, py);
-        scale_in_place(
-            pooled.mutable_view(), std::sqrt(Scalar(C::D)));
+        if (out_x == 0 || out_y == 0) throw std::invalid_argument("Gemma4E4BVisionEncoder: image produces no pooled tokens");
+        Matrix<C::D> pooled = average_pool_2d<C::POOL>(hidden.view(), px, py);
+        scale_in_place(pooled.mutable_view(), std::sqrt(Scalar(C::D)));
         RMSNormNoScale<C::D> pre_projection(C::EPS);
-        Matrix<C::D> normalized =
-            pre_projection(pooled.view());
-        Matrix<C::OUT> output =
-            projection_(normalized.view());
+        Matrix<C::D> normalized = pre_projection(pooled.view());
+        Matrix<C::OUT> output = projection_(normalized.view());
         return EmbeddingSegment<C::OUT>(Modality::Image, std::move(output));
     }
 
 private:
-    struct Prepared { size_t width, height; std::vector<uint8_t> pixels; };
+    struct Prepared {
+        size_t width, height;
+        std::vector<uint8_t> pixels;
+    };
 
     static Prepared prepare(const RGBImage& image) {
         constexpr size_t Align = C::PATCH * C::POOL;
@@ -312,21 +231,20 @@ private:
         const auto source = image.pixels();
         const Scalar xr = width > 1 ? Scalar(image.width() - 1) / Scalar(width - 1) : 0.f;
         const Scalar yr = height > 1 ? Scalar(image.height() - 1) / Scalar(height - 1) : 0.f;
-        for (size_t y = 0; y < height; ++y) for (size_t x = 0; x < width; ++x) {
-            const Scalar sx = Scalar(x) * xr, sy = Scalar(y) * yr;
-            const size_t x0 = std::min(size_t(sx), image.width() - 1);
-            const size_t y0 = std::min(size_t(sy), image.height() - 1);
-            const size_t x1 = std::min(x0 + 1, image.width() - 1);
-            const size_t y1 = std::min(y0 + 1, image.height() - 1);
-            const Scalar xf = sx - Scalar(x0), yf = sy - Scalar(y0);
-            for (size_t c = 0; c < 3; ++c) {
-                const Scalar top = Scalar(source[(y0 * image.width() + x0) * 3 + c]) * (1 - xf) +
-                                   Scalar(source[(y0 * image.width() + x1) * 3 + c]) * xf;
-                const Scalar bottom = Scalar(source[(y1 * image.width() + x0) * 3 + c]) * (1 - xf) +
-                                      Scalar(source[(y1 * image.width() + x1) * 3 + c]) * xf;
-                result.pixels[(y * width + x) * 3 + c] = uint8_t(top * (1 - yf) + bottom * yf);
+        for (size_t y = 0; y < height; ++y)
+            for (size_t x = 0; x < width; ++x) {
+                const Scalar sx = Scalar(x) * xr, sy = Scalar(y) * yr;
+                const size_t x0 = std::min(size_t(sx), image.width() - 1);
+                const size_t y0 = std::min(size_t(sy), image.height() - 1);
+                const size_t x1 = std::min(x0 + 1, image.width() - 1);
+                const size_t y1 = std::min(y0 + 1, image.height() - 1);
+                const Scalar xf = sx - Scalar(x0), yf = sy - Scalar(y0);
+                for (size_t c = 0; c < 3; ++c) {
+                    const Scalar top = Scalar(source[(y0 * image.width() + x0) * 3 + c]) * (1 - xf) + Scalar(source[(y0 * image.width() + x1) * 3 + c]) * xf;
+                    const Scalar bottom = Scalar(source[(y1 * image.width() + x0) * 3 + c]) * (1 - xf) + Scalar(source[(y1 * image.width() + x1) * 3 + c]) * xf;
+                    result.pixels[(y * width + x) * 3 + c] = uint8_t(top * (1 - yf) + bottom * yf);
+                }
             }
-        }
         return result;
     }
 

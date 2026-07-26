@@ -23,13 +23,13 @@ public:
     // encode: text -> token ids. add_bos prepends bos; parse_special makes
     // control tokens match as whole tokens (chat needs this).
     std::vector<int32_t> encode(const std::string& text, bool add_bos, bool parse_special) const;
-    std::string          decode(const std::vector<int32_t>& ids) const;
-    std::string          decode1(int32_t id) const;   // single token's bytes
+    std::string decode(const std::vector<int32_t>& ids) const;
+    std::string decode1(int32_t id) const;  // single token's bytes
 
     int32_t bos() const { return bos_; }
     int32_t eos() const { return eos_; }
-    size_t  vocab_size() const { return id_to_tok_.size(); }
-    bool    is_eog(int32_t id) const;                 // any end-of-generation id
+    size_t vocab_size() const { return id_to_tok_.size(); }
+    bool is_eog(int32_t id) const;  // any end-of-generation id
 
 private:
     enum class Pretokenizer : uint8_t { ByteLevel, Sentence };
@@ -47,7 +47,7 @@ private:
         bool marks_join_letters = false;
     };
 
-    std::vector<std::string>              id_to_tok_;  // remapped-unicode strings
+    std::vector<std::string> id_to_tok_;  // remapped-unicode strings
     std::unordered_map<std::string, int32_t> tok_to_id_;
     std::unordered_map<std::string, int32_t> special_;  // control-token text->id
     std::unordered_map<uint64_t, int32_t> merge_rank_;  // (a<<32|b) -> rank
@@ -59,8 +59,9 @@ private:
     bool ignore_merges_ = true;
 
     std::vector<std::string> pretokenize(const std::string& text) const;
-    std::vector<int32_t>     bpe_encode_chunk(const std::string& piece) const;
+    std::vector<int32_t> bpe_encode_chunk(const std::string& piece) const;
     int32_t id_of(const std::string& t) const {
-        auto it = tok_to_id_.find(t); return it == tok_to_id_.end() ? -1 : it->second;
+        auto it = tok_to_id_.find(t);
+        return it == tok_to_id_.end() ? -1 : it->second;
     }
 };

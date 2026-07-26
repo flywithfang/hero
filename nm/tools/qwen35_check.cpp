@@ -14,21 +14,20 @@
 #include <numeric>
 
 template <class C>
-static int check(const GGUF& gguf, const char* name, const char* prompt,
-                 size_t generate_count) {
+static int check(const GGUF& gguf, const char* name, const char* prompt, size_t generate_count) {
     qwen35_loader::validate_metadata<C>(gguf);
-    std::printf("Qwen 3.5 %s metadata valid: %zu tensors\n", name,
-                gguf.tensors().size());
+    std::printf("Qwen 3.5 %s metadata valid: %zu tensors\n", name, gguf.tensors().size());
     auto model = qwen35_loader::load<C>(gguf);
     (void)model;
     constexpr size_t full = C::L / C::FULL_ATTENTION_INTERVAL;
-    std::printf("Qwen 3.5 %s assembly loaded: %zu layers "
-                "(%zu gated-deltanet, %zu full attention)\n",
-                name, C::L, C::L - full, full);
-    std::printf("carried state: %zu floats/layer recurrent (constant in T), "
-                "%zu floats/token/layer attention\n",
-                Qwen35State<C>::recurrent_floats_per_layer(),
-                Qwen35State<C>::attention_floats_per_token_per_layer());
+    std::printf(
+        "Qwen 3.5 %s assembly loaded: %zu layers "
+        "(%zu gated-deltanet, %zu full attention)\n",
+        name, C::L, C::L - full, full);
+    std::printf(
+        "carried state: %zu floats/layer recurrent (constant in T), "
+        "%zu floats/token/layer attention\n",
+        Qwen35State<C>::recurrent_floats_per_layer(), Qwen35State<C>::attention_floats_per_token_per_layer());
     if (!prompt) return 0;
 
     Tokenizer tokenizer(gguf);
@@ -42,23 +41,17 @@ static int check(const GGUF& gguf, const char* name, const char* prompt,
     PrefixCache<Qwen35Architecture<C>> memo;
     const auto prefill_start = std::chrono::steady_clock::now();
     auto logits = model(tokens, memo);
-    const double prefill = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - prefill_start).count();
-    std::printf("prefill: %.3fs (%zu tokens, %.2f tok/s)\n", prefill,
-                ids.size(), double(ids.size()) / prefill);
+    const double prefill = std::chrono::duration<double>(std::chrono::steady_clock::now() - prefill_start).count();
+    std::printf("prefill: %.3fs (%zu tokens, %.2f tok/s)\n", prefill, ids.size(), double(ids.size()) / prefill);
 
     std::vector<size_t> top(C::V);
     std::iota(top.begin(), top.end(), 0);
-    std::partial_sort(top.begin(), top.begin() + 5, top.end(),
-                      [&](size_t a, size_t b) { return logits[a] > logits[b]; });
+    std::partial_sort(top.begin(), top.begin() + 5, top.end(), [&](size_t a, size_t b) { return logits[a] > logits[b]; });
     const Scalar max_logit = logits[top[0]];
     double exp_sum = 0;
     for (size_t v = 0; v < C::V; ++v) exp_sum += std::exp(double(logits[v] - max_logit));
     const double log_z = double(max_logit) + std::log(exp_sum);
-    for (size_t i = 0; i < 5; ++i)
-        std::printf("top%zu: id=%zu logprob=%.9f piece=%s\n", i + 1, top[i],
-                    double(logits[top[i]]) - log_z,
-                    tokenizer.decode1(int32_t(top[i])).c_str());
+    for (size_t i = 0; i < 5; ++i) std::printf("top%zu: id=%zu logprob=%.9f piece=%s\n", i + 1, top[i], double(logits[top[i]]) - log_z, tokenizer.decode1(int32_t(top[i])).c_str());
 
     if (generate_count > 1) {
         const auto decode_start = std::chrono::steady_clock::now();
@@ -76,29 +69,22 @@ static int check(const GGUF& gguf, const char* name, const char* prompt,
             tokens.push_back(TokenId{int32_t(token)});
             logits = model(tokens, memo);
         }
-        const double decode = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - decode_start).count();
-        std::printf("\ntext: %s\ndecode: %.3fs (%zu tokens, %.2f tok/s)\n",
-                    text.c_str(), decode, produced, double(produced) / decode);
+        const double decode = std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_start).count();
+        std::printf("\ntext: %s\ndecode: %.3fs (%zu tokens, %.2f tok/s)\n", text.c_str(), decode, produced, double(produced) / decode);
     }
     return 0;
 }
 
 int main(int argc, char** argv) {
-    if (argc < 3 || argc > 5 ||
-        (std::strcmp(argv[2], "4b") && std::strcmp(argv[2], "9b"))) {
-        std::fprintf(stderr,
-            "usage: %s qwen35.gguf {4b|9b} [prompt [generate-count]]\n", argv[0]);
+    if (argc < 3 || argc > 5 || (std::strcmp(argv[2], "4b") && std::strcmp(argv[2], "9b"))) {
+        std::fprintf(stderr, "usage: %s qwen35.gguf {4b|9b} [prompt [generate-count]]\n", argv[0]);
         return 2;
     }
     try {
         GGUF gguf(argv[1]);
         const char* prompt = argc > 3 ? argv[3] : nullptr;
-        const size_t generate_count =
-            argc > 4 ? std::strtoull(argv[4], nullptr, 10) : 1;
-        return std::strcmp(argv[2], "4b") == 0
-            ? check<Qwen35_4BConfig>(gguf, "4B", prompt, generate_count)
-            : check<Qwen35_9BConfig>(gguf, "9B", prompt, generate_count);
+        const size_t generate_count = argc > 4 ? std::strtoull(argv[4], nullptr, 10) : 1;
+        return std::strcmp(argv[2], "4b") == 0 ? check<Qwen35_4BConfig>(gguf, "4B", prompt, generate_count) : check<Qwen35_9BConfig>(gguf, "9B", prompt, generate_count);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;

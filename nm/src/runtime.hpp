@@ -7,15 +7,16 @@
 template <size_t V>
 TokenId sample_greedy(const Vec<V>& lg) {
     size_t best = 0;
-    for (size_t v = 1; v < V; ++v) if (lg[v] > lg[best]) best = v;
+    for (size_t v = 1; v < V; ++v)
+        if (lg[v] > lg[best]) best = v;
     return TokenId{int32_t(best)};
 }
 
 struct SamplerCfg {
-    float  temp   = 0.0f;      // 0 => greedy
-    int    top_k  = 0;         // 0 => disabled
-    float  top_p  = 1.0f;      // 1 => disabled
-    float  rep_penalty = 1.0f; // 1 => disabled
+    float temp = 0.0f;         // 0 => greedy
+    int top_k = 0;             // 0 => disabled
+    float top_p = 1.0f;        // 1 => disabled
+    float rep_penalty = 1.0f;  // 1 => disabled
     uint64_t seed = 0;
 };
 
@@ -24,6 +25,7 @@ template <size_t V>
 class Sampler {
     SamplerCfg cfg_;
     std::mt19937_64 rng_;
+
 public:
     explicit Sampler(SamplerCfg c = {}) : cfg_(c), rng_(c.seed) {}
     const SamplerCfg& cfg() const { return cfg_; }
@@ -40,19 +42,32 @@ public:
         std::vector<int> idx(V);
         std::iota(idx.begin(), idx.end(), 0);
         size_t k = cfg_.top_k > 0 ? std::min<size_t>(cfg_.top_k, V) : V;
-        std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
-                          [&](int a, int b){ return lg[a] > lg[b]; });
+        std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
         idx.resize(k);
         const float mx = lg[idx[0]];
         std::vector<float> pr(k);
         float sum = 0;
-        for (size_t i = 0; i < k; ++i) { pr[i] = std::exp((lg[idx[i]] - mx) / cfg_.temp); sum += pr[i]; }
-        float cum = 0; size_t keep = k;
-        for (size_t i = 0; i < k; ++i) { cum += pr[i] / sum; if (cum >= cfg_.top_p) { keep = i + 1; break; } }
-        float s2 = 0; for (size_t i = 0; i < keep; ++i) s2 += pr[i];
+        for (size_t i = 0; i < k; ++i) {
+            pr[i] = std::exp((lg[idx[i]] - mx) / cfg_.temp);
+            sum += pr[i];
+        }
+        float cum = 0;
+        size_t keep = k;
+        for (size_t i = 0; i < k; ++i) {
+            cum += pr[i] / sum;
+            if (cum >= cfg_.top_p) {
+                keep = i + 1;
+                break;
+            }
+        }
+        float s2 = 0;
+        for (size_t i = 0; i < keep; ++i) s2 += pr[i];
         std::uniform_real_distribution<float> U(0, s2);
         float r = U(rng_), acc = 0;
-        for (size_t i = 0; i < keep; ++i) { acc += pr[i]; if (r <= acc) return TokenId{idx[i]}; }
+        for (size_t i = 0; i < keep; ++i) {
+            acc += pr[i];
+            if (r <= acc) return TokenId{idx[i]};
+        }
         return TokenId{idx[keep - 1]};
     }
 };

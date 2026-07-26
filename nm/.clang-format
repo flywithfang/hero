@@ -1,0 +1,26 @@
+# nm formatting. The one rule that matters: a parameter list is never broken
+# across lines. A signature should read as a single scannable unit, so the
+# column limit is set high enough that every declaration in the tree fits on
+# one line — the widest is GemmaVisionLayer's constructor at 831 columns.
+#
+# NOTE: ColumnLimit: 0 would be wrong here — it makes clang-format preserve
+# whatever line breaks are already in the file instead of joining them.
+BasedOnStyle: Google
+ColumnLimit: 1000
+
+IndentWidth: 4
+AccessModifierOffset: -4
+
+# Keep parameters packed onto the line rather than one-per-line.
+BinPackParameters: true
+AllowAllParametersOfDeclarationOnNextLine: true
+PackConstructorInitializers: BinPack
+PenaltyBreakBeforeFirstCallParameter: 1000000
+
+# Don't split string literals to satisfy the limit.
+PenaltyBreakString: 1000000
+BreakStringLiterals: false
+
+DerivePointerAlignment: false
+PointerAlignment: Left
+SortIncludes: false

@@ -44,21 +44,16 @@ inline RGBImage load_rgb_image(const std::string& path) {
     const size_t width = std::stoull(ppm_word(input));
     const size_t height = std::stoull(ppm_word(input));
     const size_t maximum = std::stoull(ppm_word(input));
-    if (maximum == 0 || maximum > 255)
-        throw std::runtime_error("image: unsupported PPM sample range");
-    if (width == 0 || height == 0 || width > std::numeric_limits<size_t>::max() / height ||
-        width * height > std::numeric_limits<size_t>::max() / 3)
-        throw std::runtime_error("image: invalid dimensions");
+    if (maximum == 0 || maximum > 255) throw std::runtime_error("image: unsupported PPM sample range");
+    if (width == 0 || height == 0 || width > std::numeric_limits<size_t>::max() / height || width * height > std::numeric_limits<size_t>::max() / 3) throw std::runtime_error("image: invalid dimensions");
 
     std::vector<uint8_t> pixels(width * height * 3);
     if (magic == "P6") {
         char separator = 0;
         input.get(separator);
-        if (!input || !std::isspace(static_cast<unsigned char>(separator)))
-            throw std::runtime_error("image: malformed P6 header separator");
+        if (!input || !std::isspace(static_cast<unsigned char>(separator))) throw std::runtime_error("image: malformed P6 header separator");
         input.read(reinterpret_cast<char*>(pixels.data()), std::streamsize(pixels.size()));
-        if (input.gcount() != std::streamsize(pixels.size()))
-            throw std::runtime_error("image: truncated PPM pixel data");
+        if (input.gcount() != std::streamsize(pixels.size())) throw std::runtime_error("image: truncated PPM pixel data");
         if (maximum != 255)
             for (uint8_t& value : pixels) value = uint8_t(size_t(value) * 255 / maximum);
     } else {

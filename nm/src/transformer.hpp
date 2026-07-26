@@ -56,28 +56,21 @@ private:
     Norm norm_;
 };
 
-template <size_t D, class InputNorm_, class Operation_,
-          class PostTransform_ = NoPostTransform>
+template <size_t D, class InputNorm_, class Operation_, class PostTransform_ = NoPostTransform>
 class ResidualBranch {
 public:
     using InputNorm = InputNorm_;
     using Operation = Operation_;
     using PostTransform = PostTransform_;
 
-    ResidualBranch(InputNorm input_norm, Operation operation,
-                   PostTransform post_transform = {})
-        : input_norm_(std::move(input_norm)), operation_(std::move(operation)),
-          post_transform_(std::move(post_transform)) {}
+    ResidualBranch(InputNorm input_norm, Operation operation, PostTransform post_transform = {}) : input_norm_(std::move(input_norm)), operation_(std::move(operation)), post_transform_(std::move(post_transform)) {}
 
     Vec<D> normalize(VecView<D> input) const { return input_norm_(input); }
-    Matrix<D> normalize(MatrixView<D> input) const {
-        return input_norm_(input);
-    }
+    Matrix<D> normalize(MatrixView<D> input) const { return input_norm_(input); }
     const Operation& operation() const { return operation_; }
 
     template <class Runner>
-    Vec<D> finish(VecView<D> residual, VecView<D> normalized,
-                  Runner&& run) const {
+    Vec<D> finish(VecView<D> residual, VecView<D> normalized, Runner&& run) const {
         Vec<D> branch = std::forward<Runner>(run)(operation_, normalized);
         post_transform_.apply(branch);
         branch += residual;
@@ -85,10 +78,8 @@ public:
     }
 
     template <class Runner>
-    Matrix<D> finish(MatrixView<D> residual, MatrixView<D> normalized,
-                     Runner&& run) const {
-        Matrix<D> branch =
-            std::forward<Runner>(run)(operation_, normalized);
+    Matrix<D> finish(MatrixView<D> residual, MatrixView<D> normalized, Runner&& run) const {
+        Matrix<D> branch = std::forward<Runner>(run)(operation_, normalized);
         post_transform_.apply(branch);
         return add(residual, branch.view());
     }
@@ -116,56 +107,36 @@ private:
 template <size_t D>
 struct IdentityLayerTail {
     Vec<D> operator()(Vec<D> hidden, NoLayerInput = {}) const { return hidden; }
-    Matrix<D> operator()(Matrix<D> hidden, NoLayerInput = {}) const {
-        return hidden;
-    }
+    Matrix<D> operator()(Matrix<D> hidden, NoLayerInput = {}) const { return hidden; }
 };
 
 // A canonical decoder block is communication across tokens followed by a
 // per-token channel transform.  Tail represents optional architecture-specific
 // work after those branches (for example Gemma E4B's PLE residual and scale).
-template <size_t D, class TokenMixerBranch_, class ChannelMixerBranch_,
-          class Tail_ = IdentityLayerTail<D>>
+template <size_t D, class TokenMixerBranch_, class ChannelMixerBranch_, class Tail_ = IdentityLayerTail<D>>
 class TransformerBlock {
 public:
     using TokenMixerBranch = TokenMixerBranch_;
     using ChannelMixerBranch = ChannelMixerBranch_;
     using Tail = Tail_;
 
-    TransformerBlock(TokenMixerBranch token_mixer,
-                     ChannelMixerBranch channel_mixer,
-                     Tail tail = {})
-        : token_mixer_(std::move(token_mixer)),
-          channel_mixer_(std::move(channel_mixer)),
-          tail_(std::move(tail)) {}
+    TransformerBlock(TokenMixerBranch token_mixer, ChannelMixerBranch channel_mixer, Tail tail = {}) : token_mixer_(std::move(token_mixer)), channel_mixer_(std::move(channel_mixer)), tail_(std::move(tail)) {}
 
     const TokenMixerBranch& token_mixer_branch() const { return token_mixer_; }
     const ChannelMixerBranch& channel_mixer_branch() const { return channel_mixer_; }
     const Tail& tail() const { return tail_; }
 
     template <class LayerInput, class TokenMixerRunner, class ChannelMixerRunner>
-    Vec<D> forward(VecView<D> input, const LayerInput& layer_input,
-                   TokenMixerRunner&& run_token_mixer,
-                   ChannelMixerRunner&& run_channel_mixer) const {
-        Vec<D> communicated = token_mixer_.forward(
-            input, std::forward<TokenMixerRunner>(run_token_mixer));
-        Vec<D> transformed = channel_mixer_.forward(
-            VecView<D>(communicated),
-            std::forward<ChannelMixerRunner>(run_channel_mixer));
+    Vec<D> forward(VecView<D> input, const LayerInput& layer_input, TokenMixerRunner&& run_token_mixer, ChannelMixerRunner&& run_channel_mixer) const {
+        Vec<D> communicated = token_mixer_.forward(input, std::forward<TokenMixerRunner>(run_token_mixer));
+        Vec<D> transformed = channel_mixer_.forward(VecView<D>(communicated), std::forward<ChannelMixerRunner>(run_channel_mixer));
         return tail_(std::move(transformed), layer_input);
     }
 
-    template <class LayerInput, class TokenMixerRunner,
-              class ChannelMixerRunner>
-    Matrix<D> forward(MatrixView<D> input,
-                      const LayerInput& layer_input,
-                      TokenMixerRunner&& run_token_mixer,
-                      ChannelMixerRunner&& run_channel_mixer) const {
-        Matrix<D> communicated = token_mixer_.forward(
-            input, std::forward<TokenMixerRunner>(run_token_mixer));
-        Matrix<D> transformed = channel_mixer_.forward(
-            communicated.view(),
-            std::forward<ChannelMixerRunner>(run_channel_mixer));
+    template <class LayerInput, class TokenMixerRunner, class ChannelMixerRunner>
+    Matrix<D> forward(MatrixView<D> input, const LayerInput& layer_input, TokenMixerRunner&& run_token_mixer, ChannelMixerRunner&& run_channel_mixer) const {
+        Matrix<D> communicated = token_mixer_.forward(input, std::forward<TokenMixerRunner>(run_token_mixer));
+        Matrix<D> transformed = channel_mixer_.forward(communicated.view(), std::forward<ChannelMixerRunner>(run_channel_mixer));
         return tail_(std::move(transformed), layer_input);
     }
 
@@ -181,8 +152,7 @@ private:
 template <size_t D>
 class ResidualStream {
 public:
-    explicit ResidualStream(const EmbeddedSequence<D>& input)
-        : values_(copy(input.matrix())) {}
+    explicit ResidualStream(const EmbeddedSequence<D>& input) : values_(copy(input.matrix())) {}
 
     size_t tokens() const { return values_.rows(); }
     MatrixView<D> matrix() const { return values_.view(); }
@@ -192,8 +162,7 @@ public:
     void set_token(size_t i, VecView<D> value) { values_.set_row(i, value); }
     void set_token(size_t i, const Vec<D>& value) { values_.set_row(i, value); }
     void set_matrix(Matrix<D> values) {
-        if (values.rows() != values_.rows())
-            throw std::invalid_argument("ResidualStream: matrix row mismatch");
+        if (values.rows() != values_.rows()) throw std::invalid_argument("ResidualStream: matrix row mismatch");
         values_ = std::move(values);
     }
 
@@ -202,9 +171,7 @@ private:
 };
 
 template <class TokenIO, size_t D, size_t V>
-concept TokenInputOutput = requires(const TokenIO& token_io, TokenId id,
-                                    std::span<const TokenId> ids,
-                                    VecView<D> hidden) {
+concept TokenInputOutput = requires(const TokenIO& token_io, TokenId id, std::span<const TokenId> ids, VecView<D> hidden) {
     { token_io.token(id) } -> std::same_as<Vec<D>>;
     { token_io.tokens(ids) } -> std::same_as<Matrix<D>>;
     { token_io.logits(hidden) } -> std::same_as<Vec<V>>;
@@ -213,16 +180,10 @@ concept TokenInputOutput = requires(const TokenIO& token_io, TokenId id,
 // Shared text frontend: model families differ in the embedding operation, not
 // in how token IDs, identities, positions, and modality spans are assembled.
 template <size_t D, class EmbedTokens>
-EmbeddedSequence<D> embed_text_tokens(std::span<const TokenId> ids,
-                                      size_t first_position,
-                                      EmbedTokens&& embed_tokens) {
-    if (ids.empty())
-        throw std::invalid_argument("transformer: empty token sequence");
-    Matrix<D> embeddings =
-        std::invoke(std::forward<EmbedTokens>(embed_tokens), ids);
-    if (embeddings.rows() != ids.size())
-        throw std::invalid_argument(
-            "transformer: embedding row count mismatch");
+EmbeddedSequence<D> embed_text_tokens(std::span<const TokenId> ids, size_t first_position, EmbedTokens&& embed_tokens) {
+    if (ids.empty()) throw std::invalid_argument("transformer: empty token sequence");
+    Matrix<D> embeddings = std::invoke(std::forward<EmbedTokens>(embed_tokens), ids);
+    if (embeddings.rows() != ids.size()) throw std::invalid_argument("transformer: embedding row count mismatch");
     std::vector<TokenId> identities(ids.begin(), ids.end());
     std::vector<EmbeddingSegment<D>> segments;
     segments.emplace_back(std::move(embeddings), std::move(identities));
@@ -233,9 +194,7 @@ EmbeddedSequence<D> embed_text_tokens(std::span<const TokenId> ids,
 // owns the input embedding/output-head relationship (including tied weights),
 // Layer may itself be a variant for heterogeneous stacks, and ArchitectureData
 // contains immutable model-wide policy weights such as RoPE or Gemma PLE.
-template <size_t D_, size_t V_, size_t L_, class TokenIO_, class Layer_,
-          class FinalNorm_, class ArchitectureData_ = NoArchitectureData,
-          class LayerSchedule_ = AnyLayerSchedule>
+template <size_t D_, size_t V_, size_t L_, class TokenIO_, class Layer_, class FinalNorm_, class ArchitectureData_ = NoArchitectureData, class LayerSchedule_ = AnyLayerSchedule>
 class TransformerWeights {
 public:
     static constexpr size_t D = D_;
@@ -247,20 +206,11 @@ public:
     using ArchitectureData = ArchitectureData_;
     using LayerSchedule = LayerSchedule_;
 
-    static_assert(TokenInputOutput<TokenIO, D, V>,
-                  "TokenIO must embed token IDs and project hidden states to logits");
+    static_assert(TokenInputOutput<TokenIO, D, V>, "TokenIO must embed token IDs and project hidden states to logits");
 
-    TransformerWeights(TokenIO token_io, std::vector<Layer> layers,
-                       FinalNorm final_norm,
-                       ArchitectureData architecture_data = {})
-        : token_io_(std::move(token_io)), layers_(std::move(layers)),
-          final_norm_(std::move(final_norm)),
-          architecture_data_(std::move(architecture_data)) {
-        if (layers_.size() != L)
-            throw std::invalid_argument(
-                "TransformerWeights: wrong layer count");
-        for (size_t layer = 0; layer < layers_.size(); ++layer)
-            LayerSchedule::validate(layers_[layer], layer);
+    TransformerWeights(TokenIO token_io, std::vector<Layer> layers, FinalNorm final_norm, ArchitectureData architecture_data = {}) : token_io_(std::move(token_io)), layers_(std::move(layers)), final_norm_(std::move(final_norm)), architecture_data_(std::move(architecture_data)) {
+        if (layers_.size() != L) throw std::invalid_argument("TransformerWeights: wrong layer count");
+        for (size_t layer = 0; layer < layers_.size(); ++layer) LayerSchedule::validate(layers_[layer], layer);
     }
 
     const TokenIO& token_io() const { return token_io_; }
@@ -280,55 +230,30 @@ private:
 // these as explicit operations prevents a flat collection of anatomy booleans
 // from pretending that all transformer layers have the same physical shape.
 template <class A>
-concept TransformerArchitecture = requires(
-    const typename A::Weights& weights,
-    typename A::PrefixState& prefix_state,
-    const EmbeddedSequence<A::D>& input,
-    ResidualStream<A::D>& residual,
-    typename A::PreparedInput& prepared,
-    std::span<const TokenId> token_ids,
-    size_t layer) {
+concept TransformerArchitecture = requires(const typename A::Weights& weights, typename A::PrefixState& prefix_state, const EmbeddedSequence<A::D>& input, ResidualStream<A::D>& residual, typename A::PreparedInput& prepared, std::span<const TokenId> token_ids, size_t layer) {
     requires A::D == A::Weights::D;
     requires A::V == A::Weights::V;
     requires A::L == A::Weights::L;
-    { A::make_prefix_state() }
-        -> std::same_as<typename A::PrefixState>;
-    { A::prefix_tokens(prefix_state) }
-        -> std::convertible_to<size_t>;
-    { A::embed(weights, token_ids, size_t{}) }
-        -> std::same_as<EmbeddedSequence<A::D>>;
-    { A::prepare(weights, input) }
-        -> std::same_as<typename A::PreparedInput>;
-    { A::forward_layer(
-        weights, prefix_state, input, residual, prepared, layer) }
-        -> std::same_as<void>;
-    { A::advance_prefix(prefix_state, size_t{}) }
-        -> std::same_as<void>;
+    { A::make_prefix_state() } -> std::same_as<typename A::PrefixState>;
+    { A::prefix_tokens(prefix_state) } -> std::convertible_to<size_t>;
+    { A::embed(weights, token_ids, size_t{}) } -> std::same_as<EmbeddedSequence<A::D>>;
+    { A::prepare(weights, input) } -> std::same_as<typename A::PreparedInput>;
+    { A::forward_layer(weights, prefix_state, input, residual, prepared, layer) } -> std::same_as<void>;
+    { A::advance_prefix(prefix_state, size_t{}) } -> std::same_as<void>;
     { A::output(weights, residual) } -> std::same_as<Vec<A::V>>;
 };
 
 template <class Architecture>
     requires TransformerArchitecture<Architecture>
-Vec<Architecture::V> evaluate_transformer_suffix(
-    const typename Architecture::Weights& weights,
-    typename Architecture::PrefixState& prefix_state,
-    const EmbeddedSequence<Architecture::D>& input) {
-    if (input.tokens() == 0)
-        throw std::invalid_argument("transformer: empty input");
-    const size_t used =
-        Architecture::prefix_tokens(prefix_state);
-    if (input.position(0).i != used)
-        throw std::invalid_argument(
-            "transformer: cache/input prefix mismatch");
-    if (input.tokens() > Architecture::CTX - used)
-        throw std::length_error("transformer: context exhausted");
+Vec<Architecture::V> evaluate_transformer_suffix(const typename Architecture::Weights& weights, typename Architecture::PrefixState& prefix_state, const EmbeddedSequence<Architecture::D>& input) {
+    if (input.tokens() == 0) throw std::invalid_argument("transformer: empty input");
+    const size_t used = Architecture::prefix_tokens(prefix_state);
+    if (input.position(0).i != used) throw std::invalid_argument("transformer: cache/input prefix mismatch");
+    if (input.tokens() > Architecture::CTX - used) throw std::length_error("transformer: context exhausted");
 
     ResidualStream<Architecture::D> residual(input);
-    typename Architecture::PreparedInput prepared =
-        Architecture::prepare(weights, input);
-    for (size_t layer = 0; layer < Architecture::L; ++layer)
-        Architecture::forward_layer(
-            weights, prefix_state, input, residual, prepared, layer);
+    typename Architecture::PreparedInput prepared = Architecture::prepare(weights, input);
+    for (size_t layer = 0; layer < Architecture::L; ++layer) Architecture::forward_layer(weights, prefix_state, input, residual, prepared, layer);
     Architecture::advance_prefix(prefix_state, input.tokens());
     return Architecture::output(weights, residual);
 }
@@ -343,8 +268,7 @@ template <class Architecture>
     requires TransformerArchitecture<Architecture>
 class PrefixCache {
 public:
-    PrefixCache()
-        : prefix_state_(Architecture::make_prefix_state()) {}
+    PrefixCache() : prefix_state_(Architecture::make_prefix_state()) {}
 
     size_t cached_tokens() const { return cached_tokens_; }
     size_t reused_tokens() const { return reused_tokens_; }
@@ -395,47 +319,26 @@ public:
     static constexpr size_t L = Architecture::L;
     static constexpr size_t CTX = Architecture::CTX;
 
-    explicit Transformer(Weights weights)
-        : weights_(std::move(weights)) {}
+    explicit Transformer(Weights weights) : weights_(std::move(weights)) {}
 
     const Weights& weights() const { return weights_; }
 
-    Vec<V> operator()(
-        std::span<const TokenId> complete_input,
-        PrefixCache<Architecture>& memo) const {
-        if (complete_input.empty())
-            throw std::invalid_argument(
-                "Transformer: empty input");
-        if (complete_input.size() > CTX)
-            throw std::length_error(
-                "Transformer: context exhausted");
+    Vec<V> operator()(std::span<const TokenId> complete_input, PrefixCache<Architecture>& memo) const {
+        if (complete_input.empty()) throw std::invalid_argument("Transformer: empty input");
+        if (complete_input.size() > CTX) throw std::length_error("Transformer: context exhausted");
 
-        const bool extends_cached_prefix =
-            memo.weights_ == &weights_ &&
-            memo.input_kind_ ==
-                PrefixCache<Architecture>::InputKind::TokenIds &&
-            memo.token_prefix_.size() <= complete_input.size() &&
-            std::equal(
-                memo.token_prefix_.begin(),
-                memo.token_prefix_.end(),
-                complete_input.begin());
-        if (!extends_cached_prefix)
-            memo.bind(weights_);
+        const bool extends_cached_prefix = memo.weights_ == &weights_ && memo.input_kind_ == PrefixCache<Architecture>::InputKind::TokenIds && memo.token_prefix_.size() <= complete_input.size() && std::equal(memo.token_prefix_.begin(), memo.token_prefix_.end(), complete_input.begin());
+        if (!extends_cached_prefix) memo.bind(weights_);
 
         const size_t reused = memo.cached_tokens_;
         begin_evaluation(memo, reused, complete_input.size());
-        if (reused == complete_input.size())
-            return cached_logits(memo);
+        if (reused == complete_input.size()) return cached_logits(memo);
 
         try {
-            EmbeddedSequence<D> suffix = Architecture::embed(
-                weights_, complete_input.subspan(reused), reused);
-            Vec<V> logits = evaluate_transformer_suffix<Architecture>(
-                weights_, memo.prefix_state_, suffix);
-            memo.input_kind_ =
-                PrefixCache<Architecture>::InputKind::TokenIds;
-            memo.token_prefix_.assign(
-                complete_input.begin(), complete_input.end());
+            EmbeddedSequence<D> suffix = Architecture::embed(weights_, complete_input.subspan(reused), reused);
+            Vec<V> logits = evaluate_transformer_suffix<Architecture>(weights_, memo.prefix_state_, suffix);
+            memo.input_kind_ = PrefixCache<Architecture>::InputKind::TokenIds;
+            memo.token_prefix_.assign(complete_input.begin(), complete_input.end());
             commit_evaluation(memo, complete_input.size(), logits);
             return logits;
         } catch (...) {
@@ -444,50 +347,27 @@ public:
         }
     }
 
-    Vec<V> operator()(
-        const EmbeddedSequence<D>& complete_input,
-        PrefixCache<Architecture>& memo) const {
-        if (complete_input.tokens() == 0)
-            throw std::invalid_argument(
-                "Transformer: empty input");
-        if (complete_input.first_position() != 0)
-            throw std::invalid_argument(
-                "Transformer: expected a complete prefix at position zero");
-        if (complete_input.tokens() > CTX)
-            throw std::length_error(
-                "Transformer: context exhausted");
+    Vec<V> operator()(const EmbeddedSequence<D>& complete_input, PrefixCache<Architecture>& memo) const {
+        if (complete_input.tokens() == 0) throw std::invalid_argument("Transformer: empty input");
+        if (complete_input.first_position() != 0) throw std::invalid_argument("Transformer: expected a complete prefix at position zero");
+        if (complete_input.tokens() > CTX) throw std::length_error("Transformer: context exhausted");
 
-        const bool extends_cached_prefix =
-            memo.weights_ == &weights_ &&
-            memo.input_kind_ ==
-                PrefixCache<Architecture>::InputKind::EmbeddedSequence &&
-            memo.embedded_sequence_id_ ==
-                complete_input.sequence_id() &&
-            memo.cached_tokens_ <= complete_input.tokens();
-        if (!extends_cached_prefix)
-            memo.bind(weights_);
+        const bool extends_cached_prefix = memo.weights_ == &weights_ && memo.input_kind_ == PrefixCache<Architecture>::InputKind::EmbeddedSequence && memo.embedded_sequence_id_ == complete_input.sequence_id() && memo.cached_tokens_ <= complete_input.tokens();
+        if (!extends_cached_prefix) memo.bind(weights_);
 
         const size_t reused = memo.cached_tokens_;
         begin_evaluation(memo, reused, complete_input.tokens());
-        if (reused == complete_input.tokens())
-            return cached_logits(memo);
+        if (reused == complete_input.tokens()) return cached_logits(memo);
 
         try {
             Vec<V> logits = [&] {
-                if (reused == 0)
-                    return evaluate_transformer_suffix<Architecture>(
-                        weights_, memo.prefix_state_, complete_input);
-                EmbeddedSequence<D> suffix =
-                    complete_input.suffix(reused);
-                return evaluate_transformer_suffix<Architecture>(
-                    weights_, memo.prefix_state_, suffix);
+                if (reused == 0) return evaluate_transformer_suffix<Architecture>(weights_, memo.prefix_state_, complete_input);
+                EmbeddedSequence<D> suffix = complete_input.suffix(reused);
+                return evaluate_transformer_suffix<Architecture>(weights_, memo.prefix_state_, suffix);
             }();
-            memo.input_kind_ =
-                PrefixCache<Architecture>::InputKind::EmbeddedSequence;
-            memo.embedded_sequence_id_ =
-                complete_input.sequence_id();
-            commit_evaluation(
-                memo, complete_input.tokens(), logits);
+            memo.input_kind_ = PrefixCache<Architecture>::InputKind::EmbeddedSequence;
+            memo.embedded_sequence_id_ = complete_input.sequence_id();
+            commit_evaluation(memo, complete_input.tokens(), logits);
             return logits;
         } catch (...) {
             memo.clear();
@@ -496,25 +376,17 @@ public:
     }
 
 private:
-    static void begin_evaluation(
-        PrefixCache<Architecture>& memo,
-        size_t reused, size_t complete_tokens) {
+    static void begin_evaluation(PrefixCache<Architecture>& memo, size_t reused, size_t complete_tokens) {
         memo.reused_tokens_ = reused;
         memo.computed_tokens_ = complete_tokens - reused;
     }
 
-    static Vec<V> cached_logits(
-        const PrefixCache<Architecture>& memo) {
-        if (!memo.last_logits_)
-            throw std::logic_error(
-                "Transformer: prefix cache has no logits");
+    static Vec<V> cached_logits(const PrefixCache<Architecture>& memo) {
+        if (!memo.last_logits_) throw std::logic_error("Transformer: prefix cache has no logits");
         return copy(VecView<V>(*memo.last_logits_));
     }
 
-    static void commit_evaluation(
-        PrefixCache<Architecture>& memo,
-        size_t complete_tokens,
-        const Vec<V>& logits) {
+    static void commit_evaluation(PrefixCache<Architecture>& memo, size_t complete_tokens, const Vec<V>& logits) {
         memo.cached_tokens_ = complete_tokens;
         memo.last_logits_ = copy(VecView<V>(logits));
     }

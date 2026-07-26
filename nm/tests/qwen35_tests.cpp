@@ -37,9 +37,7 @@ struct ToyQwen {
 
     using OutputWeight = std::monostate;
 
-    static constexpr bool is_recurrent(size_t layer) {
-        return (layer + 1) % FULL_ATTENTION_INTERVAL != 0;
-    }
+    static constexpr bool is_recurrent(size_t layer) { return (layer + 1) % FULL_ATTENTION_INTERVAL != 0; }
 };
 
 static_assert(TransformerArchitecture<Qwen35Architecture<ToyQwen>>);
@@ -52,17 +50,14 @@ template <size_t In, size_t Out>
 static Weight<In, Out> weight_from(Scalar (*f)(size_t, size_t)) {
     MatT<In, Out> matrix = MatT<In, Out>::owning();
     for (size_t out = 0; out < Out; ++out)
-        for (size_t in = 0; in < In; ++in)
-            matrix.raw()[out * In + in] = f(in, out);
+        for (size_t in = 0; in < In; ++in) matrix.raw()[out * In + in] = f(in, out);
     return Weight<In, Out>(std::move(matrix));
 }
 template <size_t In, size_t Out>
 static Linear<In, Out> linear_from(Scalar (*f)(size_t, size_t)) {
     return Linear<In, Out>(weight_from<In, Out>(f));
 }
-static Scalar small(size_t in, size_t out) {
-    return Scalar(((in * 7 + out * 3) % 5) - 2) * 0.1f;
-}
+static Scalar small(size_t in, size_t out) { return Scalar(((in * 7 + out * 3) % 5) - 2) * 0.1f; }
 template <size_t N>
 static Vec<N> filled(Scalar value) {
     Vec<N> v;
@@ -70,7 +65,9 @@ static Vec<N> filled(Scalar value) {
     return v;
 }
 template <size_t N>
-static Vec<N> ones() { return filled<N>(1.f); }
+static Vec<N> ones() {
+    return filled<N>(1.f);
+}
 template <size_t N>
 static RMSNorm<N> unit_norm() {
     return RMSNorm<N>(ones<N>(), ToyQwen::RMS_EPS);
@@ -78,80 +75,48 @@ static RMSNorm<N> unit_norm() {
 
 static Qwen35Layer<ToyQwen> make_layer(size_t index) {
     using C = ToyQwen;
-    GatedMLP<C::D, C::FF> mlp(linear_from<C::D, C::FF>(small),
-                              linear_from<C::D, C::FF>(small),
-                              linear_from<C::FF, C::D>(small));
-    ResidualBranch<C::D, RMSNorm<C::D>, GatedMLP<C::D, C::FF>> channel(
-        unit_norm<C::D>(), std::move(mlp));
+    GatedMLP<C::D, C::FF> mlp(linear_from<C::D, C::FF>(small), linear_from<C::D, C::FF>(small), linear_from<C::FF, C::D>(small));
+    ResidualBranch<C::D, RMSNorm<C::D>, GatedMLP<C::D, C::FF>> channel(unit_norm<C::D>(), std::move(mlp));
 
     if (C::is_recurrent(index)) {
         using Mixer = QwenRecurrentMixer<C>;
         Matrix<C::CONV_WIDTH> conv(Mixer::CONV_CHANNELS);
         for (size_t c = 0; c < Mixer::CONV_CHANNELS; ++c)
-            for (size_t tap = 0; tap < C::CONV_WIDTH; ++tap)
-                conv.row_mut(c)[tap] = tap == C::CONV_WIDTH - 1 ? 1.f : 0.25f;
-        Mixer mixer(linear_from<C::D, Mixer::CONV_CHANNELS>(small),
-                    linear_from<C::D, Mixer::VALUE_WIDTH>(small),
-                    std::move(conv), linear_from<C::D, C::VALUE_HEADS>(small),
-                    linear_from<C::D, C::VALUE_HEADS>(small),
+            for (size_t tap = 0; tap < C::CONV_WIDTH; ++tap) conv.row_mut(c)[tap] = tap == C::CONV_WIDTH - 1 ? 1.f : 0.25f;
+        Mixer mixer(linear_from<C::D, Mixer::CONV_CHANNELS>(small), linear_from<C::D, Mixer::VALUE_WIDTH>(small), std::move(conv), linear_from<C::D, C::VALUE_HEADS>(small), linear_from<C::D, C::VALUE_HEADS>(small),
                     // decay_scale must be <= 0: the checkpoint stores
                     // -exp(A_log), which is what makes exp(gate) a contraction.
                     // A positive value here makes the state grow every token.
-                    Vec<C::VALUE_HEADS>{}, filled<C::VALUE_HEADS>(-1.f),
-                    PerHeadNorm<C::VALUE_HEADS, C::VALUE_HEAD_DIM,
-                                RMSNorm<C::VALUE_HEAD_DIM>>(
-                        unit_norm<C::VALUE_HEAD_DIM>()),
-                    linear_from<Mixer::VALUE_WIDTH, C::D>(small));
-        return Qwen35Block<C, Mixer>(
-            ResidualBranch<C::D, RMSNorm<C::D>, Mixer>(unit_norm<C::D>(),
-                                                       std::move(mixer)),
-            std::move(channel));
+                    Vec<C::VALUE_HEADS>{}, filled<C::VALUE_HEADS>(-1.f), PerHeadNorm<C::VALUE_HEADS, C::VALUE_HEAD_DIM, RMSNorm<C::VALUE_HEAD_DIM>>(unit_norm<C::VALUE_HEAD_DIM>()), linear_from<Mixer::VALUE_WIDTH, C::D>(small));
+        return Qwen35Block<C, Mixer>(ResidualBranch<C::D, RMSNorm<C::D>, Mixer>(unit_norm<C::D>(), std::move(mixer)), std::move(channel));
     }
 
     using Mixer = QwenAttentionMixer<C>;
-    Mixer mixer(linear_from<C::D, Mixer::GATED_QW>(small),
-                PerHeadNorm<C::Hq, C::HEAD_DIM, RMSNorm<C::HEAD_DIM>>(
-                    unit_norm<C::HEAD_DIM>()),
-                linear_from<C::D, Mixer::KW>(small),
-                PerHeadNorm<C::Hkv, C::HEAD_DIM, RMSNorm<C::HEAD_DIM>>(
-                    unit_norm<C::HEAD_DIM>()),
-                linear_from<C::D, Mixer::KW>(small),
-                linear_from<Mixer::QW, C::D>(small));
-    return Qwen35Block<C, Mixer>(
-        ResidualBranch<C::D, RMSNorm<C::D>, Mixer>(unit_norm<C::D>(),
-                                                   std::move(mixer)),
-        std::move(channel));
+    Mixer mixer(linear_from<C::D, Mixer::GATED_QW>(small), PerHeadNorm<C::Hq, C::HEAD_DIM, RMSNorm<C::HEAD_DIM>>(unit_norm<C::HEAD_DIM>()), linear_from<C::D, Mixer::KW>(small), PerHeadNorm<C::Hkv, C::HEAD_DIM, RMSNorm<C::HEAD_DIM>>(unit_norm<C::HEAD_DIM>()), linear_from<C::D, Mixer::KW>(small), linear_from<Mixer::QW, C::D>(small));
+    return Qwen35Block<C, Mixer>(ResidualBranch<C::D, RMSNorm<C::D>, Mixer>(unit_norm<C::D>(), std::move(mixer)), std::move(channel));
 }
 
 static Qwen35Weights<ToyQwen> make_toy_weights() {
     std::vector<Qwen35Layer<ToyQwen>> layers;
     layers.reserve(ToyQwen::L);
     for (size_t i = 0; i < ToyQwen::L; ++i) layers.push_back(make_layer(i));
-    return Qwen35Weights<ToyQwen>(
-        QwenTokenIO<ToyQwen>(weight_from<ToyQwen::D, ToyQwen::V>(small),
-                             std::monostate{}),
-        std::move(layers), unit_norm<ToyQwen::D>());
+    return Qwen35Weights<ToyQwen>(QwenTokenIO<ToyQwen>(weight_from<ToyQwen::D, ToyQwen::V>(small), std::monostate{}), std::move(layers), unit_norm<ToyQwen::D>());
 }
 
 int main() {
     std::printf("== the hybrid layer schedule ==\n");
     {
         size_t recurrent = 0, full = 0;
-        for (size_t l = 0; l < Qwen35_4BConfig::L; ++l)
-            (Qwen35_4BConfig::is_recurrent(l) ? recurrent : full)++;
-        check(recurrent == 24 && full == 8,
-              "4B is 24 gated-deltanet layers and 8 full-attention layers");
-        check(!Qwen35_4BConfig::is_recurrent(Qwen35_4BConfig::L - 1),
-              "the last layer is full attention");
+        for (size_t l = 0; l < Qwen35_4BConfig::L; ++l) (Qwen35_4BConfig::is_recurrent(l) ? recurrent : full)++;
+        check(recurrent == 24 && full == 8, "4B is 24 gated-deltanet layers and 8 full-attention layers");
+        check(!Qwen35_4BConfig::is_recurrent(Qwen35_4BConfig::L - 1), "the last layer is full attention");
     }
 
     std::printf("== state cost: only attention layers grow with T ==\n");
     {
         using State = Qwen35State<Qwen35_4BConfig>;
-        check(State::recurrent_floats_per_layer() == 32 * 128 * 128,
-              "a delta layer carries Hv*Dk*Dv floats, independent of T");
-        check(State::attention_floats_per_token_per_layer() == 2 * 4 * 256,
-              "an attention layer carries 2*Hkv*HeadDim floats PER TOKEN");
+        check(State::recurrent_floats_per_layer() == 32 * 128 * 128, "a delta layer carries Hv*Dk*Dv floats, independent of T");
+        check(State::attention_floats_per_token_per_layer() == 2 * 4 * 256, "an attention layer carries 2*Hkv*HeadDim floats PER TOKEN");
     }
 
     std::printf("== causal conv1d ==\n");
@@ -166,9 +131,12 @@ int main() {
         }
         CausalConv1dState<2, 3> conv;
         Vec<2> x1, x2, x3;
-        x1[0] = 1.f; x1[1] = 0.f;
-        x2[0] = 2.f; x2[1] = 0.f;
-        x3[0] = 3.f; x3[1] = 0.f;
+        x1[0] = 1.f;
+        x1[1] = 0.f;
+        x2[0] = 2.f;
+        x2[1] = 0.f;
+        x3[0] = 3.f;
+        x3[1] = 0.f;
         Vec<2> y1 = conv.step(x1, taps);
         Vec<2> y2 = conv.step(x2, taps);
         Vec<2> y3 = conv.step(x3, taps);
@@ -189,34 +157,27 @@ int main() {
         // it stores an association and can retrieve it.
         DeltaNetState<1, 2, 2> state;
         Vec<2> k, v;
-        k[0] = 1.f; k[1] = 0.f;      // unit key
-        v[0] = 3.f; v[1] = -5.f;
-        Vec<2> out = gated_delta_step<2, 2>(state.head(0), VecView<2>(k),
-                                            VecView<2>(k), VecView<2>(v),
-                                            0.f, 1.f);
-        check(std::fabs(out[0] - 3.f) < 1e-6f && std::fabs(out[1] + 5.f) < 1e-6f,
-              "writing v at key k and reading at k returns v");
+        k[0] = 1.f;
+        k[1] = 0.f;  // unit key
+        v[0] = 3.f;
+        v[1] = -5.f;
+        Vec<2> out = gated_delta_step<2, 2>(state.head(0), VecView<2>(k), VecView<2>(k), VecView<2>(v), 0.f, 1.f);
+        check(std::fabs(out[0] - 3.f) < 1e-6f && std::fabs(out[1] + 5.f) < 1e-6f, "writing v at key k and reading at k returns v");
 
         // An orthogonal key reads nothing back: the state is an associative
         // memory, not a bag of values.
         Vec<2> orthogonal;
-        orthogonal[0] = 0.f; orthogonal[1] = 1.f;
-        Vec<2> miss = gated_delta_step<2, 2>(state.head(0), VecView<2>(orthogonal),
-                                             VecView<2>(orthogonal), Vec<2>{},
-                                             0.f, 0.f);
-        check(std::fabs(miss[0]) < 1e-6f && std::fabs(miss[1]) < 1e-6f,
-              "an orthogonal query retrieves nothing");
+        orthogonal[0] = 0.f;
+        orthogonal[1] = 1.f;
+        Vec<2> miss = gated_delta_step<2, 2>(state.head(0), VecView<2>(orthogonal), VecView<2>(orthogonal), Vec<2>{}, 0.f, 0.f);
+        check(std::fabs(miss[0]) < 1e-6f && std::fabs(miss[1]) < 1e-6f, "an orthogonal query retrieves nothing");
 
         // The gate is what lets the state forget: a strongly negative gate
         // decays the stored association toward zero.
         DeltaNetState<1, 2, 2> decaying;
-        (void)gated_delta_step<2, 2>(decaying.head(0), VecView<2>(k),
-                                     VecView<2>(k), VecView<2>(v), 0.f, 1.f);
-        Vec<2> faded = gated_delta_step<2, 2>(decaying.head(0), VecView<2>(k),
-                                              VecView<2>(k), Vec<2>{},
-                                              -4.f, 0.f);
-        check(std::fabs(faded[0] - 3.f * std::exp(-4.f)) < 1e-5f,
-              "exp(gate) decays what the state remembers");
+        (void)gated_delta_step<2, 2>(decaying.head(0), VecView<2>(k), VecView<2>(k), VecView<2>(v), 0.f, 1.f);
+        Vec<2> faded = gated_delta_step<2, 2>(decaying.head(0), VecView<2>(k), VecView<2>(k), Vec<2>{}, -4.f, 0.f);
+        check(std::fabs(faded[0] - 3.f * std::exp(-4.f)) < 1e-5f, "exp(gate) decays what the state remembers");
     }
 
     std::printf("== softplus and l2 normalization ==\n");
@@ -224,10 +185,10 @@ int main() {
         check(std::fabs(softplus(0.f) - std::log(2.f)) < 1e-6f, "softplus(0)=ln2");
         check(softplus(60.f) == 60.f, "softplus saturates to identity, never inf");
         Vec<2> x;
-        x[0] = 3.f; x[1] = 4.f;
+        x[0] = 3.f;
+        x[1] = 4.f;
         Vec<2> unit = l2_normalize<2>(VecView<2>(x));
-        check(std::fabs(unit[0] - 0.6f) < 1e-6f && std::fabs(unit[1] - 0.8f) < 1e-6f,
-              "l2_normalize divides by the norm, not by sqrt(N)");
+        check(std::fabs(unit[0] - 0.6f) < 1e-6f && std::fabs(unit[1] - 0.8f) < 1e-6f, "l2_normalize divides by the norm, not by sqrt(N)");
     }
 
     std::printf("== gated attention splits its query projection ==\n");
@@ -236,12 +197,8 @@ int main() {
         Matrix<8> packed(1);
         for (size_t i = 0; i < 8; ++i) packed.row_mut(0)[i] = Scalar(i);
         HeadPair<2, 2> split = split_head_pairs<2, 2>(packed.view());
-        check(split.first.row(0)[0] == 0.f && split.first.row(0)[1] == 1.f &&
-              split.first.row(0)[2] == 4.f && split.first.row(0)[3] == 5.f,
-              "queries are the first half of each head pair");
-        check(split.second.row(0)[0] == 2.f && split.second.row(0)[1] == 3.f &&
-              split.second.row(0)[2] == 6.f && split.second.row(0)[3] == 7.f,
-              "gates are the second half of each head pair");
+        check(split.first.row(0)[0] == 0.f && split.first.row(0)[1] == 1.f && split.first.row(0)[2] == 4.f && split.first.row(0)[3] == 5.f, "queries are the first half of each head pair");
+        check(split.second.row(0)[0] == 2.f && split.second.row(0)[1] == 3.f && split.second.row(0)[2] == 6.f && split.second.row(0)[3] == 7.f, "gates are the second half of each head pair");
     }
 
     std::printf("== the schedule is enforced by construction ==\n");
@@ -249,21 +206,18 @@ int main() {
         bool threw = false;
         try {
             std::vector<Qwen35Layer<ToyQwen>> layers;
-            for (size_t i = 0; i < ToyQwen::L; ++i)
-                layers.push_back(make_layer(i == 0 ? 3 : i));  // wrong kind at 0
-            Qwen35Weights<ToyQwen> bad(
-                QwenTokenIO<ToyQwen>(weight_from<ToyQwen::D, ToyQwen::V>(small),
-                                     std::monostate{}),
-                std::move(layers), unit_norm<ToyQwen::D>());
-        } catch (const std::invalid_argument&) { threw = true; }
+            for (size_t i = 0; i < ToyQwen::L; ++i) layers.push_back(make_layer(i == 0 ? 3 : i));  // wrong kind at 0
+            Qwen35Weights<ToyQwen> bad(QwenTokenIO<ToyQwen>(weight_from<ToyQwen::D, ToyQwen::V>(small), std::monostate{}), std::move(layers), unit_norm<ToyQwen::D>());
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
         check(threw, "a layer of the wrong kind is rejected at assembly time");
     }
 
     std::printf("== the hybrid stack runs, and PrefixCache stays pure ==\n");
     {
         const Qwen35Transformer<ToyQwen> T(make_toy_weights());
-        std::vector<TokenId> input{TokenId{1}, TokenId{4}, TokenId{2},
-                                   TokenId{7}, TokenId{0}};
+        std::vector<TokenId> input{TokenId{1}, TokenId{4}, TokenId{2}, TokenId{7}, TokenId{0}};
 
         PrefixCache<Qwen35Architecture<ToyQwen>> scratch;
         const Vec<ToyQwen::V> whole = T(input, scratch);
@@ -274,25 +228,18 @@ int main() {
         // and nowhere else.
         PrefixCache<Qwen35Architecture<ToyQwen>> incremental;
         Vec<ToyQwen::V> stepwise;
-        for (size_t n = 1; n <= input.size(); ++n)
-            stepwise = T(std::span<const TokenId>(input.data(), n), incremental);
+        for (size_t n = 1; n <= input.size(); ++n) stepwise = T(std::span<const TokenId>(input.data(), n), incremental);
 
         Scalar worst = 0;
-        for (size_t v = 0; v < ToyQwen::V; ++v)
-            worst = std::max(worst, std::fabs(whole[v] - stepwise[v]));
-        check(worst < 1e-4f,
-              "token-by-token decode matches one-shot prefill");
-        check(incremental.reused_tokens() == input.size() - 1,
-              "the last step reused the whole prefix");
+        for (size_t v = 0; v < ToyQwen::V; ++v) worst = std::max(worst, std::fabs(whole[v] - stepwise[v]));
+        check(worst < 1e-4f, "token-by-token decode matches one-shot prefill");
+        check(incremental.reused_tokens() == input.size() - 1, "the last step reused the whole prefix");
 
         bool finite = true;
-        for (size_t v = 0; v < ToyQwen::V; ++v)
-            finite = finite && std::isfinite(whole[v]);
+        for (size_t v = 0; v < ToyQwen::V; ++v) finite = finite && std::isfinite(whole[v]);
         check(finite, "logits are finite through 6 recurrent and 2 attention layers");
     }
 
-    std::printf("\n%s (%d failures)\n",
-                failures ? "QWEN35 TESTS FAILED" : "ALL QWEN35 TESTS PASSED",
-                failures);
+    std::printf("\n%s (%d failures)\n", failures ? "QWEN35 TESTS FAILED" : "ALL QWEN35 TESTS PASSED", failures);
     return failures ? 1 : 0;
 }

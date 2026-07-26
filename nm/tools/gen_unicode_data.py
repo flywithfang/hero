@@ -54,6 +54,8 @@ def main(llama_cpp_root):
     print("#pragma once")
     print("#include <cstdint>")
     print("#include <cstddef>")
+    # These are packed data tables, not code; let them keep their own layout.
+    print("// clang-format off")
     for name, bit in FLAGS.items():
         print()
         print(table(name, ranges(pairs, bit)), end="")

@@ -28,13 +28,10 @@ public:
     explicit PerHeadNorm(Norm norm) : norm_(std::move(norm)) {}
 
     Vec<Heads * HeadDim> operator()(VecView<Heads * HeadDim> x) const {
-        return transform_heads<Heads, HeadDim>(
-            x, [&](VecView<HeadDim> head) { return norm_(head); });
+        return transform_heads<Heads, HeadDim>(x, [&](VecView<HeadDim> head) { return norm_(head); });
     }
-    Matrix<Heads * HeadDim> operator()(
-        MatrixView<Heads * HeadDim> x) const {
-        return transform_heads<Heads, HeadDim>(
-            x, [&](VecView<HeadDim> head) { return norm_(head); });
+    Matrix<Heads * HeadDim> operator()(MatrixView<Heads * HeadDim> x) const {
+        return transform_heads<Heads, HeadDim>(x, [&](VecView<HeadDim> head) { return norm_(head); });
     }
 
 private:
@@ -53,10 +50,8 @@ struct HeadPair {
 };
 
 template <size_t Heads, size_t HeadDim>
-HeadPair<Heads, HeadDim> split_head_pairs(
-    MatrixView<2 * Heads * HeadDim> packed) {
-    HeadPair<Heads, HeadDim> split{Matrix<Heads * HeadDim>(packed.rows()),
-                                   Matrix<Heads * HeadDim>(packed.rows())};
+HeadPair<Heads, HeadDim> split_head_pairs(MatrixView<2 * Heads * HeadDim> packed) {
+    HeadPair<Heads, HeadDim> split{Matrix<Heads * HeadDim>(packed.rows()), Matrix<Heads * HeadDim>(packed.rows())};
     for (size_t row = 0; row < packed.rows(); ++row) {
         const Scalar* source = packed.row(row).begin();
         Scalar* first = split.first.data() + row * Heads * HeadDim;
@@ -89,10 +84,7 @@ class RotaryEmbedding {
 
 public:
     RotaryEmbedding() {
-        for (size_t i = 0; i < Planes; ++i)
-            inv_freq_[i] = i < RotaryPlanes
-                ? Scalar(std::pow(double(Base), -double(2 * i) / double(HeadDim)))
-                : 0.f;
+        for (size_t i = 0; i < Planes; ++i) inv_freq_[i] = i < RotaryPlanes ? Scalar(std::pow(double(Base), -double(2 * i) / double(HeadDim))) : 0.f;
     }
 
     void apply(MutVecView<HeadDim> value, size_t position) const {
@@ -113,19 +105,13 @@ private:
 
 template <size_t Heads, size_t HeadDim, class Rope>
 void rotate_heads(Vec<Heads * HeadDim>& value, const Rope& rope, size_t position) {
-    for (size_t h = 0; h < Heads; ++h)
-        rope.apply(slice_mut<HeadDim>(value, h * HeadDim), position);
+    for (size_t h = 0; h < Heads; ++h) rope.apply(slice_mut<HeadDim>(value, h * HeadDim), position);
 }
 
 template <size_t Heads, size_t HeadDim, class Rope>
-void rotate_heads(Matrix<Heads * HeadDim>& values, const Rope& rope,
-                  size_t first_position) {
+void rotate_heads(Matrix<Heads * HeadDim>& values, const Rope& rope, size_t first_position) {
     for (size_t row = 0; row < values.rows(); ++row)
-        for (size_t head = 0; head < Heads; ++head)
-            rope.apply(
-                MutVecView<HeadDim>{
-                    values.data() + row * Heads * HeadDim + head * HeadDim},
-                first_position + row);
+        for (size_t head = 0; head < Heads; ++head) rope.apply(MutVecView<HeadDim>{values.data() + row * Heads * HeadDim + head * HeadDim}, first_position + row);
 }
 
 // ---- the K/V cache ----------------------------------------------------------
@@ -142,14 +128,11 @@ public:
     explicit KVCache(size_t capacity = 0) : capacity_(capacity) {}
 
     size_t size() const { return size_; }
-    bool can_append_without_eviction(size_t rows) const {
-        return capacity_ == 0 || rows <= capacity_ - size_;
-    }
+    bool can_append_without_eviction(size_t rows) const { return capacity_ == 0 || rows <= capacity_ - size_; }
     size_t capacity() const { return capacity_; }
 
     void append(Position position, VecView<Width> key, VecView<Width> value) {
-        if (size_ != 0 && position.i <= this->position(size_ - 1).i)
-            throw std::invalid_argument("KVCache: positions must increase");
+        if (size_ != 0 && position.i <= this->position(size_ - 1).i) throw std::invalid_argument("KVCache: positions must increase");
 
         if (capacity_ == 0) {
             positions_.push_back(position.i);
@@ -174,9 +157,7 @@ public:
         std::copy(value.begin(), value.end(), values_.begin() + physical * Width);
     }
 
-    Position position(size_t logical) const {
-        return Position{positions_[physical(logical)]};
-    }
+    Position position(size_t logical) const { return Position{positions_[physical(logical)]}; }
     VecView<HeadDim> key(size_t logical, KvHead head) const {
         if (head.i >= Hkv) throw std::out_of_range("KVCache: KV head out of range");
         return VecView<HeadDim>(keys_.data() + physical(logical) * Width + head.i * HeadDim);
@@ -226,11 +207,9 @@ inline bool key_is_visible(Position key, Position query, size_t sliding_window) 
 // bug in the caller (a ring that evicted too early, or a stale cache), never a
 // silently-zero output.
 template <size_t Hkv, size_t HeadDim>
-void require_visible_key(const KVCache<Hkv, HeadDim>& cache,
-                         Position query_position, size_t sliding_window) {
+void require_visible_key(const KVCache<Hkv, HeadDim>& cache, Position query_position, size_t sliding_window) {
     for (size_t j = 0; j < cache.size(); ++j)
-        if (key_is_visible(cache.position(j), query_position, sliding_window))
-            return;
+        if (key_is_visible(cache.position(j), query_position, sliding_window)) return;
     throw std::runtime_error("attend: query has no visible keys");
 }
 
@@ -252,29 +231,24 @@ void require_visible_key(const KVCache<Hkv, HeadDim>& cache,
 // gathered, so the score matrix is never materialized and masked-out entries
 // cost nothing. [COMPUTE][GROWS-T]
 template <size_t Hq, size_t Hkv, size_t HeadDim>
-Vec<HeadDim> attend_head(VecView<Hq * HeadDim> query,
-                         const KVCache<Hkv, HeadDim>& cache,
-                         Position query_position, size_t query_head,
-                         size_t sliding_window, Scalar score_scale) {
+Vec<HeadDim> attend_head(VecView<Hq * HeadDim> query, const KVCache<Hkv, HeadDim>& cache, Position query_position, size_t query_head, size_t sliding_window, Scalar score_scale) {
     static_assert(Hq % Hkv == 0, "GQA groups must divide evenly");
     const KvHead group{query_head / (Hq / Hkv)};
     const VecView<HeadDim> q = slice<HeadDim>(query, query_head * HeadDim);
 
-    std::vector<size_t> J;          // the visible cache rows
-    std::vector<Scalar> alpha;      // scores s_j, then softmax weights
+    std::vector<size_t> J;      // the visible cache rows
+    std::vector<Scalar> alpha;  // scores s_j, then softmax weights
     J.reserve(cache.size());
     alpha.reserve(cache.size());
     for (size_t j = 0; j < cache.size(); ++j) {
-        if (!key_is_visible(cache.position(j), query_position, sliding_window))
-            continue;
+        if (!key_is_visible(cache.position(j), query_position, sliding_window)) continue;
         J.push_back(j);
         alpha.push_back(score_scale * dot(q, cache.key(j, group)));
     }
     softmax(alpha);
 
-    Vec<HeadDim> attended;          // zero-initialized; this is the sum
-    for (size_t n = 0; n < J.size(); ++n)
-        axpy(alpha[n], cache.value(J[n], group), attended);
+    Vec<HeadDim> attended;  // zero-initialized; this is the sum
+    for (size_t n = 0; n < J.size(); ++n) axpy(alpha[n], cache.value(J[n], group), attended);
     return attended;
 }
 
@@ -286,27 +260,14 @@ Vec<HeadDim> attend_head(VecView<Hq * HeadDim> query,
 // must already be present.
 
 template <size_t Hq, size_t Hkv, size_t HeadDim>
-Vec<Hq * HeadDim> attend(VecView<Hq * HeadDim> query,
-                         const KVCache<Hkv, HeadDim>& cache,
-                         Position query_position,
-                         size_t sliding_window = 0,
-                         Scalar score_scale = 1.f) {
+Vec<Hq * HeadDim> attend(VecView<Hq * HeadDim> query, const KVCache<Hkv, HeadDim>& cache, Position query_position, size_t sliding_window = 0, Scalar score_scale = 1.f) {
     require_visible_key(cache, query_position, sliding_window);
-    return par_map<Hq, HeadDim>([&](size_t head) {
-        return attend_head<Hq>(query, cache, query_position, head,
-                               sliding_window, score_scale);
-    });
+    return par_map<Hq, HeadDim>([&](size_t head) { return attend_head<Hq>(query, cache, query_position, head, sliding_window, score_scale); });
 }
 
 template <size_t Hq, size_t Hkv, size_t HeadDim>
-Matrix<Hq * HeadDim> attend(MatrixView<Hq * HeadDim> queries,
-                            const KVCache<Hkv, HeadDim>& cache,
-                            size_t first_query_position,
-                            size_t sliding_window = 0,
-                            Scalar score_scale = 1.f) {
-    for (size_t row = 0; row < queries.rows(); ++row)
-        require_visible_key(cache, Position{first_query_position + row},
-                            sliding_window);
+Matrix<Hq * HeadDim> attend(MatrixView<Hq * HeadDim> queries, const KVCache<Hkv, HeadDim>& cache, size_t first_query_position, size_t sliding_window = 0, Scalar score_scale = 1.f) {
+    for (size_t row = 0; row < queries.rows(); ++row) require_visible_key(cache, Position{first_query_position + row}, sliding_window);
 
     // Rows x heads are mutually independent, so the batch is one flat task
     // space rather than a map over heads alone. par_for, not par_map, because
@@ -316,11 +277,8 @@ Matrix<Hq * HeadDim> attend(MatrixView<Hq * HeadDim> queries,
     par_for(queries.rows() * Hq, [&](size_t task) {
         const size_t row = task / Hq;
         const size_t head = task % Hq;
-        Vec<HeadDim> attended = attend_head<Hq>(
-            queries.row(row), cache, Position{first_query_position + row},
-            head, sliding_window, score_scale);
-        std::copy(attended.begin(), attended.end(),
-                  output.data() + (row * Hq + head) * HeadDim);
+        Vec<HeadDim> attended = attend_head<Hq>(queries.row(row), cache, Position{first_query_position + row}, head, sliding_window, score_scale);
+        std::copy(attended.begin(), attended.end(), output.data() + (row * Hq + head) * HeadDim);
     });
     return output;
 }
@@ -329,20 +287,12 @@ Matrix<Hq * HeadDim> attend(MatrixView<Hq * HeadDim> queries,
 // makes prefill cheap: every query in the batch sees the whole batch's keys
 // (masked back to causal), so the cache is written once and read once.
 template <size_t Hq, size_t Hkv, size_t HeadDim>
-Matrix<Hq * HeadDim> attend_and_cache(
-    MatrixView<Hq * HeadDim> queries, MatrixView<Hkv * HeadDim> keys,
-    MatrixView<Hkv * HeadDim> values, KVCache<Hkv, HeadDim>& cache,
-    size_t first_query_position, size_t sliding_window = 0,
-    Scalar score_scale = 1.f) {
-    if (queries.rows() != keys.rows() || keys.rows() != values.rows())
-        throw std::invalid_argument("attend_and_cache: Q/K/V row mismatch");
+Matrix<Hq * HeadDim> attend_and_cache(MatrixView<Hq * HeadDim> queries, MatrixView<Hkv * HeadDim> keys, MatrixView<Hkv * HeadDim> values, KVCache<Hkv, HeadDim>& cache, size_t first_query_position, size_t sliding_window = 0, Scalar score_scale = 1.f) {
+    if (queries.rows() != keys.rows() || keys.rows() != values.rows()) throw std::invalid_argument("attend_and_cache: Q/K/V row mismatch");
 
     if (cache.can_append_without_eviction(queries.rows())) {
-        for (size_t row = 0; row < queries.rows(); ++row)
-            cache.append(Position{first_query_position + row},
-                         keys.row(row), values.row(row));
-        return attend<Hq, Hkv, HeadDim>(queries, cache, first_query_position,
-                                        sliding_window, score_scale);
+        for (size_t row = 0; row < queries.rows(); ++row) cache.append(Position{first_query_position + row}, keys.row(row), values.row(row));
+        return attend<Hq, Hkv, HeadDim>(queries, cache, first_query_position, sliding_window, score_scale);
     }
 
     // Eviction case only: a bounded sliding ring smaller than this batch would
@@ -353,9 +303,7 @@ Matrix<Hq * HeadDim> attend_and_cache(
     for (size_t row = 0; row < queries.rows(); ++row) {
         const Position position{first_query_position + row};
         cache.append(position, keys.row(row), values.row(row));
-        output.set_row(row, attend<Hq, Hkv, HeadDim>(
-                                queries.row(row), cache, position,
-                                sliding_window, score_scale));
+        output.set_row(row, attend<Hq, Hkv, HeadDim>(queries.row(row), cache, position, sliding_window, score_scale));
     }
     return output;
 }

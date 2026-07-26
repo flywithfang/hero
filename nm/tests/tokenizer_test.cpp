@@ -9,7 +9,10 @@
 #include <string>
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: %s vocab.gguf [--roundtrip]\n", argv[0]); return 2; }
+    if (argc < 2) {
+        std::fprintf(stderr, "usage: %s vocab.gguf [--roundtrip]\n", argv[0]);
+        return 2;
+    }
     bool roundtrip = argc > 2 && std::string(argv[2]) == "--roundtrip";
     try {
         GGUF g(argv[1]);
@@ -20,13 +23,20 @@ int main(int argc, char** argv) {
             auto ids = tok.encode(line, /*add_bos=*/false, /*parse_special=*/true);
             if (roundtrip) {
                 std::string back = tok.decode(ids);
-                ++total; if (back != line) { ++bad; std::fprintf(stderr, "ROUNDTRIP FAIL: [%s] -> [%s]\n", line.c_str(), back.c_str()); }
+                ++total;
+                if (back != line) {
+                    ++bad;
+                    std::fprintf(stderr, "ROUNDTRIP FAIL: [%s] -> [%s]\n", line.c_str(), back.c_str());
+                }
             } else {
-                for (size_t i = 0; i < ids.size(); ++i) std::printf("%d%s", ids[i], i+1<ids.size()?" ":"");
+                for (size_t i = 0; i < ids.size(); ++i) std::printf("%d%s", ids[i], i + 1 < ids.size() ? " " : "");
                 std::printf("\n");
             }
         }
-        if (roundtrip) std::fprintf(stderr, "roundtrip: %d/%d ok\n", total-bad, total);
+        if (roundtrip) std::fprintf(stderr, "roundtrip: %d/%d ok\n", total - bad, total);
         return 0;
-    } catch (const std::exception& e) { std::fprintf(stderr, "error: %s\n", e.what()); return 1; }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "error: %s\n", e.what());
+        return 1;
+    }
 }

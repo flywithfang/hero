@@ -32,9 +32,7 @@
 
 // softplus(x) = log(1 + e^x), computed through the stable branch so that a
 // large positive x does not overflow before the log takes it back down.
-inline Scalar softplus(Scalar x) {
-    return x > Scalar(20) ? x : std::log1p(std::exp(x));
-}
+inline Scalar softplus(Scalar x) { return x > Scalar(20) ? x : std::log1p(std::exp(x)); }
 
 // x / max(||x||_2, eps). Note this is L2 normalization, NOT RMS: there is no
 // 1/sqrt(N) and no learned scale. Delta networks normalize q and k this way so
@@ -72,15 +70,13 @@ public:
     CausalConv1dState() : history_(History * Channels, 0.f) {}
 
     Vec<Channels> step(VecView<Channels> input, const Matrix<Width>& weights) {
-        if (weights.rows() != Channels)
-            throw std::invalid_argument("CausalConv1dState: wrong channel count");
+        if (weights.rows() != Channels) throw std::invalid_argument("CausalConv1dState: wrong channel count");
 
         Vec<Channels> output;
         for (size_t c = 0; c < Channels; ++c) {
             const VecView<Width> taps = weights.row(c);
-            Scalar sum = taps[History] * input[c];   // the current sample
-            for (size_t tap = 0; tap < History; ++tap)
-                sum += taps[tap] * past(tap)[c];     // tap 0 is the oldest
+            Scalar sum = taps[History] * input[c];                                       // the current sample
+            for (size_t tap = 0; tap < History; ++tap) sum += taps[tap] * past(tap)[c];  // tap 0 is the oldest
             output[c] = sum;
         }
         advance(input);
@@ -95,15 +91,12 @@ public:
 private:
     // Logical tap t (0 = oldest) maps into a ring of the last History samples.
     // Slots that no token has written yet are zero, which is the causal pad.
-    const Scalar* past(size_t tap) const {
-        return history_.data() + ((start_ + tap) % History) * Channels;
-    }
+    const Scalar* past(size_t tap) const { return history_.data() + ((start_ + tap) % History) * Channels; }
 
     void advance(VecView<Channels> input) {
         if constexpr (History != 0) {
             // The newest sample overwrites the oldest slot, which start_ names.
-            std::copy(input.begin(), input.end(),
-                      history_.begin() + start_ * Channels);
+            std::copy(input.begin(), input.end(), history_.begin() + start_ * Channels);
             start_ = (start_ + 1) % History;
         }
     }
@@ -147,8 +140,7 @@ private:
 // q is expected pre-scaled by 1/sqrt(Dk) and q/k pre-L2-normalized; keeping
 // those out of here means the caller can hoist them across the head group.
 template <size_t Dk, size_t Dv>
-Vec<Dv> gated_delta_step(Scalar* state, VecView<Dk> q, VecView<Dk> k,
-                         VecView<Dv> v, Scalar gate, Scalar beta) {
+Vec<Dv> gated_delta_step(Scalar* state, VecView<Dk> q, VecView<Dk> k, VecView<Dv> v, Scalar gate, Scalar beta) {
     const Scalar decay = std::exp(gate);
 
     // Decay, then read what the state currently predicts for this key.
@@ -165,8 +157,7 @@ Vec<Dv> gated_delta_step(Scalar* state, VecView<Dk> q, VecView<Dk> k,
     // The correction is how far that prediction is from the actual value,
     // scaled by the per-head write strength beta.
     Vec<Dv> delta;
-    for (size_t j = 0; j < Dv; ++j)
-        delta[j] = (v[j] - predicted[j]) * beta;
+    for (size_t j = 0; j < Dv; ++j) delta[j] = (v[j] - predicted[j]) * beta;
 
     // Rank-1 write, then read with the query.
     Vec<Dv> output;

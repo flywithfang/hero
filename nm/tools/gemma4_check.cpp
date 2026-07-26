@@ -14,8 +14,7 @@ int main(int argc, char** argv) {
         std::string size = argc == 3 ? argv[2] : "";
         if (size.empty()) {
             const size_t blocks = size_t(gguf.get_int("gemma4.block_count", 0));
-            size = blocks == Gemma4_12BTextConfig::L ? "12b"
-                 : blocks == Gemma4E4BTextConfig::L ? "e4b" : "";
+            size = blocks == Gemma4_12BTextConfig::L ? "12b" : blocks == Gemma4E4BTextConfig::L ? "e4b" : "";
             if (size.empty()) {
                 std::fprintf(stderr, "no compiled Gemma 4 config has %zu blocks\n", blocks);
                 return 1;
@@ -26,15 +25,16 @@ int main(int argc, char** argv) {
             std::printf("Gemma 4 12B metadata valid: %zu tensors\n", gguf.tensors().size());
             auto model = gemma4_loader::load_12b_text(gguf);
             (void)model;
-            std::printf("Gemma 4 12B assembly loaded (%zu layers: 40 sliding + 8 global"
-                        " unified-K/V, no PLE, no shared KV)\n", Gemma4_12BTextConfig::L);
+            std::printf(
+                "Gemma 4 12B assembly loaded (%zu layers: 40 sliding + 8 global"
+                " unified-K/V, no PLE, no shared KV)\n",
+                Gemma4_12BTextConfig::L);
             return 0;
         }
         gemma4_loader::validate_e4b_text_metadata(gguf);
         std::printf("Gemma 4 E4B metadata valid: %zu tensors\n", gguf.tensors().size());
         auto model = gemma4_loader::load_e4b_text(gguf);
-        std::printf("Gemma 4 E4B immutable text assembly loaded (%zu layers)\n",
-                    Gemma4E4BTextConfig::L);
+        std::printf("Gemma 4 E4B immutable text assembly loaded (%zu layers)\n", Gemma4E4BTextConfig::L);
         (void)model;
         return 0;
     } catch (const std::exception& error) {

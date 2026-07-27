@@ -193,35 +193,42 @@ private:
     QueryOutput query_output_;
 };
 
-// One layer's token mixer, shared by every Gemma 4 size. The variation is all
-// in the template arguments: head width, KV head count, window, RoPE table, and
-// whether this layer owns K/V at all.
+// One layer's token mixer, shared by every Gemma 4 size:
 //
 //     Q = rope( rmsnorm_per_head( X W_q ) )      [T, Hq  * Dh]
 //     K = rope( rmsnorm_per_head( X W_k ) )      [T, Hkv * Dh]
 //     V =       rmsnorm_per_head( X W_v )        [T, Hkv * Dh]   (never rotated)
 //     A = attend(Q, cache <- K,V) W_o            [T, D]
 //
-// Gemma's score scale stays at attention.hpp's default 1.0: the usual
-// 1/sqrt(HeadDim) is folded into the learned per-head Q norm.
-template <size_t D, size_t Hq, size_t Window, class Rope, class Attention>
-Matrix<D> gemma_attend_layer(const Attention& attention, MatrixView<D> X, KVCache<Attention::KV_HEADS, Attention::HEAD_DIM>& cache, size_t first_position) {
-    constexpr size_t Dh = Attention::HEAD_DIM;
-    constexpr size_t Hkv = Attention::KV_HEADS;
+// Every shape (D, Hq, Hkv, Dh) is deduced from the weight and cache arguments;
+// the rope table, start position and window are the caller's schedule, passed
+// as plain arguments (window 0 = look back to position 0). KeyValue is
+// GemmaKeyValue or GemmaUnifiedKeyValue — both yield K and V together, so a
+// unified projection runs once. Gemma's score scale stays at attention.hpp's
+// default 1.0: the usual 1/sqrt(HeadDim) is folded into the learned per-head
+// Q norm.
+template <size_t D, size_t Hq, size_t Hkv, size_t Dh, class KeyValue, class Rope>
+Matrix<D> gemma_attend_layer(const GemmaQueryOutput<D, Hq, Dh>& query_output, const KeyValue& key_value, MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) {
+    Matrix<Hq * Dh> Q = query_output.query(X);
+    rotate_heads<Hq, Dh>(Q, rope, first_position);
 
-    Matrix<Hq * Dh> Q = attention.query_output().query(X);
-    rotate_heads<Hq, Dh>(Q, Rope{}, first_position);
+    GemmaKeyValuePair<Hkv * Dh> kv = key_value.key_and_value(X);
+    rotate_heads<Hkv, Dh>(kv.key, rope, first_position);
 
-    Matrix<Hq * Dh> A = [&] {
-        if constexpr (Attention::OWNS_KV) {
-            GemmaKeyValuePair<Hkv * Dh> kv = attention.key_value().key_and_value(X);
-            rotate_heads<Hkv, Dh>(kv.key, Rope{}, first_position);
-            return attend_and_cache<Hq, Hkv, Dh>(Q.view(), kv.key.view(), kv.value.view(), cache, first_position, Window);
-        } else {
-            return attend<Hq, Hkv, Dh>(Q.view(), cache, first_position, Window);
-        }
-    }();
-    return attention.query_output().output(A.view());
+    Matrix<Hq * Dh> A = attend_and_cache<Hq, Hkv, Dh>(Q.view(), kv.key.view(), kv.value.view(), cache, first_position, window);
+    return query_output.output(A.view());
+}
+
+// A shared-KV layer (E4B's last 18): the layer has no K/V weights, so there is
+// nothing to project or cache — the query attends against rows an earlier
+// layer of the same attention kind already wrote to `cache` this pass.
+template <size_t D, size_t Hq, size_t Hkv, size_t Dh, class Rope>
+Matrix<D> gemma_attend_shared_layer(const GemmaQueryOutput<D, Hq, Dh>& query_output, MatrixView<D> X, const KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) {
+    Matrix<Hq * Dh> Q = query_output.query(X);
+    rotate_heads<Hq, Dh>(Q, rope, first_position);
+
+    Matrix<Hq * Dh> A = attend<Hq, Hkv, Dh>(Q.view(), cache, first_position, window);
+    return query_output.output(A.view());
 }
 
 template <size_t D>
@@ -507,23 +514,31 @@ struct Gemma4E4BArchitecture {
     //   * its PLE columns      per_layer[:, layer_index*PLE ...]
     //   * where it starts      input.position(0), for RoPE and the mask
     //
-    // std::visit is the layer-kind dispatch, and the only one. GemmaE4BLayer's
-    // four alternatives are 2 head widths x 2 KV kinds, and all four are real
-    // types rather than flags: head width is a static matrix width, and a
-    // shared-KV layer has no W_k/W_v members at all. The kind is resolved once
-    // here, so the body below is monomorphic — no per-token branch on width,
-    // window, or which cache. The whole layer equation is in that body.
+    // std::visit is the layer-kind dispatch. GemmaE4BLayer's four alternatives
+    // are 2 head widths x 2 KV kinds, and all four are real types rather than
+    // flags: head width is a static matrix width, and a shared-KV layer has no
+    // W_k/W_v members at all. The kind is resolved once here — the two
+    // if constexpr branches below compile away per alternative, so the body is
+    // monomorphic: no per-token branch on width, window, KV ownership, or
+    // which cache. The whole layer equation is in that body.
     static void forward_layer(const Weights& weights, PrefixState& prefix_state, const EmbeddedSequence<D>& input, ResidualStream<D>& residual, const PreparedInput& per_layer, size_t layer_index) {
         const size_t first_position = input.position(0).i;
         const Matrix<C::PLE> ple = slice_columns<C::PLE>(per_layer.view(), layer_index * C::PLE);
         const MatrixView<D> X = residual.matrix();
         Matrix<D> next = std::visit(
             [&](const auto& layer) {
-                using Shape = shape_of<std::decay_t<decltype(layer.attention)>>;
+                using Attention = std::decay_t<decltype(layer.attention)>;
+                using Shape = shape_of<Attention>;
 
                 // h = x + post_norm( attn( pre_norm(x) ) )
                 Matrix<D> U = layer.attention_norm(X);
-                Matrix<D> A = gemma_attend_layer<D, C::Hq, Shape::WINDOW, typename Shape::Rope>(layer.attention, U.view(), Shape::cache(prefix_state, layer_index), first_position);
+                KVCache<C::Hkv, Shape::HEAD_DIM>& cache = Shape::cache(prefix_state, layer_index);
+                Matrix<D> A = [&] {
+                    if constexpr (Attention::OWNS_KV)
+                        return gemma_attend_layer(layer.attention.query_output(), layer.attention.key_value(), U.view(), cache, typename Shape::Rope{}, first_position, Shape::WINDOW);
+                    else
+                        return gemma_attend_shared_layer(layer.attention.query_output(), U.view(), cache, typename Shape::Rope{}, first_position, Shape::WINDOW);
+                }();
                 A = layer.post_attention_norm(A);
                 Matrix<D> H = add(X, A.view());
 
@@ -576,7 +591,7 @@ private:
     // Layers 24..41 own no K/V: they contribute no rows and attend against what
     // layer 22 (sliding) or 23 (full) wrote earlier in this same pass, which is
     // why cache() redirects rather than the layer holding a cache of its own.
-    // gemma_attend_layer picks the contribute-and-reduce or reduce-only path
+    // forward_layer() picks gemma_attend_layer or gemma_attend_shared_layer
     // from Attention::OWNS_KV.
 };
 
@@ -729,9 +744,9 @@ struct Gemma4_12BArchitecture {
                 Matrix<D> U = layer.attention_norm(X);
                 Matrix<D> A = [&] {
                     if constexpr (Attention::HEAD_DIM == C::LOCAL_HEAD_DIM)
-                        return gemma_attend_layer<D, C::Hq, C::SLIDING_WINDOW, LocalRope>(layer.attention, U.view(), state.local(layer_index), first_position);
+                        return gemma_attend_layer(layer.attention.query_output(), layer.attention.key_value(), U.view(), state.local(layer_index), LocalRope{}, first_position, C::SLIDING_WINDOW);
                     else
-                        return gemma_attend_layer<D, C::Hq, /*window=*/0, GlobalRope>(layer.attention, U.view(), state.global(layer_index), first_position);
+                        return gemma_attend_layer(layer.attention.query_output(), layer.attention.key_value(), U.view(), state.global(layer_index), GlobalRope{}, first_position, /*window=*/0);
                 }();
                 A = layer.post_attention_norm(A);
                 Matrix<D> H = add(X, A.view());

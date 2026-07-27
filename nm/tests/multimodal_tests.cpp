@@ -9,10 +9,11 @@ static void check(bool ok, const char* msg) {
 }
 
 template <size_t D>
-static TokenMatrix<D> rows(std::initializer_list<std::array<Scalar, D>> values) {
+static TokenMatrix<D> rows(std::initializer_list<std::initializer_list<Scalar>> values) {
     TokenMatrix<D> out(values.size());
     size_t r = 0;
     for (const auto& value : values) {
+        if (value.size() != D) throw std::invalid_argument("test row has the wrong width");
         auto dst = out.row_mut(r++);
         std::copy(value.begin(), value.end(), dst.begin());
     }

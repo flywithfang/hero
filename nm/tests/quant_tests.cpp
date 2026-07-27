@@ -8,6 +8,7 @@
 //     reference (which is separately cross-checked against libggml).
 // (3) Block sizes match the ggml static_asserts.
 #include "../src/quant_i8.hpp"
+#include <array>
 #include <cstdio>
 #include <random>
 

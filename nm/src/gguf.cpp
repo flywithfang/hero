@@ -9,9 +9,15 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
+#if defined(_WIN32)
+#define NOMINMAX
+#include <io.h>
+#include <windows.h>
+#else
+#include <sys/mman.h>
 #include <unistd.h>
+#endif
 
 namespace {
 
@@ -122,6 +128,37 @@ GT u32_to_gt(uint32_t v) {
 }  // namespace
 
 GGUF::GGUF(const std::string& path) {
+#if defined(_WIN32)
+    fd_ = ::_open(path.c_str(), _O_RDONLY | _O_BINARY);
+    if (fd_ < 0) throw std::runtime_error("GGUF: cannot open " + path);
+    struct _stat64 st {};
+    if (::_fstat64(fd_, &st) != 0) {
+        ::_close(fd_);
+        throw std::runtime_error("GGUF: fstat failed");
+    }
+    size_ = size_t(st.st_size);
+
+    const intptr_t os_handle = ::_get_osfhandle(fd_);
+    HANDLE mapping = ::CreateFileMappingW(reinterpret_cast<HANDLE>(os_handle), nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (!mapping) {
+        ::_close(fd_);
+        throw std::runtime_error("GGUF: CreateFileMapping failed");
+    }
+    map_ = ::MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+    ::CloseHandle(mapping);
+    if (!map_) {
+        ::_close(fd_);
+        throw std::runtime_error("GGUF: MapViewOfFile failed");
+    }
+
+    // keepalive: unmap + close when the last Weight view drops.
+    void* mp = map_;
+    int fd = fd_;
+    holder_ = std::shared_ptr<const void>(map_, [mp, fd](const void*) {
+        ::UnmapViewOfFile(mp);
+        ::_close(fd);
+    });
+#else
     fd_ = ::open(path.c_str(), O_RDONLY);
     if (fd_ < 0) throw std::runtime_error("GGUF: cannot open " + path);
     struct stat st{};
@@ -144,6 +181,7 @@ GGUF::GGUF(const std::string& path) {
         ::munmap(mp, sz);
         ::close(fd);
     });
+#endif
 
     Cursor c{(const uint8_t*)map_, (const uint8_t*)map_ + size_};
     uint32_t magic = c.read<uint32_t>();

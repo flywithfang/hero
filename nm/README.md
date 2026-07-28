@@ -76,8 +76,8 @@ PPM P6/P3. `/reset`, `/stats`, `/help`, and `/quit` work for every adapter.
 | 2 components | `src/components.hpp` | `Linear/ClippedLinear/RMSNorm/RMSNormNoScale/GatedMLP/GeluGatedMLP/MoE` (config-free) |
 | 2 token mixing | `src/attention.hpp` | `KVCache`, the visibility mask, GQA `attend`, `RotaryEmbedding`, `PerHeadNorm`, gated-attention head split — **model-neutral** |
 | 2 token mixing | `src/recurrent.hpp` | `CausalConv1dState`, `DeltaNetState`, the gated delta rule — **model-neutral** |
-| 3 transformer | `src/transformer.hpp` | shared residual stream, immutable callable `Transformer`, architecture contract, explicit `PrefixCache` |
-| 3 specifications | `src/gemma4.hpp`, `src/qwen35.hpp` | family dimensions, concrete layer types, cache/state policies, input preparation and output rules |
+| 3 transformer | `src/transformer.hpp` | shared residual stream, the two-operation model contract, `evaluate` + explicit `PrefixCache` (caching only — no pipeline) |
+| 3 models | `src/gemma4.hpp`, `src/qwen35.hpp` | `Gemma4E4BModel`/`Gemma4_12BModel`/`Qwen35Model` — dimensions, flat layer structs, cache/state, and each model's own `forward()` |
 | 3 modalities | `src/multimodal.hpp`, `src/gemma4_vision.hpp` | modality segments, image preprocessing, ViT, soft-token projection |
 | 4 runtime | `src/runtime.hpp` | model-neutral sampling |
 | chat application | `tools/chat.cpp`, `src/chat_session.hpp`, `src/chat_models.hpp` | conversation history, model detection, tokenization, sampling, family adapters |
@@ -166,24 +166,32 @@ backend kernels so they do not obscure the model equations.
 The implementation follows the general transformer map in
 `General_Multimodal_Transformer_Architecture_Wide.pdf`. Each encoder produces an
 `EmbeddingSegment<D>`; `compose_embeddings` creates one residual-width token
-sequence with modality spans. `Transformer` owns `TransformerWeights`:
-immutable token I/O, typed layers, final norm, and architecture data. The
-public model is an immutable callable:
+sequence with modality spans. A model is one entity — `Gemma4E4BModel` owns
+its token I/O, one plain vector of flat layers per physical layer shape, and
+the final norm — immutable and non-copyable. Evaluate it with:
 
 ```text
-logits = T(complete_input, prefix_cache)
+logits = evaluate(model, complete_input, prefix_cache)
 ```
 
 `PrefixCache` is explicit but contains only derived, prefix-indexed memoized
 intermediates. Its `Architecture::PrefixState` member is the model-specific
 derived storage — Gemma binds it to its collection of owned and shared K/V
-caches; a Qwen linear-attention layer will bind it to a fixed-size recurrent
+caches; a Qwen linear-attention layer binds it to a fixed-size recurrent
 state. Callers always provide the complete input. A cache is reused only when it
 belongs to the same immutable weights and its input is a verified prefix;
 otherwise it is cleared and recomputed. Caching changes cost, never the result.
 
-Gemma has a nominal `GemmaDenseDecoderLayer` whose forward function states its
-attention-residual, FFN-residual, and PLE equations directly, while reusing the
+That memoization is the *only* reason a model takes carried state at all:
+without it, generating token N would re-run tokens 0..N-1. So the contract is
+just two operations — `embed(ids, first_position)` and
+`forward(state, input) -> logits`. A model runs itself; how many layers it has,
+in what order, and what it precomputes once per pass are private to it and
+appear nowhere in `transformer.hpp`.
+
+A Gemma layer is a flat struct of tensors named after the checkpoint (`WQ`,
+`q_norm`, `WK`, ..., `WO`), and each architecture's `run_layer` states its
+attention-residual, FFN-residual, and PLE equations directly, reusing the
 shared components and satisfying the shared contract. The token-mixer name is
 intentional: a Qwen layer may bind attention or a recurrent mixer without
 changing the transformer lifecycle. Dense MLP versus MoE is likewise a concrete

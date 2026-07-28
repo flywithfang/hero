@@ -41,12 +41,13 @@ standing context.
   remembers a cache that grows with T; a delta network remembers a fixed-size
   state matrix. Both are "communication across tokens".
 - `src/transformer.hpp` — the architecture-neutral spine: one decoder-width
-  residual stream, typed residual branches, immutable callable `Transformer`,
-  explicit prefix-indexed `PrefixCache`.
+  residual stream, immutable callable `Transformer`, explicit prefix-indexed
+  `PrefixCache`. There is deliberately NO generic weights container: each
+  family's weights are its own flat struct of per-shape layer vectors.
 - `src/qwen35.hpp` + `src/qwen35_loader.hpp` — Qwen 3.5: 4B/9B configs, gated
   attention, the gated delta network, and the 3:1 hybrid layer schedule. Both
-  layer kinds bind the SAME canonical `TransformerBlock`; only the mixer type
-  differs. This is the payoff for calling it a token mixer.
+  layer kinds are the SAME flat `Qwen35Block`; only the mixer type differs.
+  This is the payoff for calling it a token mixer.
 - `src/gemma4.hpp` + `src/gemma4_vision.hpp` — Gemma-specific anatomy only:
   configuration, the two attention shapes, KV sharing, PLE, logit softcap, the
   decoder layer equation, and the ViT.
@@ -63,11 +64,32 @@ standing context.
    change cost, never semantics. Conversation history and sampling live outside
    the transformer. Layout knowledge lives ONLY in storage types
    (`Mat::operator()`, `KVCache`).
-2. Components take dimensions (template params); specifications satisfy the
-   `TransformerArchitecture` contract; token I/O satisfies `TokenInputOutput`.
-   Model differences are expressed as component/policy types and layer
-   schedules, not flat anatomy booleans. Hyperparameters compile-time; weights
-   runtime data; T is the only runtime dimension.
+2. Abstraction is BOTTOM-UP only. Reusable math components take dimensions
+   (template params) and have clear definitions; everything above them is flat
+   data. A layer is a plain struct of tensors named after the checkpoint
+   (`WQ`, `q_norm`, `WO`, ...); a model's weights are plain vectors, one per
+   physical layer shape; `forward_layer` is an if/else on the schedule
+   (`Config::position_in_kind`). KV anatomy is which members a layer HAS — a
+   shared-KV layer has no `WK`/`WV`, and `gemma_attention()` reads that with
+   `requires` — never a kind flag or wrapper type. NO top-down machinery: no
+   layer variants/visitors, no schedule-validator types, no generic weight
+   containers, no Architecture/Transformer split. A model is ONE entity: its
+   tensors and its math, immutable and non-copyable (`Gemma4E4BModel`). It
+   exposes exactly TWO operations — `embed(ids, pos)` and
+   `forward(state, input) -> logits` — and nothing else. How it runs (layer
+   count, order, what it precomputes once per pass) is private; `transformer.hpp`
+   must never dictate a pipeline. The shared `evaluate(model, input, cache)` is
+   about CACHING, not math, and reaches up to the model rather than the model
+   fitting into it. Token I/O satisfies `TokenInputOutput`. Hyperparameters
+   compile-time; weights runtime data; T is the only runtime dimension.
+   Share a layer equation only when it IS the same equation. E4B and 12B share
+   `gemma_layer()` — they differ by one PLE line, tested with
+   `requires { layer.ple; }`. Gemma and Qwen do NOT share one: Gemma is
+   sandwich-norm (a norm after each branch) plus a per-layer scale, Qwen is
+   plain pre-norm with neither, and their mixers take different arguments.
+   Merging those buys ~10 lines for four feature tests plus a mixer callback
+   punched through the middle — the wrong trade. Duplication that is really
+   two different equations is not duplication.
 3. Strong types where confusion is plausible AND type-detectable
    (`TokenId`/`Position`, `QHead`/`KvHead`). No role-typed vectors where
    dimensions already discriminate.

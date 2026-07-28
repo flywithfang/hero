@@ -62,19 +62,22 @@ hidden_size_per_layer_input=0     → NO PLE
 attention_k_eq_v=true             → V IS K on layers with no v_proj tensor
 enable_moe_block=false, use_double_wide_mlp=false
 ```
-So 12B is a *simpler* decoder than E4B — no PLE tail, no shared-KV layers —
-but it added two things the code did not express, and both became types:
+So 12B is a *simpler* decoder than E4B — no PLE residual, no shared-KV layers —
+but it added two things the code did not express, and both are expressed by the
+flat layer structs (`Gemma12BSlidingLayer` / `Gemma12BGlobalLayer`):
 1. **Per-attention-kind KV head count.** Sliding layers have `Hkv=8`, global
-   layers `Hkv=1`, so `Hkv` moved from a config constant into the attention
-   weight type (`Attention::KV_HEADS`) and the cache follows it.
-2. **Unified K/V.** `GemmaKVKind` replaced the `OwnsKV` bool with three cases —
-   `Owned`, `Unified`, `Shared`. On a unified layer the VALUE is the raw `W_k`
-   output taken *before* the key's learned norm and *before* RoPE, then given
-   the scale-free RMS the ordinary value path uses. `key_and_value()` exists so
-   that projection runs once.
-The PLE tail also became a template parameter (`GemmaPerLayerTail` for E4B,
-`GemmaNoTail` for 12B) rather than a "has PLE" bool, and `[[no_unique_address]]`
-makes its absence free. E4B's numerics and tests were unchanged by all of this.
+   layers `Hkv=1`, so `Hkv` is a per-layer-struct constant and the cache
+   follows it.
+2. **Unified K/V.** Three K/V anatomies exist across Gemma 4 — owned, unified,
+   shared — and each is expressed by which members a layer struct HAS: a
+   unified layer has `WK`/`k_norm`/`v_norm` but no `WV`; a shared layer has
+   none of them. On a unified layer the VALUE is the raw `W_k` output taken
+   *before* the key's learned norm and *before* RoPE, then given the scale-free
+   RMS the ordinary value path uses; `gemma_attention()` computes `X W_k` once
+   and applies both norms to it.
+PLE is likewise a member (`ple` + `layer_output_scale` on E4B's layer structs)
+that a 12B layer simply does not have — never a "has PLE" bool. E4B's numerics
+and tests were unchanged by all of this.
 Its multimodality is also encoder-free: raw image patches and audio are
 projected straight into the decoder embedding space (`patch_size=16`,
 `num_soft_tokens=280`, `mm_embed_dim=3840`), so there is no ViT to port —
@@ -93,10 +96,10 @@ What actually changes for **26B-A4B** (from the reference tensor schema):
   `ffn_gate_up_exps` or separate `ffn_gate_exps`/`ffn_up_exps`, plus
   `ffn_down_exps` and a per-expert scale), and **three extra norms**
   (`ffn_pre_norm_2`, `ffn_post_norm_1`, `ffn_post_norm_2`).
-  So the MoE layer is a distinct layer type with a second normalized branch,
-  not `GemmaDenseDecoderLayer` with `MoE` substituted for `GeluGatedMLP`.
-- PLE is optional (`n_embd_per_layer > 0`); a checkpoint without it must not
-  require the PLE tail.
+  So the MoE layer is a distinct flat layer struct with a second normalized
+  branch, not a dense layer with `MoE` substituted for `GeluGatedMLP`.
+- PLE is optional (`n_embd_per_layer > 0`); a checkpoint without it simply has
+  no `ple` member on its layer struct.
 - `LAYER_OUT_SCALE` is optional per layer.
 `EmbeddingSegment<D>` stays the modality/decoder seam and does not change.
 

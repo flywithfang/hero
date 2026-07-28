@@ -40,9 +40,9 @@ struct ToyQwen {
     static constexpr bool is_recurrent(size_t layer) { return (layer + 1) % FULL_ATTENTION_INTERVAL != 0; }
 };
 
-static_assert(TransformerArchitecture<Qwen35Architecture<ToyQwen>>);
-static_assert(TransformerArchitecture<Qwen35Architecture<Qwen35_4BConfig>>);
-static_assert(TransformerArchitecture<Qwen35Architecture<Qwen35_9BConfig>>);
+static_assert(TransformerModel<Qwen35Model<ToyQwen>>);
+static_assert(TransformerModel<Qwen35Model<Qwen35_4BConfig>>);
+static_assert(TransformerModel<Qwen35Model<Qwen35_9BConfig>>);
 
 // ---- helpers to build a deterministic toy weight ----------------------------
 
@@ -73,33 +73,42 @@ static RMSNorm<N> unit_norm() {
     return RMSNorm<N>(ones<N>(), ToyQwen::RMS_EPS);
 }
 
-static Qwen35Layer<ToyQwen> make_layer(size_t index) {
+static GatedMLP<ToyQwen::D, ToyQwen::FF> make_toy_mlp() {
     using C = ToyQwen;
-    GatedMLP<C::D, C::FF> mlp(linear_from<C::D, C::FF>(small), linear_from<C::D, C::FF>(small), linear_from<C::FF, C::D>(small));
-
-    if (C::is_recurrent(index)) {
-        using Mixer = QwenRecurrentMixer<C>;
-        Matrix<C::CONV_WIDTH> conv(Mixer::CONV_CHANNELS);
-        for (size_t c = 0; c < Mixer::CONV_CHANNELS; ++c)
-            for (size_t tap = 0; tap < C::CONV_WIDTH; ++tap) conv.row_mut(c)[tap] = tap == C::CONV_WIDTH - 1 ? 1.f : 0.25f;
-        Mixer mixer(linear_from<C::D, Mixer::CONV_CHANNELS>(small), linear_from<C::D, Mixer::VALUE_WIDTH>(small), std::move(conv), linear_from<C::D, C::VALUE_HEADS>(small), linear_from<C::D, C::VALUE_HEADS>(small),
-                    // decay_scale must be <= 0: the checkpoint stores
-                    // -exp(A_log), which is what makes exp(gate) a contraction.
-                    // A positive value here makes the state grow every token.
-                    Vec<C::VALUE_HEADS>{}, filled<C::VALUE_HEADS>(-1.f), PerHeadNorm<C::VALUE_HEADS, C::VALUE_HEAD_DIM, RMSNorm<C::VALUE_HEAD_DIM>>(unit_norm<C::VALUE_HEAD_DIM>()), linear_from<Mixer::VALUE_WIDTH, C::D>(small));
-        return Qwen35Block<C, Mixer>{unit_norm<C::D>(), std::move(mixer), unit_norm<C::D>(), std::move(mlp)};
-    }
-
-    using Mixer = QwenAttentionMixer<C>;
-    Mixer mixer(linear_from<C::D, Mixer::GATED_QW>(small), PerHeadNorm<C::Hq, C::HEAD_DIM, RMSNorm<C::HEAD_DIM>>(unit_norm<C::HEAD_DIM>()), linear_from<C::D, Mixer::KW>(small), PerHeadNorm<C::Hkv, C::HEAD_DIM, RMSNorm<C::HEAD_DIM>>(unit_norm<C::HEAD_DIM>()), linear_from<C::D, Mixer::KW>(small), linear_from<Mixer::QW, C::D>(small));
-    return Qwen35Block<C, Mixer>{unit_norm<C::D>(), std::move(mixer), unit_norm<C::D>(), std::move(mlp)};
+    return GatedMLP<C::D, C::FF>(linear_from<C::D, C::FF>(small), linear_from<C::D, C::FF>(small), linear_from<C::FF, C::D>(small));
 }
 
-static Qwen35Weights<ToyQwen> make_toy_weights() {
-    std::vector<Qwen35Layer<ToyQwen>> layers;
-    layers.reserve(ToyQwen::L);
-    for (size_t i = 0; i < ToyQwen::L; ++i) layers.push_back(make_layer(i));
-    return Qwen35Weights<ToyQwen>(QwenTokenIO<ToyQwen>(weight_from<ToyQwen::D, ToyQwen::V>(small), std::monostate{}), std::move(layers), unit_norm<ToyQwen::D>());
+static Qwen35Block<ToyQwen, QwenRecurrentMixer<ToyQwen>> make_recurrent_layer() {
+    using C = ToyQwen;
+    using Mixer = QwenRecurrentMixer<C>;
+    Matrix<C::CONV_WIDTH> conv(Mixer::CONV_CHANNELS);
+    for (size_t c = 0; c < Mixer::CONV_CHANNELS; ++c)
+        for (size_t tap = 0; tap < C::CONV_WIDTH; ++tap) conv.row_mut(c)[tap] = tap == C::CONV_WIDTH - 1 ? 1.f : 0.25f;
+    // decay_scale must be <= 0: the checkpoint stores -exp(A_log), which is
+    // what makes exp(gate) a contraction. A positive value here makes the
+    // state grow every token; the loader rejects that.
+    Mixer mixer{.WQKV = linear_from<C::D, Mixer::CONV_CHANNELS>(small), .WZ = linear_from<C::D, Mixer::VALUE_WIDTH>(small), .conv = std::move(conv), .Wbeta = linear_from<C::D, C::VALUE_HEADS>(small), .Walpha = linear_from<C::D, C::VALUE_HEADS>(small), .dt_bias = Vec<C::VALUE_HEADS>{}, .decay_scale = filled<C::VALUE_HEADS>(-1.f), .head_norm = PerHeadNorm<C::VALUE_HEADS, C::VALUE_HEAD_DIM, RMSNorm<C::VALUE_HEAD_DIM>>(unit_norm<C::VALUE_HEAD_DIM>()), .WO = linear_from<Mixer::VALUE_WIDTH, C::D>(small)};
+    return Qwen35Block<C, Mixer>{unit_norm<C::D>(), std::move(mixer), unit_norm<C::D>(), make_toy_mlp()};
+}
+
+static Qwen35Block<ToyQwen, QwenAttentionMixer<ToyQwen>> make_attention_layer() {
+    using C = ToyQwen;
+    using Mixer = QwenAttentionMixer<C>;
+    Mixer mixer{.WQG = linear_from<C::D, Mixer::GATED_QW>(small), .q_norm = PerHeadNorm<C::Hq, C::HEAD_DIM, RMSNorm<C::HEAD_DIM>>(unit_norm<C::HEAD_DIM>()), .WK = linear_from<C::D, Mixer::KW>(small), .k_norm = PerHeadNorm<C::Hkv, C::HEAD_DIM, RMSNorm<C::HEAD_DIM>>(unit_norm<C::HEAD_DIM>()), .WV = linear_from<C::D, Mixer::KW>(small), .WO = linear_from<Mixer::QW, C::D>(small)};
+    return Qwen35Block<C, Mixer>{unit_norm<C::D>(), std::move(mixer), unit_norm<C::D>(), make_toy_mlp()};
+}
+
+static Qwen35Model<ToyQwen> make_toy_model(size_t drop_attention_layers = 0) {
+    std::vector<Qwen35Model<ToyQwen>::RecurrentLayer> recurrent;
+    std::vector<Qwen35Model<ToyQwen>::AttentionLayer> attention;
+    for (size_t i = 0; i < ToyQwen::L; ++i) {
+        if (ToyQwen::is_recurrent(i))
+            recurrent.push_back(make_recurrent_layer());
+        else
+            attention.push_back(make_attention_layer());
+    }
+    for (size_t i = 0; i < drop_attention_layers; ++i) attention.pop_back();
+    return Qwen35Model<ToyQwen>(QwenTokenIO<ToyQwen>(weight_from<ToyQwen::D, ToyQwen::V>(small), std::monostate{}), std::move(recurrent), std::move(attention), unit_norm<ToyQwen::D>());
 }
 
 int main() {
@@ -200,34 +209,37 @@ int main() {
         check(split.second.row(0)[0] == 2.f && split.second.row(0)[1] == 3.f && split.second.row(0)[2] == 6.f && split.second.row(0)[3] == 7.f, "gates are the second half of each head pair");
     }
 
-    std::printf("== the schedule is enforced by construction ==\n");
+    std::printf("== the schedule cannot be silently violated ==\n");
     {
+        // A layer of the wrong KIND is a compile error: the two kinds are
+        // different types in different vectors. A missing layer is rejected by
+        // the model's constructor, so a mis-assembled model cannot exist at all
+        // — the check happens once at load, not once per evaluation.
         bool threw = false;
         try {
-            std::vector<Qwen35Layer<ToyQwen>> layers;
-            for (size_t i = 0; i < ToyQwen::L; ++i) layers.push_back(make_layer(i == 0 ? 3 : i));  // wrong kind at 0
-            Qwen35Weights<ToyQwen> bad(QwenTokenIO<ToyQwen>(weight_from<ToyQwen::D, ToyQwen::V>(small), std::monostate{}), std::move(layers), unit_norm<ToyQwen::D>());
+            make_toy_model(/*drop_attention_layers=*/1);
         } catch (const std::invalid_argument&) {
             threw = true;
         }
-        check(threw, "a layer of the wrong kind is rejected at assembly time");
+        check(threw, "a model whose layer counts disagree with the schedule cannot be constructed");
+        check(!std::is_copy_constructible_v<Qwen35Model<ToyQwen>>, "a loaded model's weights are never copied");
     }
 
     std::printf("== the hybrid stack runs, and PrefixCache stays pure ==\n");
     {
-        const Qwen35Transformer<ToyQwen> T(make_toy_weights());
+        const Qwen35Model<ToyQwen> model = make_toy_model();
         std::vector<TokenId> input{TokenId{1}, TokenId{4}, TokenId{2}, TokenId{7}, TokenId{0}};
 
-        PrefixCache<Qwen35Architecture<ToyQwen>> scratch;
-        const Vec<ToyQwen::V> whole = T(input, scratch);
+        PrefixCache<Qwen35Model<ToyQwen>> scratch;
+        const Vec<ToyQwen::V> whole = evaluate(model, input, scratch);
 
         // Incremental decode must equal one-shot prefill. This is the property
         // the recurrent mixer could most easily break: its state is sequential,
         // so an off-by-one in the conv history or a missed decay shows up here
         // and nowhere else.
-        PrefixCache<Qwen35Architecture<ToyQwen>> incremental;
+        PrefixCache<Qwen35Model<ToyQwen>> incremental;
         Vec<ToyQwen::V> stepwise;
-        for (size_t n = 1; n <= input.size(); ++n) stepwise = T(std::span<const TokenId>(input.data(), n), incremental);
+        for (size_t n = 1; n <= input.size(); ++n) stepwise = evaluate(model, std::span<const TokenId>(input.data(), n), incremental);
 
         Scalar worst = 0;
         for (size_t v = 0; v < ToyQwen::V; ++v) worst = std::max(worst, std::fabs(whole[v] - stepwise[v]));

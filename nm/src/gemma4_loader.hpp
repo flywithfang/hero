@@ -60,57 +60,49 @@ inline Scalar optional_scalar(const GGUF& gguf, const std::string& name, Scalar 
     return value;
 }
 
-// Shared by every Gemma 4 size: Q/O and K/V construction differ only in the
-// head width and KV head count the layer uses.
-template <class Cfg, size_t HeadDim>
-GemmaQueryOutput<Cfg::D, Cfg::Hq, HeadDim> load_query_output(const GGUF& gguf, size_t layer) {
-    constexpr size_t QW = Cfg::Hq * HeadDim;
-    return GemmaQueryOutput<Cfg::D, Cfg::Hq, HeadDim>(Linear<Cfg::D, QW>(tensor_loader::load_weight<Cfg::D, QW>(gguf, block(layer, "attn_q.weight"))), PerHeadNorm<Cfg::Hq, HeadDim, RMSNorm<HeadDim>>(RMSNorm<HeadDim>(tensor_loader::load_vector<HeadDim>(gguf, block(layer, "attn_q_norm.weight")), Cfg::RMS_EPS)), Linear<QW, Cfg::D>(tensor_loader::load_weight<QW, Cfg::D>(gguf, block(layer, "attn_output.weight"))));
+// Tensor-loading shorthands shared by every Gemma 4 size. Each returns one
+// finished member of a flat layer struct; the layer loaders below just list
+// them, tensor name next to the member it feeds.
+template <size_t D>
+RMSNorm<D> load_norm(const GGUF& gguf, size_t layer, const char* suffix, Scalar eps) {
+    return RMSNorm<D>(tensor_loader::load_vector<D>(gguf, block(layer, suffix)), eps);
 }
 
-template <class Cfg, size_t Hkv, size_t HeadDim>
-GemmaKeyValue<Cfg::D, Hkv, HeadDim> load_key_value(const GGUF& gguf, size_t layer) {
-    constexpr size_t KW = Hkv * HeadDim;
-    return GemmaKeyValue<Cfg::D, Hkv, HeadDim>(Linear<Cfg::D, KW>(tensor_loader::load_weight<Cfg::D, KW>(gguf, block(layer, "attn_k.weight"))), PerHeadNorm<Hkv, HeadDim, RMSNorm<HeadDim>>(RMSNorm<HeadDim>(tensor_loader::load_vector<HeadDim>(gguf, block(layer, "attn_k_norm.weight")), Cfg::RMS_EPS)), Linear<Cfg::D, KW>(tensor_loader::load_weight<Cfg::D, KW>(gguf, block(layer, "attn_v.weight"))), PerHeadNorm<Hkv, HeadDim, RMSNormNoScale<HeadDim>>(RMSNormNoScale<HeadDim>(Cfg::RMS_EPS)));
+template <size_t In, size_t Out>
+Linear<In, Out> load_linear(const GGUF& gguf, size_t layer, const char* suffix) {
+    return Linear<In, Out>(tensor_loader::load_weight<In, Out>(gguf, block(layer, suffix)));
 }
 
-// Unified K/V: the checkpoint has no attn_v at all on this layer.
-template <class Cfg, size_t Hkv, size_t HeadDim>
-GemmaUnifiedKeyValue<Cfg::D, Hkv, HeadDim> load_unified_key_value(const GGUF& gguf, size_t layer) {
-    constexpr size_t KW = Hkv * HeadDim;
-    expect(gguf.find(block(layer, "attn_v.weight")) == nullptr, block(layer, "attn_v.weight") + " is present, but this layer is configured for unified K/V");
-    return GemmaUnifiedKeyValue<Cfg::D, Hkv, HeadDim>(Linear<Cfg::D, KW>(tensor_loader::load_weight<Cfg::D, KW>(gguf, block(layer, "attn_k.weight"))), PerHeadNorm<Hkv, HeadDim, RMSNorm<HeadDim>>(RMSNorm<HeadDim>(tensor_loader::load_vector<HeadDim>(gguf, block(layer, "attn_k_norm.weight")), Cfg::RMS_EPS)), PerHeadNorm<Hkv, HeadDim, RMSNormNoScale<HeadDim>>(RMSNormNoScale<HeadDim>(Cfg::RMS_EPS)));
+template <size_t Heads, size_t HeadDim>
+PerHeadNorm<Heads, HeadDim, RMSNorm<HeadDim>> load_head_norm(const GGUF& gguf, size_t layer, const char* suffix, Scalar eps) {
+    return PerHeadNorm<Heads, HeadDim, RMSNorm<HeadDim>>(RMSNorm<HeadDim>(tensor_loader::load_vector<HeadDim>(gguf, block(layer, suffix)), eps));
 }
 
-template <class Attention>
-GemmaE4BDenseLayer<Attention> load_dense_layer(const GGUF& gguf, size_t layer, Attention attention) {
-    auto norm = [&](const char* suffix) { return RMSNorm<C::D>(tensor_loader::load_vector<C::D>(gguf, block(layer, suffix)), C::RMS_EPS); };
-    GeluGatedMLP<C::D, C::FF> mlp(Linear<C::D, C::FF>(tensor_loader::load_weight<C::D, C::FF>(gguf, block(layer, "ffn_gate.weight"))), Linear<C::D, C::FF>(tensor_loader::load_weight<C::D, C::FF>(gguf, block(layer, "ffn_up.weight"))), Linear<C::FF, C::D>(tensor_loader::load_weight<C::FF, C::D>(gguf, block(layer, "ffn_down.weight"))));
-    GemmaPerLayerResidual<C::D, C::PLE> ple(Linear<C::D, C::PLE>(tensor_loader::load_weight<C::D, C::PLE>(gguf, block(layer, "inp_gate.weight"))), Linear<C::PLE, C::D>(tensor_loader::load_weight<C::PLE, C::D>(gguf, block(layer, "proj.weight"))), norm("post_norm.weight"));
-
-    return GemmaE4BDenseLayer<Attention>{norm("attn_norm.weight"), std::move(attention), norm("post_attention_norm.weight"), norm("ffn_norm.weight"), std::move(mlp), norm("post_ffw_norm.weight"), GemmaPerLayerTail<C::D, C::PLE>(std::move(ple), optional_scalar(gguf, block(layer, "layer_output_scale.weight"), 1.f))};
+template <size_t D, size_t FF>
+GeluGatedMLP<D, FF> load_gelu_mlp(const GGUF& gguf, size_t layer) {
+    return GeluGatedMLP<D, FF>(load_linear<D, FF>(gguf, layer, "ffn_gate.weight"), load_linear<D, FF>(gguf, layer, "ffn_up.weight"), load_linear<FF, D>(gguf, layer, "ffn_down.weight"));
 }
 
-inline GemmaE4BLayer load_layer(const GGUF& gguf, size_t layer) {
-    const bool full = C::attention_kind(layer) == GemmaAttentionKind::Full;
-    const bool shared = C::shares_kv(layer);
-    if (!full && !shared) {
-        GemmaE4BLocalOwnAttention attention(load_query_output<C, C::LOCAL_HEAD_DIM>(gguf, layer), load_key_value<C, C::Hkv, C::LOCAL_HEAD_DIM>(gguf, layer));
-        return load_dense_layer(gguf, layer, std::move(attention));
-    }
-    if (full && !shared) {
-        GemmaE4BGlobalOwnAttention attention(load_query_output<C, C::GLOBAL_HEAD_DIM>(gguf, layer), load_key_value<C, C::Hkv, C::GLOBAL_HEAD_DIM>(gguf, layer));
-        return load_dense_layer(gguf, layer, std::move(attention));
-    }
-    if (!full) {
-        GemmaE4BLocalSharedAttention attention(load_query_output<C, C::LOCAL_HEAD_DIM>(gguf, layer));
-        return load_dense_layer(gguf, layer, std::move(attention));
-    }
-    GemmaE4BGlobalSharedAttention attention(load_query_output<C, C::GLOBAL_HEAD_DIM>(gguf, layer));
-    return load_dense_layer(gguf, layer, std::move(attention));
+inline GemmaPerLayerResidual<C::D, C::PLE> load_ple_residual(const GGUF& gguf, size_t layer) {
+    return GemmaPerLayerResidual<C::D, C::PLE>(load_linear<C::D, C::PLE>(gguf, layer, "inp_gate.weight"), load_linear<C::PLE, C::D>(gguf, layer, "proj.weight"), load_norm<C::D>(gguf, layer, "post_norm.weight", C::RMS_EPS));
 }
 
-inline Gemma4E4BTransformer load_e4b_text(const GGUF& gguf) {
+template <size_t Dh>
+GemmaE4BLayer<Dh> load_e4b_layer(const GGUF& gguf, size_t layer) {
+    using Layer = GemmaE4BLayer<Dh>;
+    return Layer{.attn_norm = load_norm<C::D>(gguf, layer, "attn_norm.weight", C::RMS_EPS), .WQ = load_linear<C::D, Layer::Hq * Dh>(gguf, layer, "attn_q.weight"), .q_norm = load_head_norm<Layer::Hq, Dh>(gguf, layer, "attn_q_norm.weight", C::RMS_EPS), .WK = load_linear<C::D, Layer::Hkv * Dh>(gguf, layer, "attn_k.weight"), .k_norm = load_head_norm<Layer::Hkv, Dh>(gguf, layer, "attn_k_norm.weight", C::RMS_EPS), .WV = load_linear<C::D, Layer::Hkv * Dh>(gguf, layer, "attn_v.weight"), .v_norm = PerHeadNorm<Layer::Hkv, Dh, RMSNormNoScale<Dh>>(RMSNormNoScale<Dh>(C::RMS_EPS)), .WO = load_linear<Layer::Hq * Dh, C::D>(gguf, layer, "attn_output.weight"), .post_attn_norm = load_norm<C::D>(gguf, layer, "post_attention_norm.weight", C::RMS_EPS), .ffn_norm = load_norm<C::D>(gguf, layer, "ffn_norm.weight", C::RMS_EPS), .ffn = load_gelu_mlp<C::D, C::FF>(gguf, layer), .post_ffn_norm = load_norm<C::D>(gguf, layer, "post_ffw_norm.weight", C::RMS_EPS), .ple = load_ple_residual(gguf, layer), .layer_output_scale = optional_scalar(gguf, block(layer, "layer_output_scale.weight"), 1.f)};
+}
+
+// Shared-KV layers load only Q/O. (The GGUF may still carry attn_k/attn_v
+// tensors on these layers — converters emit them — but the model never uses
+// them, so they are simply not loaded.)
+template <size_t Dh>
+GemmaE4BSharedLayer<Dh> load_e4b_shared_layer(const GGUF& gguf, size_t layer) {
+    using Layer = GemmaE4BSharedLayer<Dh>;
+    return Layer{.attn_norm = load_norm<C::D>(gguf, layer, "attn_norm.weight", C::RMS_EPS), .WQ = load_linear<C::D, Layer::Hq * Dh>(gguf, layer, "attn_q.weight"), .q_norm = load_head_norm<Layer::Hq, Dh>(gguf, layer, "attn_q_norm.weight", C::RMS_EPS), .WO = load_linear<Layer::Hq * Dh, C::D>(gguf, layer, "attn_output.weight"), .post_attn_norm = load_norm<C::D>(gguf, layer, "post_attention_norm.weight", C::RMS_EPS), .ffn_norm = load_norm<C::D>(gguf, layer, "ffn_norm.weight", C::RMS_EPS), .ffn = load_gelu_mlp<C::D, C::FF>(gguf, layer), .post_ffn_norm = load_norm<C::D>(gguf, layer, "post_ffw_norm.weight", C::RMS_EPS), .ple = load_ple_residual(gguf, layer), .layer_output_scale = optional_scalar(gguf, block(layer, "layer_output_scale.weight"), 1.f)};
+}
+
+inline Gemma4E4BModel load_e4b_text(const GGUF& gguf) {
     validate_e4b_text_metadata(gguf);
 
     GemmaTokenIO<C::D, C::V> token_io(tensor_loader::load_weight<C::D, C::V>(gguf, "token_embd.weight"), std::sqrt(Scalar(C::D)));
@@ -118,13 +110,22 @@ inline Gemma4E4BTransformer load_e4b_text(const GGUF& gguf) {
     constexpr size_t PackedPLE = C::PLE * C::L;
     GemmaPerLayerInputs<C::D, C::PLE, C::L, C::V> ple(tensor_loader::load_weight<PackedPLE, C::V>(gguf, "per_layer_token_embd.weight"), Linear<C::D, PackedPLE>(tensor_loader::load_weight<C::D, PackedPLE>(gguf, "per_layer_model_proj.weight")), PerHeadNorm<C::L, C::PLE, RMSNorm<C::PLE>>(RMSNorm<C::PLE>(tensor_loader::load_vector<C::PLE>(gguf, "per_layer_proj_norm.weight"), C::RMS_EPS)), std::sqrt(Scalar(C::PLE)), 1.f / std::sqrt(Scalar(C::D)), 1.f / std::sqrt(2.f));
 
-    std::vector<GemmaE4BLayer> layers;
-    layers.reserve(C::L);
-    for (size_t layer = 0; layer < C::L; ++layer) layers.push_back(load_layer(gguf, layer));
-
-    RMSNorm<C::D> final_norm(tensor_loader::load_vector<C::D>(gguf, "output_norm.weight"), C::RMS_EPS);
-    Gemma4E4BTextWeights weights(std::move(token_io), std::move(layers), std::move(final_norm), std::move(ple));
-    return Gemma4E4BTransformer(std::move(weights));
+    // One vector per layer shape, filled in schedule order so that
+    // C::position_in_kind(i) is each layer's slot. The model's constructor
+    // checks the four counts against the schedule.
+    std::vector<Gemma4E4BModel::SlidingLayer> sliding;
+    std::vector<Gemma4E4BModel::GlobalLayer> global;
+    std::vector<Gemma4E4BModel::SlidingSharedLayer> sliding_shared;
+    std::vector<Gemma4E4BModel::GlobalSharedLayer> global_shared;
+    for (size_t layer = 0; layer < C::L; ++layer) {
+        const bool full = C::attention_kind(layer) == GemmaAttentionKind::Full;
+        const bool shared = C::shares_kv(layer);
+        if (!shared && !full) sliding.push_back(load_e4b_layer<C::LOCAL_HEAD_DIM>(gguf, layer));
+        else if (!shared) global.push_back(load_e4b_layer<C::GLOBAL_HEAD_DIM>(gguf, layer));
+        else if (!full) sliding_shared.push_back(load_e4b_shared_layer<C::LOCAL_HEAD_DIM>(gguf, layer));
+        else global_shared.push_back(load_e4b_shared_layer<C::GLOBAL_HEAD_DIM>(gguf, layer));
+    }
+    return Gemma4E4BModel(std::move(token_io), std::move(ple), std::move(sliding), std::move(global), std::move(sliding_shared), std::move(global_shared), RMSNorm<C::D>(tensor_loader::load_vector<C::D>(gguf, "output_norm.weight"), C::RMS_EPS));
 }
 
 // ============================ Gemma 4 12B Unified ============================
@@ -171,31 +172,34 @@ inline void validate_12b_text_metadata(const GGUF& gguf) {
     if (gguf.has("tokenizer.ggml.tokens")) expect(gguf.get("tokenizer.ggml.tokens").arr_str.size() == C12::V, "tokenizer vocabulary size differs from 262144");
 }
 
-template <class Attention>
-Gemma12BDenseLayer<Attention> load_12b_dense_layer(const GGUF& gguf, size_t layer, Attention attention) {
-    auto norm = [&](const char* suffix) { return RMSNorm<C12::D>(tensor_loader::load_vector<C12::D>(gguf, block(layer, suffix)), C12::RMS_EPS); };
-    GeluGatedMLP<C12::D, C12::FF> mlp(Linear<C12::D, C12::FF>(tensor_loader::load_weight<C12::D, C12::FF>(gguf, block(layer, "ffn_gate.weight"))), Linear<C12::D, C12::FF>(tensor_loader::load_weight<C12::D, C12::FF>(gguf, block(layer, "ffn_up.weight"))), Linear<C12::FF, C12::D>(tensor_loader::load_weight<C12::FF, C12::D>(gguf, block(layer, "ffn_down.weight"))));
-    return Gemma12BDenseLayer<Attention>{norm("attn_norm.weight"), std::move(attention), norm("post_attention_norm.weight"), norm("ffn_norm.weight"), std::move(mlp), norm("post_ffw_norm.weight"),
-                                         // No PLE, but the per-layer output scalar is still present.
-                                         GemmaLayerScaleTail<C12::D>(optional_scalar(gguf, block(layer, "layer_output_scale.weight"), 1.f))};
+inline Gemma12BSlidingLayer load_12b_sliding_layer(const GGUF& gguf, size_t layer) {
+    using Layer = Gemma12BSlidingLayer;
+    constexpr size_t Dh = Layer::HEAD_DIM;
+    return Layer{.attn_norm = load_norm<C12::D>(gguf, layer, "attn_norm.weight", C12::RMS_EPS), .WQ = load_linear<C12::D, Layer::Hq * Dh>(gguf, layer, "attn_q.weight"), .q_norm = load_head_norm<Layer::Hq, Dh>(gguf, layer, "attn_q_norm.weight", C12::RMS_EPS), .WK = load_linear<C12::D, Layer::Hkv * Dh>(gguf, layer, "attn_k.weight"), .k_norm = load_head_norm<Layer::Hkv, Dh>(gguf, layer, "attn_k_norm.weight", C12::RMS_EPS), .WV = load_linear<C12::D, Layer::Hkv * Dh>(gguf, layer, "attn_v.weight"), .v_norm = PerHeadNorm<Layer::Hkv, Dh, RMSNormNoScale<Dh>>(RMSNormNoScale<Dh>(C12::RMS_EPS)), .WO = load_linear<Layer::Hq * Dh, C12::D>(gguf, layer, "attn_output.weight"), .post_attn_norm = load_norm<C12::D>(gguf, layer, "post_attention_norm.weight", C12::RMS_EPS), .ffn_norm = load_norm<C12::D>(gguf, layer, "ffn_norm.weight", C12::RMS_EPS), .ffn = load_gelu_mlp<C12::D, C12::FF>(gguf, layer), .post_ffn_norm = load_norm<C12::D>(gguf, layer, "post_ffw_norm.weight", C12::RMS_EPS), .layer_output_scale = optional_scalar(gguf, block(layer, "layer_output_scale.weight"), 1.f)};
 }
 
-inline Gemma12BLayer load_12b_layer(const GGUF& gguf, size_t layer) {
-    if (C12::attention_kind(layer) == GemmaAttentionKind::Sliding) return load_12b_dense_layer(gguf, layer, Gemma12BSlidingAttention(load_query_output<C12, C12::LOCAL_HEAD_DIM>(gguf, layer), load_key_value<C12, C12::LOCAL_HKV, C12::LOCAL_HEAD_DIM>(gguf, layer)));
-    return load_12b_dense_layer(gguf, layer, Gemma12BGlobalAttention(load_query_output<C12, C12::GLOBAL_HEAD_DIM>(gguf, layer), load_unified_key_value<C12, C12::GLOBAL_HKV, C12::GLOBAL_HEAD_DIM>(gguf, layer)));
+// Unified K/V: the checkpoint has no attn_v at all on this layer.
+inline Gemma12BGlobalLayer load_12b_global_layer(const GGUF& gguf, size_t layer) {
+    using Layer = Gemma12BGlobalLayer;
+    constexpr size_t Dh = Layer::HEAD_DIM;
+    expect(gguf.find(block(layer, "attn_v.weight")) == nullptr, block(layer, "attn_v.weight") + " is present, but this layer is configured for unified K/V");
+    return Layer{.attn_norm = load_norm<C12::D>(gguf, layer, "attn_norm.weight", C12::RMS_EPS), .WQ = load_linear<C12::D, Layer::Hq * Dh>(gguf, layer, "attn_q.weight"), .q_norm = load_head_norm<Layer::Hq, Dh>(gguf, layer, "attn_q_norm.weight", C12::RMS_EPS), .WK = load_linear<C12::D, Layer::Hkv * Dh>(gguf, layer, "attn_k.weight"), .k_norm = load_head_norm<Layer::Hkv, Dh>(gguf, layer, "attn_k_norm.weight", C12::RMS_EPS), .v_norm = PerHeadNorm<Layer::Hkv, Dh, RMSNormNoScale<Dh>>(RMSNormNoScale<Dh>(C12::RMS_EPS)), .WO = load_linear<Layer::Hq * Dh, C12::D>(gguf, layer, "attn_output.weight"), .post_attn_norm = load_norm<C12::D>(gguf, layer, "post_attention_norm.weight", C12::RMS_EPS), .ffn_norm = load_norm<C12::D>(gguf, layer, "ffn_norm.weight", C12::RMS_EPS), .ffn = load_gelu_mlp<C12::D, C12::FF>(gguf, layer), .post_ffn_norm = load_norm<C12::D>(gguf, layer, "post_ffw_norm.weight", C12::RMS_EPS), .layer_output_scale = optional_scalar(gguf, block(layer, "layer_output_scale.weight"), 1.f)};
 }
 
-inline Gemma4_12BTransformer load_12b_text(const GGUF& gguf) {
+inline Gemma4_12BModel load_12b_text(const GGUF& gguf) {
     validate_12b_text_metadata(gguf);
 
     GemmaTokenIO<C12::D, C12::V> token_io(tensor_loader::load_weight<C12::D, C12::V>(gguf, "token_embd.weight"), std::sqrt(Scalar(C12::D)));
 
-    std::vector<Gemma12BLayer> layers;
-    layers.reserve(C12::L);
-    for (size_t layer = 0; layer < C12::L; ++layer) layers.push_back(load_12b_layer(gguf, layer));
-
-    RMSNorm<C12::D> final_norm(tensor_loader::load_vector<C12::D>(gguf, "output_norm.weight"), C12::RMS_EPS);
-    return Gemma4_12BTransformer(Gemma4_12BTextWeights(std::move(token_io), std::move(layers), std::move(final_norm)));
+    std::vector<Gemma12BSlidingLayer> sliding;
+    std::vector<Gemma12BGlobalLayer> global;
+    for (size_t layer = 0; layer < C12::L; ++layer) {
+        if (C12::attention_kind(layer) == GemmaAttentionKind::Sliding)
+            sliding.push_back(load_12b_sliding_layer(gguf, layer));
+        else
+            global.push_back(load_12b_global_layer(gguf, layer));
+    }
+    return Gemma4_12BModel(std::move(token_io), std::move(sliding), std::move(global), RMSNorm<C12::D>(tensor_loader::load_vector<C12::D>(gguf, "output_norm.weight"), C12::RMS_EPS));
 }
 
 }  // namespace gemma4_loader

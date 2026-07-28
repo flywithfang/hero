@@ -2,9 +2,10 @@
 #include <cstdio>
 #include <type_traits>
 
-static_assert(TransformerArchitecture<Gemma4E4BArchitecture>);
-static_assert(!std::is_default_constructible_v<Gemma4E4BTextWeights>);
-static_assert(!std::is_default_constructible_v<Gemma4E4BTransformer>);
+static_assert(TransformerModel<Gemma4E4BModel>);
+static_assert(TransformerModel<Gemma4_12BModel>);
+static_assert(!std::is_default_constructible_v<Gemma4E4BModel>);
+static_assert(!std::is_copy_constructible_v<Gemma4E4BModel>);
 
 static int g_fail = 0;
 static void check(bool ok, const char* msg) {
@@ -17,6 +18,25 @@ static Linear<In, Out> zero_linear() {
     MatT<In, Out> matrix = MatT<In, Out>::owning();
     return Linear<In, Out>(Weight<In, Out>(std::move(matrix)));
 }
+
+template <size_t N>
+static Linear<N, N> identity_linear() {
+    MatT<N, N> matrix = MatT<N, N>::owning();
+    for (size_t i = 0; i < N; ++i) matrix.raw()[i * N + i] = 1.f;
+    return Linear<N, N>(Weight<N, N>(std::move(matrix)));
+}
+
+// A toy unified layer: one head of width 2, no WV member — exactly the 12B
+// global anatomy at toy size. gemma_attention() must read that off the members.
+struct ToyUnifiedLayer {
+    static constexpr size_t D = 2, Hq = 1, HEAD_DIM = 2;
+    Linear<2, 2> WQ;
+    PerHeadNorm<1, 2, RMSNorm<2>> q_norm;
+    Linear<2, 2> WK;
+    PerHeadNorm<1, 2, RMSNorm<2>> k_norm;
+    PerHeadNorm<1, 2, RMSNormNoScale<2>> v_norm;
+    Linear<2, 2> WO;
+};
 
 template <size_t N>
 static RMSNorm<N> unit_norm(Scalar eps = 1e-6f) {
@@ -109,16 +129,14 @@ int main() {
         check(std::fabs(gemma_softcap(1000.f, 30.f) - 30.f) < 1e-4f && gemma_softcap(-4.f, 30.f) < 0.f, "logit softcap is cap*tanh(x/cap)");
     }
 
-    std::printf("== dense decoder tail anatomy ==\n");
+    std::printf("== the PLE residual and the layer output scale ==\n");
     {
-        // The layer equation now reads straight out of forward_layer() in each
-        // architecture, so it has no mockable seam and is pinned by the parity
-        // harness instead. What is still a component with numbers of its own is
-        // the tail. Zero PLE projections make the residual contribute nothing,
-        // leaving exactly the layer_output_scale on the FF residual.
-        struct MockAttention {};
+        // The layer equation reads straight out of each architecture's
+        // run_layer() and is pinned by the parity harness. What is still a
+        // component with numbers of its own is the PLE residual. Zero PLE
+        // projections make the branch contribute nothing, so `h + branch` is
+        // `h`, and the layer scale that follows in run_layer() is then exact.
         GemmaPerLayerResidual<2, 1> ple(zero_linear<2, 1>(), zero_linear<1, 2>(), unit_norm<2>());
-        GemmaPerLayerTail<2, 1> tail(std::move(ple), 2.f);
         auto x = [] {
             Vec<2> value;
             value[0] = 3;
@@ -127,22 +145,20 @@ int main() {
         };
         Vec<1> per_layer;
         per_layer[0] = 7;
-        Vec<2> y = tail(x(), VecView<1>(per_layer));
+        Vec<2> y = ple(VecView<2>(x()), VecView<1>(per_layer));
+        scale_in_place(y, 2.f);  // exactly run_layer()'s tail: PLE residual, then layer_output_scale
         check(y[0] == 6 && y[1] == -8, "the PLE residual precedes layer scaling");
 
         Matrix<2> batch(1);
         batch.set_row(0, x());
         Matrix<1> batch_per_layer(1);
         batch_per_layer.set_row(0, per_layer);
-        Matrix<2> batch_output = tail(std::move(batch), batch_per_layer.view());
-        check(batch_output.row(0)[0] == 6 && batch_output.row(0)[1] == -8, "the matrix tail states the same equation as the scalar one");
+        Matrix<2> batch_output = ple(batch.view(), batch_per_layer.view());
+        scale_in_place(batch_output.mutable_view(), 2.f);
+        check(batch_output.row(0)[0] == 6 && batch_output.row(0)[1] == -8, "the matrix PLE residual states the same equation as the scalar one");
 
-        // 12B's tail types: a scalar-only tail, and no tail at all.
-        Vec<2> scaled = GemmaLayerScaleTail<2>(2.f)(x());
-        check(scaled[0] == 6 && scaled[1] == -8, "a PLE-free size still applies layer_output_scale");
-        Vec<2> plain = GemmaNoTail<2>{}(x());
-        check(plain[0] == 3 && plain[1] == -4, "a layer with no tail returns the FF residual unscaled");
-        check(sizeof(GemmaDenseDecoderLayer<2, 2, MockAttention, GemmaNoTail<2>>) < sizeof(GemmaDenseDecoderLayer<2, 2, MockAttention, GemmaPerLayerTail<2, 1>>), "the absent tail costs no space");
+        // A shared-KV layer carries no K/V tensors — the members do not exist.
+        check(sizeof(GemmaE4BSharedLayer<256>) < sizeof(GemmaE4BLayer<256>), "a shared-KV layer is physically smaller than an owning one");
     }
 
     std::printf("== Gemma 4 12B anatomy ==\n");
@@ -157,14 +173,13 @@ int main() {
         const double params = double(gemma_dense_param_count<C>());
         check(params > 11.7e9 && params < 12.1e9, "parameter count lands on the advertised ~11.95B");
 
-        // Every Gemma 4 layer carries a scalar output scale; 12B has no PLE
-        // but still has that, so its tail is scale-only rather than absent.
-        GemmaLayerScaleTail<2> scale_tail(0.5f);
+        // Every Gemma 4 layer carries a scalar layer_output_scale, applied
+        // last in run_layer(): scale_in_place on the finished residual.
         Vec<2> h;
         h[0] = 6.f;
         h[1] = -8.f;
-        Vec<2> scaled = scale_tail(std::move(h));
-        check(scaled[0] == 3.f && scaled[1] == -4.f, "the layer output scale is applied last");
+        scale_in_place(h, 0.5f);
+        check(h[0] == 3.f && h[1] == -4.f, "the layer output scale is applied last");
 
         Gemma4_12BCache cache;
         check(cache.local(0).capacity() == C::SLIDING_WINDOW, "sliding layers own a bounded ring, so their cost stops growing");
@@ -173,9 +188,8 @@ int main() {
 
     std::printf("== unified K/V takes one projection two ways ==\n");
     {
-        // One head of width 2. W_k maps x -> (x0, x1). The key gets the learned
-        // per-head RMSNorm; the value gets the scale-free one on the SAME raw
-        // projection output, so the two differ only by that learned scale.
+        // W_k maps x -> (x0, x1); the key gets the learned per-head RMSNorm,
+        // the value the scale-free one on the SAME raw projection output.
         MatT<2, 2> w = MatT<2, 2>::owning();
         w.raw()[0] = 1.f;
         w.raw()[1] = 0.f;  // out 0 = x0
@@ -184,18 +198,24 @@ int main() {
         Vec<2> gamma;
         gamma[0] = 3.f;
         gamma[1] = 3.f;
-        GemmaUnifiedKeyValue<2, 1, 2> kv(Linear<2, 2>(Weight<2, 2>(std::move(w))), PerHeadNorm<1, 2, RMSNorm<2>>(RMSNorm<2>(std::move(gamma), 1e-6f)), PerHeadNorm<1, 2, RMSNormNoScale<2>>(RMSNormNoScale<2>(1e-6f)));
+        ToyUnifiedLayer layer{identity_linear<2>(), PerHeadNorm<1, 2, RMSNorm<2>>(unit_norm<2>()), Linear<2, 2>(Weight<2, 2>(std::move(w))), PerHeadNorm<1, 2, RMSNorm<2>>(RMSNorm<2>(std::move(gamma), 1e-6f)), PerHeadNorm<1, 2, RMSNormNoScale<2>>(RMSNormNoScale<2>(1e-6f)), identity_linear<2>()};
 
         Matrix<2> x(1);
         x.row_mut(0)[0] = 3.f;
         x.row_mut(0)[1] = 4.f;
-        GemmaKeyValuePair<2> pair = kv.key_and_value(x.view());
+
+        // One token, one visible key: the softmax weight is 1 regardless of K,
+        // and WO is identity, so gemma_attention() returns V itself — which for
+        // unified K/V must be the raw W_k output under the scale-free norm.
+        KVCache<1, 2> cache;
+        Matrix<2> out = gemma_attention(layer, x.view(), cache, RotaryEmbedding<2, 10000>{}, /*first_position=*/0, /*window=*/0);
+
         // rms([3,4]) = sqrt(12.5); normalized = [0.8485, 1.1314]
         const Scalar inv = 1.f / std::sqrt(12.5f);
-        check(std::fabs(pair.value.row(0)[0] - 3.f * inv) < 1e-5f && std::fabs(pair.value.row(0)[1] - 4.f * inv) < 1e-5f, "the value is the raw projection with the scale-free norm");
-        check(std::fabs(pair.key.row(0)[0] - 3.f * 3.f * inv) < 1e-5f, "the key is the same projection with the learned scale");
-        Matrix<2> separate_key = kv.key(x.view());
-        check(separate_key.row(0)[0] == pair.key.row(0)[0], "key() and key_and_value() agree");
+        check(std::fabs(out.row(0)[0] - 3.f * inv) < 1e-5f && std::fabs(out.row(0)[1] - 4.f * inv) < 1e-5f, "the value is the raw projection with the scale-free norm");
+        Matrix<2> K = layer.k_norm(layer.WK(x.view()));
+        check(std::fabs(K.row(0)[0] - 3.f * 3.f * inv) < 1e-5f, "the key is the same projection with the learned scale");
+        check(cache.size() == 1, "the unified K/V row was cached like any owned one");
     }
 
     std::printf("\n%s (%d failures)\n", g_fail ? "GEMMA4 TESTS FAILED" : "ALL GEMMA4 TESTS PASSED", g_fail);

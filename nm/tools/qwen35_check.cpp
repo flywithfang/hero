@@ -38,9 +38,9 @@ static int check(const GGUF& gguf, const char* name, const char* prompt, size_t 
     for (int32_t id : ids) std::printf(" %d", id);
     std::printf("\n");
 
-    PrefixCache<Qwen35Architecture<C>> memo;
+    PrefixCache<Qwen35Model<C>> memo;
     const auto prefill_start = std::chrono::steady_clock::now();
-    auto logits = model(tokens, memo);
+    auto logits = evaluate(model, tokens, memo);
     const double prefill = std::chrono::duration<double>(std::chrono::steady_clock::now() - prefill_start).count();
     std::printf("prefill: %.3fs (%zu tokens, %.2f tok/s)\n", prefill, ids.size(), double(ids.size()) / prefill);
 
@@ -67,7 +67,7 @@ static int check(const GGUF& gguf, const char* name, const char* prompt, size_t 
             text += tokenizer.decode1(int32_t(token));
             if (tokenizer.is_eog(int32_t(token)) || i + 1 == generate_count) break;
             tokens.push_back(TokenId{int32_t(token)});
-            logits = model(tokens, memo);
+            logits = evaluate(model, tokens, memo);
         }
         const double decode = std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_start).count();
         std::printf("\ntext: %s\ndecode: %.3fs (%zu tokens, %.2f tok/s)\n", text.c_str(), decode, produced, double(produced) / decode);

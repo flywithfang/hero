@@ -42,6 +42,14 @@ struct Gemma4E4BTextConfig {
             if (attention_kind(next) == kind) return false;
         return true;
     }
+    // Which slot of its shape's weights vector layer `i` occupies: the count
+    // of earlier layers with the same (attention kind, KV ownership).
+    static constexpr size_t position_in_kind(size_t layer) {
+        size_t n = 0;
+        for (size_t i = 0; i < layer; ++i)
+            if (attention_kind(i) == attention_kind(layer) && shares_kv(i) == shares_kv(layer)) ++n;
+        return n;
+    }
 };
 
 static_assert(Gemma4E4BTextConfig::attention_kind(4) == GemmaAttentionKind::Sliding);
@@ -50,185 +58,93 @@ static_assert(Gemma4E4BTextConfig::FIRST_KV_SHARED_LAYER == 24);
 static_assert(Gemma4E4BTextConfig::stores_shared_kv(22));
 static_assert(Gemma4E4BTextConfig::stores_shared_kv(23));
 static_assert(Gemma4E4BTextConfig::shares_kv(24));
+static_assert(Gemma4E4BTextConfig::position_in_kind(0) == 0 && Gemma4E4BTextConfig::position_in_kind(6) == 5, "sliding-own layers count their own kind only");
+static_assert(Gemma4E4BTextConfig::position_in_kind(5) == 0 && Gemma4E4BTextConfig::position_in_kind(23) == 3, "full-own layers are 5, 11, 17, 23");
+static_assert(Gemma4E4BTextConfig::position_in_kind(24) == 0 && Gemma4E4BTextConfig::position_in_kind(29) == 0 && Gemma4E4BTextConfig::position_in_kind(35) == 1, "shared layers restart their count at layer 24");
 
-// Gemma keeps Q/O and K/V as separate construction units because E4B's final
-// 18 layers have Q/O weights but deliberately have no K/V tensors.
-template <size_t D, size_t Hq, size_t HeadDim>
-class GemmaQueryOutput {
-public:
-    static constexpr size_t QW = Hq * HeadDim;
-
-    GemmaQueryOutput(Linear<D, QW> query, PerHeadNorm<Hq, HeadDim, RMSNorm<HeadDim>> query_norm, Linear<QW, D> output) : query_(std::move(query)), query_norm_(std::move(query_norm)), output_(std::move(output)) {}
-
-    Vec<QW> query(VecView<D> hidden) const { return query_norm_(query_(hidden)); }
-    Vec<D> output(VecView<QW> attended) const { return output_(attended); }
-    Matrix<QW> query(MatrixView<D> hidden) const { return query_norm_(query_(hidden)); }
-    Matrix<D> output(MatrixView<QW> attended) const { return output_(attended); }
-
-private:
-    Linear<D, QW> query_;
-    PerHeadNorm<Hq, HeadDim, RMSNorm<HeadDim>> query_norm_;
-    Linear<QW, D> output_;
-};
-
-// K and V come from the same input, so the pair is produced together: a layer
-// with UNIFIED K/V has one projection and must not run it twice.
-template <size_t KW>
-struct GemmaKeyValuePair {
-    Matrix<KW> key;
-    Matrix<KW> value;
-};
-
-template <size_t D, size_t Hkv, size_t HeadDim>
-class GemmaKeyValue {
-public:
-    static constexpr size_t KW = Hkv * HeadDim;
-
-    GemmaKeyValue(Linear<D, KW> key, PerHeadNorm<Hkv, HeadDim, RMSNorm<HeadDim>> key_norm, Linear<D, KW> value, PerHeadNorm<Hkv, HeadDim, RMSNormNoScale<HeadDim>> value_norm) : key_(std::move(key)), key_norm_(std::move(key_norm)), value_(std::move(value)), value_norm_(std::move(value_norm)) {}
-
-    Vec<KW> key(VecView<D> hidden) const { return key_norm_(key_(hidden)); }
-    Vec<KW> value(VecView<D> hidden) const { return value_norm_(value_(hidden)); }
-    Matrix<KW> key(MatrixView<D> hidden) const { return key_norm_(key_(hidden)); }
-    Matrix<KW> value(MatrixView<D> hidden) const { return value_norm_(value_(hidden)); }
-    GemmaKeyValuePair<KW> key_and_value(MatrixView<D> hidden) const { return {key(hidden), value(hidden)}; }
-
-private:
-    Linear<D, KW> key_;
-    PerHeadNorm<Hkv, HeadDim, RMSNorm<HeadDim>> key_norm_;
-    Linear<D, KW> value_;
-    PerHeadNorm<Hkv, HeadDim, RMSNormNoScale<HeadDim>> value_norm_;
-};
-
-// Unified K/V (Gemma 4 12B's global layers): the checkpoint carries no W_v, and
-// the VALUE is the raw W_k output — taken before the key's learned norm and
-// before RoPE — then normalized with the same scale-free RMS the ordinary value
-// path uses. One projection, two different post-processings.
-template <size_t D, size_t Hkv, size_t HeadDim>
-class GemmaUnifiedKeyValue {
-public:
-    static constexpr size_t KW = Hkv * HeadDim;
-
-    GemmaUnifiedKeyValue(Linear<D, KW> key, PerHeadNorm<Hkv, HeadDim, RMSNorm<HeadDim>> key_norm, PerHeadNorm<Hkv, HeadDim, RMSNormNoScale<HeadDim>> value_norm) : key_(std::move(key)), key_norm_(std::move(key_norm)), value_norm_(std::move(value_norm)) {}
-
-    Vec<KW> key(VecView<D> hidden) const { return key_norm_(key_(hidden)); }
-    Vec<KW> value(VecView<D> hidden) const { return value_norm_(key_(hidden)); }
-    Matrix<KW> key(MatrixView<D> hidden) const { return key_norm_(key_(hidden)); }
-    Matrix<KW> value(MatrixView<D> hidden) const { return value_norm_(key_(hidden)); }
-    GemmaKeyValuePair<KW> key_and_value(MatrixView<D> hidden) const {
-        Matrix<KW> projected = key_(hidden);
-        return {key_norm_(projected.view()), value_norm_(projected.view())};
-    }
-
-private:
-    Linear<D, KW> key_;
-    PerHeadNorm<Hkv, HeadDim, RMSNorm<HeadDim>> key_norm_;
-    PerHeadNorm<Hkv, HeadDim, RMSNormNoScale<HeadDim>> value_norm_;
-};
-
-// What a layer physically holds for K/V is a property of the checkpoint, not a
-// runtime flag, so it selects a type. Three cases exist across Gemma 4:
+// What a layer physically holds for K/V is a property of the checkpoint.
+// Three cases exist across Gemma 4, and each is expressed by which members a
+// layer struct HAS — there is no kind flag at runtime and no kind type:
 //   Owned    W_k and W_v both present (E4B's first 24 layers, 12B's sliding)
 //   Unified  W_k only, V = normalized raw W_k output (12B's global layers)
 //   Shared   neither; the layer attends against what an earlier layer wrote
-//            (E4B's last 18 layers) — so `key_value()` does not exist on it.
+// This enum survives only as config/loader vocabulary (kv_kind(), the
+// parameter count); the layer structs themselves just have or lack tensors.
 enum class GemmaKVKind : uint8_t { Owned, Unified, Shared };
-
-template <size_t D, size_t Hq, size_t Hkv, size_t HeadDim, GemmaKVKind Kind>
-class GemmaAttentionWeights;
-
-template <size_t D, size_t Hq, size_t Hkv, size_t HeadDim>
-class GemmaAttentionWeights<D, Hq, Hkv, HeadDim, GemmaKVKind::Owned> {
-public:
-    static constexpr size_t HEAD_DIM = HeadDim;
-    static constexpr size_t KV_HEADS = Hkv;
-    static constexpr GemmaKVKind KV_KIND = GemmaKVKind::Owned;
-    static constexpr bool OWNS_KV = true;
-    using QueryOutput = GemmaQueryOutput<D, Hq, HeadDim>;
-    using KeyValue = GemmaKeyValue<D, Hkv, HeadDim>;
-
-    GemmaAttentionWeights(QueryOutput query_output, KeyValue key_value) : query_output_(std::move(query_output)), key_value_(std::move(key_value)) {}
-
-    const QueryOutput& query_output() const { return query_output_; }
-    const KeyValue& key_value() const { return key_value_; }
-
-private:
-    QueryOutput query_output_;
-    KeyValue key_value_;
-};
-
-template <size_t D, size_t Hq, size_t Hkv, size_t HeadDim>
-class GemmaAttentionWeights<D, Hq, Hkv, HeadDim, GemmaKVKind::Unified> {
-public:
-    static constexpr size_t HEAD_DIM = HeadDim;
-    static constexpr size_t KV_HEADS = Hkv;
-    static constexpr GemmaKVKind KV_KIND = GemmaKVKind::Unified;
-    static constexpr bool OWNS_KV = true;
-    using QueryOutput = GemmaQueryOutput<D, Hq, HeadDim>;
-    using KeyValue = GemmaUnifiedKeyValue<D, Hkv, HeadDim>;
-
-    GemmaAttentionWeights(QueryOutput query_output, KeyValue key_value) : query_output_(std::move(query_output)), key_value_(std::move(key_value)) {}
-
-    const QueryOutput& query_output() const { return query_output_; }
-    const KeyValue& key_value() const { return key_value_; }
-
-private:
-    QueryOutput query_output_;
-    KeyValue key_value_;
-};
-
-template <size_t D, size_t Hq, size_t Hkv, size_t HeadDim>
-class GemmaAttentionWeights<D, Hq, Hkv, HeadDim, GemmaKVKind::Shared> {
-public:
-    static constexpr size_t HEAD_DIM = HeadDim;
-    static constexpr size_t KV_HEADS = Hkv;
-    static constexpr GemmaKVKind KV_KIND = GemmaKVKind::Shared;
-    static constexpr bool OWNS_KV = false;
-    using QueryOutput = GemmaQueryOutput<D, Hq, HeadDim>;
-
-    explicit GemmaAttentionWeights(QueryOutput query_output) : query_output_(std::move(query_output)) {}
-
-    const QueryOutput& query_output() const { return query_output_; }
-
-private:
-    QueryOutput query_output_;
-};
 
 // One layer's token mixer, shared by every Gemma 4 size:
 //
 //     Q = rope( rmsnorm_per_head( X W_q ) )      [T, Hq  * Dh]
 //     K = rope( rmsnorm_per_head( X W_k ) )      [T, Hkv * Dh]
 //     V =       rmsnorm_per_head( X W_v )        [T, Hkv * Dh]   (never rotated)
-//     A = attend(Q, cache <- K,V) W_o            [T, D]
+//     A = softmax_masked( Q K^T ) V              over the cache, K/V appended
+//     out = A W_o                                [T, D]
 //
-// Every shape (D, Hq, Hkv, Dh) is deduced from the weight and cache arguments;
-// the rope table, start position and window are the caller's schedule, passed
-// as plain arguments (window 0 = look back to position 0). KeyValue is
-// GemmaKeyValue or GemmaUnifiedKeyValue — both yield K and V together, so a
-// unified projection runs once. Gemma's score scale stays at attention.hpp's
-// default 1.0: the usual 1/sqrt(HeadDim) is folded into the learned per-head
-// Q norm.
-template <size_t D, size_t Hq, size_t Hkv, size_t Dh, class KeyValue, class Rope>
-Matrix<D> gemma_attend_layer(const GemmaQueryOutput<D, Hq, Dh>& query_output, const KeyValue& key_value, MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) {
-    Matrix<Hq * Dh> Q = query_output.query(X);
+// `layer` is any flat layer struct carrying WQ/q_norm/WO and the Hq/HEAD_DIM
+// constants; the `requires` checks read the anatomy straight off the member
+// list: no WK member = shared KV (attend against what an earlier layer cached),
+// WK without WV = unified (V is the RAW W_k output under the scale-free norm).
+// The rope table, start position and window are the caller's schedule (window
+// 0 = look back to position 0). Gemma's score scale stays at attention.hpp's
+// default 1.0: the usual 1/sqrt(Dh) is folded into the learned per-head Q norm.
+template <class Layer, size_t Hkv, size_t Dh, class Rope>
+Matrix<Layer::D> gemma_attention(const Layer& layer, MatrixView<Layer::D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) {
+    static_assert(Layer::HEAD_DIM == Dh, "layer and cache disagree on head width");
+    constexpr size_t Hq = Layer::Hq;
+
+    Matrix<Hq * Dh> Q = layer.q_norm(layer.WQ(X));
     rotate_heads<Hq, Dh>(Q, rope, first_position);
 
-    GemmaKeyValuePair<Hkv * Dh> kv = key_value.key_and_value(X);
-    rotate_heads<Hkv, Dh>(kv.key, rope, first_position);
+    if constexpr (!requires { layer.WK; }) {
+        // No K/V weights at all (E4B's last 18 layers): nothing to project and
+        // nothing to cache — the query attends against rows an earlier layer
+        // of the same attention kind already wrote this pass.
+        Matrix<Hq * Dh> A = attend<Hq, Hkv, Dh>(Q.view(), cache, first_position, window);
+        return layer.WO(A.view());
+    } else {
+        Matrix<Hkv * Dh> projected = layer.WK(X);  // X W_k, computed once
+        Matrix<Hkv * Dh> K = layer.k_norm(projected.view());
+        rotate_heads<Hkv, Dh>(K, rope, first_position);
 
-    Matrix<Hq * Dh> A = attend_and_cache<Hq, Hkv, Dh>(Q.view(), kv.key.view(), kv.value.view(), cache, first_position, window);
-    return query_output.output(A.view());
+        Matrix<Hkv * Dh> V = [&] {
+            if constexpr (requires { layer.WV; })
+                return layer.v_norm(layer.WV(X));
+            else
+                return layer.v_norm(projected.view());  // no W_v: V is the raw W_k output
+        }();
+
+        Matrix<Hq * Dh> A = attend_and_cache<Hq, Hkv, Dh>(Q.view(), K.view(), V.view(), cache, first_position, window);
+        return layer.WO(A.view());
+    }
 }
 
-// A shared-KV layer (E4B's last 18): the layer has no K/V weights, so there is
-// nothing to project or cache — the query attends against rows an earlier
-// layer of the same attention kind already wrote to `cache` this pass.
-template <size_t D, size_t Hq, size_t Hkv, size_t Dh, class Rope>
-Matrix<D> gemma_attend_shared_layer(const GemmaQueryOutput<D, Hq, Dh>& query_output, MatrixView<D> X, const KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) {
-    Matrix<Hq * Dh> Q = query_output.query(X);
-    rotate_heads<Hq, Dh>(Q, rope, first_position);
+// One Gemma 4 decoder layer — EVERY size, E4B and 12B alike:
+//
+//     h   = x + post_norm( attn( pre_norm(x) ) )
+//     h   = h + post_norm( mlp( pre_norm(h) ) )
+//     h   = h + norm( (gelu(h W_gate) (*) ple) W_proj )   <- only if the layer has `ple`
+//     out = layer_output_scale * h
+//
+// The two sizes differ by exactly that PLE line, so this is one function and
+// the difference is whether the layer struct HAS a `ple` member — the same way
+// gemma_attention() reads KV anatomy off `WK`/`WV`. Nothing here is a flag.
+template <class Layer, size_t Hkv, size_t Dh, class Rope, class PerLayerInput = std::monostate>
+Matrix<Layer::D> gemma_layer(const Layer& layer, MatrixView<Layer::D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window, PerLayerInput ple = {}) {
+    constexpr size_t D = Layer::D;
 
-    Matrix<Hq * Dh> A = attend<Hq, Hkv, Dh>(Q.view(), cache, first_position, window);
-    return query_output.output(A.view());
+    Matrix<D> U = layer.attn_norm(X);
+    Matrix<D> A = gemma_attention(layer, U.view(), cache, rope, first_position, window);
+    A = layer.post_attn_norm(A);
+    Matrix<D> H = add(X, A.view());
+
+    Matrix<D> Z = layer.ffn_norm(H.view());
+    Matrix<D> F = layer.ffn(Z.view());
+    F = layer.post_ffn_norm(F);
+    H = add(H.view(), F.view());
+
+    if constexpr (requires { layer.ple; }) H = layer.ple(H.view(), ple);
+    scale_in_place(H.mutable_view(), layer.layer_output_scale);
+    return H;
 }
 
 template <size_t D>
@@ -317,90 +233,6 @@ private:
     Scalar combination_scale_;
 };
 
-// E4B adds a PLE residual and scalar after the canonical attention + channel
-// branches.  Keeping this in the typed tail makes the general block reusable
-// without pretending that PLE exists in every architecture.
-template <size_t D, size_t P>
-class GemmaPerLayerTail {
-public:
-    GemmaPerLayerTail(GemmaPerLayerResidual<D, P> per_layer_residual, Scalar layer_scale) : per_layer_residual_(std::move(per_layer_residual)), layer_scale_(layer_scale) {}
-
-    Vec<D> operator()(Vec<D> hidden, const VecView<P>& per_layer_input) const {
-        Vec<D> output = per_layer_residual_(VecView<D>(hidden), per_layer_input);
-        scale_in_place(output, layer_scale_);
-        return output;
-    }
-    Matrix<D> operator()(Matrix<D> hidden, MatrixView<P> per_layer_input) const {
-        Matrix<D> output = per_layer_residual_(hidden.view(), per_layer_input);
-        scale_in_place(output.mutable_view(), layer_scale_);
-        return output;
-    }
-
-private:
-    GemmaPerLayerResidual<D, P> per_layer_residual_;
-    Scalar layer_scale_;
-};
-
-/*
-h  = x + attn( pre_norm(x) )                 attention sub-layer (+ post-norm, Gemma style)
-h  = h + mlp( pre_norm(h) )                  NORMAL SwiGLU FFN: gate/up [D→FF],
-                                             GELU-family activation, down [FF→D]
-p  = PLE_table[token][layer]                 ← the PLE addition
-g  = act( h · W_gate )
-h  = h + norm( (g ⊙ p) · W_proj )            a THIRD residual contribution
-*/
-// Not every Gemma 4 size has PLE: 12B sets hidden_size_per_layer_input to 0 and
-// carries no per-layer embedding tensors at all. That is a different layer type,
-// not a "has PLE" bool — so the tail is a template parameter and its absence is
-// this type, which consumes no space and no time.
-template <size_t D>
-struct GemmaNoTail {
-    Vec<D> operator()(Vec<D> hidden, NoLayerInput = {}) const { return hidden; }
-    Matrix<D> operator()(Matrix<D> hidden, NoLayerInput = {}) const { return hidden; }
-};
-
-// Every Gemma 4 layer carries a scalar `layer_output_scale`, applied last.
-// E4B folds it into the PLE tail; a size with no PLE still has the scalar, so
-// it gets a tail that is only that.
-template <size_t D>
-class GemmaLayerScaleTail {
-public:
-    explicit GemmaLayerScaleTail(Scalar scale) : scale_(scale) {}
-
-    Vec<D> operator()(Vec<D> hidden, NoLayerInput = {}) const {
-        scale_in_place(hidden, scale_);
-        return hidden;
-    }
-    Matrix<D> operator()(Matrix<D> hidden, NoLayerInput = {}) const {
-        scale_in_place(hidden.mutable_view(), scale_);
-        return hidden;
-    }
-    Scalar scale() const { return scale_; }
-
-private:
-    Scalar scale_;
-};
-
-// One concrete Gemma decoder layer: the seven weight objects a layer owns, in
-// the order the equation applies them, and nothing else. There is deliberately
-// no forward() here. The layer cannot run itself — evaluating attention needs
-// the cache, RoPE table and window, which belong to the architecture's schedule
-// and not to any weight — so a forward() here would need a callback punched
-// through its middle. Each Gemma size writes the equation out in its own
-// forward_layer() instead, where the attention call can just be a call.
-//
-// Members are public and this is an aggregate: it is data.
-template <size_t D, size_t FF, class Attention, class Tail>
-struct GemmaDenseDecoderLayer {
-    RMSNorm<D> attention_norm;
-    Attention attention;
-    RMSNorm<D> post_attention_norm;
-    RMSNorm<D> ffn_norm;
-    GeluGatedMLP<D, FF> ffn;
-    RMSNorm<D> post_ffn_norm;
-    [[no_unique_address]] Tail tail;
-};
-
 template <size_t D, size_t V>
 class GemmaTokenIO {
 public:
@@ -423,29 +255,64 @@ private:
     Scalar input_scale_;
 };
 
-using GemmaE4BLocalOwnAttention = GemmaAttentionWeights<Gemma4E4BTextConfig::D, Gemma4E4BTextConfig::Hq, Gemma4E4BTextConfig::Hkv, Gemma4E4BTextConfig::LOCAL_HEAD_DIM, GemmaKVKind::Owned>;
-using GemmaE4BLocalSharedAttention = GemmaAttentionWeights<Gemma4E4BTextConfig::D, Gemma4E4BTextConfig::Hq, Gemma4E4BTextConfig::Hkv, Gemma4E4BTextConfig::LOCAL_HEAD_DIM, GemmaKVKind::Shared>;
-using GemmaE4BGlobalOwnAttention = GemmaAttentionWeights<Gemma4E4BTextConfig::D, Gemma4E4BTextConfig::Hq, Gemma4E4BTextConfig::Hkv, Gemma4E4BTextConfig::GLOBAL_HEAD_DIM, GemmaKVKind::Owned>;
-using GemmaE4BGlobalSharedAttention = GemmaAttentionWeights<Gemma4E4BTextConfig::D, Gemma4E4BTextConfig::Hq, Gemma4E4BTextConfig::Hkv, Gemma4E4BTextConfig::GLOBAL_HEAD_DIM, GemmaKVKind::Shared>;
+// ---- E4B layers: flat tensor lists, one struct per physical layer shape -----
+//
+// The layer equation, applied in member order:
+//
+//     h   = x + post_norm( attn( pre_norm(x) ) )
+//     h   = h + post_norm( mlp( pre_norm(h) ) )         GELU-gated FFN
+//     h   = h + norm( (gelu(h W_gate) (*) ple) W_proj )  the PLE residual
+//     out = layer_output_scale * h
+//
+// Two head widths exist (sliding 256, full 512), and the last 18 layers carry
+// no K/V tensors at all — so there are two structs, each instantiated at two
+// widths. No variant, no wrapper types: a layer is its tensor list, and
+// gemma_attention() reads the KV anatomy off which members exist.
+template <size_t Dh>
+struct GemmaE4BLayer {
+    static constexpr size_t D = Gemma4E4BTextConfig::D;
+    static constexpr size_t Hq = Gemma4E4BTextConfig::Hq;
+    static constexpr size_t HEAD_DIM = Dh;
+    static constexpr size_t Hkv = Gemma4E4BTextConfig::Hkv;
 
-template <class Attention>
-using GemmaE4BDenseLayer = GemmaDenseDecoderLayer<Gemma4E4BTextConfig::D, Gemma4E4BTextConfig::FF, Attention, GemmaPerLayerTail<Gemma4E4BTextConfig::D, Gemma4E4BTextConfig::PLE>>;
+    RMSNorm<D> attn_norm;
+    Linear<D, Hq * Dh> WQ;
+    PerHeadNorm<Hq, Dh, RMSNorm<Dh>> q_norm;
+    Linear<D, Hkv * Dh> WK;
+    PerHeadNorm<Hkv, Dh, RMSNorm<Dh>> k_norm;
+    Linear<D, Hkv * Dh> WV;
+    PerHeadNorm<Hkv, Dh, RMSNormNoScale<Dh>> v_norm;  // V's norm has no learned scale
+    Linear<Hq * Dh, D> WO;
+    RMSNorm<D> post_attn_norm;
+    RMSNorm<D> ffn_norm;
+    GeluGatedMLP<D, Gemma4E4BTextConfig::FF> ffn;
+    RMSNorm<D> post_ffn_norm;
+    GemmaPerLayerResidual<D, Gemma4E4BTextConfig::PLE> ple;
+    Scalar layer_output_scale;
+};
 
-using GemmaE4BLayer = std::variant<GemmaE4BDenseLayer<GemmaE4BLocalOwnAttention>, GemmaE4BDenseLayer<GemmaE4BGlobalOwnAttention>, GemmaE4BDenseLayer<GemmaE4BLocalSharedAttention>, GemmaE4BDenseLayer<GemmaE4BGlobalSharedAttention>>;
+// The last 18 layers: the same layer minus the K/V tensors, which the
+// checkpoint does not carry. Not an optional, not a flag — the members
+// do not exist, so misusing them is a compile error.
+template <size_t Dh>
+struct GemmaE4BSharedLayer {
+    static constexpr size_t D = Gemma4E4BTextConfig::D;
+    static constexpr size_t Hq = Gemma4E4BTextConfig::Hq;
+    static constexpr size_t HEAD_DIM = Dh;
 
-struct GemmaE4BLayerSchedule {
-    static void validate(const GemmaE4BLayer& layer, size_t index) {
-        using C = Gemma4E4BTextConfig;
-        const bool full = C::attention_kind(index) == GemmaAttentionKind::Full;
-        const bool shared = C::shares_kv(index);
-        const size_t expected = !full && !shared ? 0 : full && !shared ? 1 : !full ? 2 : 3;
-        if (layer.index() != expected) throw std::invalid_argument("Gemma4E4B: layer variant disagrees with attention/KV schedule");
-    }
+    RMSNorm<D> attn_norm;
+    Linear<D, Hq * Dh> WQ;
+    PerHeadNorm<Hq, Dh, RMSNorm<Dh>> q_norm;
+    Linear<Hq * Dh, D> WO;
+    RMSNorm<D> post_attn_norm;
+    RMSNorm<D> ffn_norm;
+    GeluGatedMLP<D, Gemma4E4BTextConfig::FF> ffn;
+    RMSNorm<D> post_ffn_norm;
+    GemmaPerLayerResidual<D, Gemma4E4BTextConfig::PLE> ple;
+    Scalar layer_output_scale;
 };
 
 using GemmaE4BModelData = GemmaPerLayerInputs<Gemma4E4BTextConfig::D, Gemma4E4BTextConfig::PLE, Gemma4E4BTextConfig::L, Gemma4E4BTextConfig::V>;
-
-using Gemma4E4BTextWeights = TransformerWeights<Gemma4E4BTextConfig::D, Gemma4E4BTextConfig::V, Gemma4E4BTextConfig::L, GemmaTokenIO<Gemma4E4BTextConfig::D, Gemma4E4BTextConfig::V>, GemmaE4BLayer, RMSNorm<Gemma4E4BTextConfig::D>, GemmaE4BModelData, GemmaE4BLayerSchedule>;
 
 class Gemma4E4BCache {
     using C = Gemma4E4BTextConfig;
@@ -480,122 +347,102 @@ private:
     size_t tokens_ = 0;
 };
 
-struct Gemma4E4BArchitecture {
+// ---- the model -------------------------------------------------------------
+//
+// Gemma 4 E4B: its tensors and its math, one entity. The layer vectors are
+// private and the methods are const, so the weights are immutable once loaded;
+// copying is deleted because a checkpoint is gigabytes and there is never a
+// reason to duplicate one. Call it with evaluate(model, input, cache).
+class Gemma4E4BModel {
+public:
     using C = Gemma4E4BTextConfig;
     static constexpr size_t D = C::D;
     static constexpr size_t V = C::V;
     static constexpr size_t L = C::L;
     static constexpr size_t CTX = C::CTX;
-    using Weights = Gemma4E4BTextWeights;
     using PrefixState = Gemma4E4BCache;
-    using PreparedInput = Matrix<C::PLE * C::L>;
     // Local heads rotate every plane; global heads rotate only the first
     // quarter of theirs (partial RoPE), which is what lets a 512-wide global
     // head stay stable at 128K context.
     using LocalRope = RotaryEmbedding<C::LOCAL_HEAD_DIM, C::LOCAL_ROPE_BASE>;
     using GlobalRope = RotaryEmbedding<C::GLOBAL_HEAD_DIM, C::GLOBAL_ROPE_BASE, 1, 4>;
+    using SlidingLayer = GemmaE4BLayer<C::LOCAL_HEAD_DIM>;
+    using GlobalLayer = GemmaE4BLayer<C::GLOBAL_HEAD_DIM>;
+    using SlidingSharedLayer = GemmaE4BSharedLayer<C::LOCAL_HEAD_DIM>;
+    using GlobalSharedLayer = GemmaE4BSharedLayer<C::GLOBAL_HEAD_DIM>;
 
-    static PrefixState make_prefix_state() { return {}; }
-    static size_t prefix_tokens(const PrefixState& prefix_state) { return prefix_state.tokens(); }
-    static void advance_prefix(PrefixState& prefix_state, size_t count) { prefix_state.advance(count); }
-
-    static EmbeddedSequence<D> embed(const Weights& weights, std::span<const TokenId> tokens, size_t first_position) {
-        return embed_text_tokens<D>(tokens, first_position, [&](std::span<const TokenId> batch) { return weights.token_io().tokens(batch); });
+    // One vector per layer shape, filled in schedule order, so that
+    // C::position_in_kind(i) is layer i's slot.
+    Gemma4E4BModel(GemmaTokenIO<D, V> token_io, GemmaE4BModelData per_layer_inputs, std::vector<SlidingLayer> sliding, std::vector<GlobalLayer> global, std::vector<SlidingSharedLayer> sliding_shared, std::vector<GlobalSharedLayer> global_shared, RMSNorm<D> final_norm) : token_io_(std::move(token_io)), per_layer_inputs_(std::move(per_layer_inputs)), sliding_(std::move(sliding)), global_(std::move(global)), sliding_shared_(std::move(sliding_shared)), global_shared_(std::move(global_shared)), final_norm_(std::move(final_norm)) {
+        if (sliding_.size() != 20 || global_.size() != 4 || sliding_shared_.size() != 15 || global_shared_.size() != 3) throw std::invalid_argument("Gemma4E4BModel: layer shape counts disagree with the schedule");
     }
 
-    static PreparedInput prepare(const Weights& weights, const EmbeddedSequence<D>& input) { return weights.architecture_data()(input.matrix(), input.ple_token_identities()); }
+    Gemma4E4BModel(const Gemma4E4BModel&) = delete;
+    Gemma4E4BModel& operator=(const Gemma4E4BModel&) = delete;
+    Gemma4E4BModel(Gemma4E4BModel&&) = default;
+    Gemma4E4BModel& operator=(Gemma4E4BModel&&) = delete;  // immutable once built
 
-    // Run layer `layer_index` in place: `residual` is the only in/out, every
-    // other argument is read-only. The signature is the TransformerArchitecture
-    // contract's, not a choice — evaluate_transformer_suffix() loops the layers
-    // and hands each the same six arguments — so this function's job is to
-    // narrow the whole model down to the three things ONE layer needs:
-    //   * its weights          weights.layer(layer_index)
-    //   * its PLE columns      per_layer[:, layer_index*PLE ...]
-    //   * where it starts      input.position(0), for RoPE and the mask
-    //
-    // std::visit is the layer-kind dispatch. GemmaE4BLayer's four alternatives
-    // are 2 head widths x 2 KV kinds, and all four are real types rather than
-    // flags: head width is a static matrix width, and a shared-KV layer has no
-    // W_k/W_v members at all. The kind is resolved once here — the two
-    // if constexpr branches below compile away per alternative, so the body is
-    // monomorphic: no per-token branch on width, window, KV ownership, or
-    // which cache. The whole layer equation is in that body.
-    static void forward_layer(const Weights& weights, PrefixState& prefix_state, const EmbeddedSequence<D>& input, ResidualStream<D>& residual, const PreparedInput& per_layer, size_t layer_index) {
-        const size_t first_position = input.position(0).i;
-        const Matrix<C::PLE> ple = slice_columns<C::PLE>(per_layer.view(), layer_index * C::PLE);
-        const MatrixView<D> X = residual.matrix();
-        Matrix<D> next = std::visit(
-            [&](const auto& layer) {
-                using Attention = std::decay_t<decltype(layer.attention)>;
-                using Shape = shape_of<Attention>;
+    // One input embedding, for callers that assemble multimodal sequences.
+    Vec<D> token(TokenId id) const { return token_io_.token(id); }
 
-                // h = x + post_norm( attn( pre_norm(x) ) )
-                Matrix<D> U = layer.attention_norm(X);
-                KVCache<C::Hkv, Shape::HEAD_DIM>& cache = Shape::cache(prefix_state, layer_index);
-                Matrix<D> A = [&] {
-                    if constexpr (Attention::OWNS_KV)
-                        return gemma_attend_layer(layer.attention.query_output(), layer.attention.key_value(), U.view(), cache, typename Shape::Rope{}, first_position, Shape::WINDOW);
-                    else
-                        return gemma_attend_shared_layer(layer.attention.query_output(), U.view(), cache, typename Shape::Rope{}, first_position, Shape::WINDOW);
-                }();
-                A = layer.post_attention_norm(A);
-                Matrix<D> H = add(X, A.view());
-
-                // h = h + post_norm( mlp( pre_norm(h) ) )
-                Matrix<D> Z = layer.ffn_norm(H.view());
-                Matrix<D> F = layer.ffn(Z.view());
-                F = layer.post_ffn_norm(F);
-                H = add(H.view(), F.view());
-
-                // h = layer_output_scale * ( h + norm( (act(h W_gate) (*) ple) W_proj ) )
-                return layer.tail(std::move(H), ple.view());
-            },
-            weights.layer(layer_index));
-        residual.set_matrix(std::move(next));
+    EmbeddedSequence<D> embed(std::span<const TokenId> tokens, size_t first_position) const {
+        return embed_text_tokens<D>(tokens, first_position, [&](std::span<const TokenId> batch) { return token_io_.tokens(batch); });
     }
 
-    static Vec<V> output(const Weights& weights, const ResidualStream<D>& residual) {
-        Vec<D> last = weights.final_norm()(residual.token(residual.tokens() - 1));
-        Vec<V> logits = weights.token_io().logits(last);
+    // Run `input` (the rows not yet in `state`) all the way to logits. How this
+    // model runs is entirely inside here: the PLE table is built once, the 42
+    // layers each take their slice of it, and the state advances at the end.
+    Vec<V> forward(PrefixState& state, const EmbeddedSequence<D>& input) const {
+        if (input.tokens() > CTX - state.tokens()) throw std::length_error("Gemma4E4BModel: context exhausted");
+
+        // Once per pass, not once per layer: every layer reads its own P-wide
+        // slice of this L*P-wide table.
+        const Matrix<C::PLE * C::L> per_layer = per_layer_inputs_(input.matrix(), input.ple_token_identities());
+
+        ResidualStream<D> residual(input);
+        for (size_t layer = 0; layer < L; ++layer) forward_layer(state, input, residual, per_layer, layer);
+        state.advance(input.tokens());
+
+        Vec<D> last = final_norm_(residual.token(residual.tokens() - 1));
+        Vec<V> logits = token_io_.logits(last);
         gemma_softcap(logits, C::LOGIT_SOFTCAP);
         return logits;
     }
 
 private:
-    // E4B alternates between exactly two attention shapes on a period-6
-    // schedule. A shape bundles everything the checkpoint varies: how wide a
-    // head is, which RoPE table rotates it, how far back it may look, and
-    // which of the two caches it reads. Nothing else about attention differs
-    // between a sliding layer and a full one.
-    struct SlidingShape {
-        static constexpr size_t HEAD_DIM = C::LOCAL_HEAD_DIM;
-        static constexpr size_t WINDOW = C::SLIDING_WINDOW;
-        using Rope = LocalRope;
-        static KVCache<C::Hkv, HEAD_DIM>& cache(PrefixState& prefix_state, size_t layer) { return prefix_state.local(layer); }
-    };
-    struct FullShape {
-        static constexpr size_t HEAD_DIM = C::GLOBAL_HEAD_DIM;
-        static constexpr size_t WINDOW = 0;  // 0 == look back to position 0
-        using Rope = GlobalRope;
-        static KVCache<C::Hkv, HEAD_DIM>& cache(PrefixState& prefix_state, size_t layer) { return prefix_state.global(layer); }
-    };
+    // Run layer `layer_index` in place: `residual` is the only in/out. The
+    // equation is gemma_layer(), shared with 12B; the schedule is two plain
+    // booleans, and each of the four branches names exactly which vector, which
+    // cache, which rope table and which window that layer kind uses. Layers
+    // 24..41 own no K/V: they attend against what layer 22 (sliding) or 23
+    // (full) wrote earlier in this same pass, which is why local()/global()
+    // redirect rather than those layers holding a cache.
+    void forward_layer(PrefixState& state, const EmbeddedSequence<D>& input, ResidualStream<D>& residual, const Matrix<C::PLE * C::L>& per_layer, size_t layer_index) const {
+        const size_t pos = input.position(0).i;
+        const Matrix<C::PLE> ple = slice_columns<C::PLE>(per_layer.view(), layer_index * C::PLE);
+        const MatrixView<D> X = residual.matrix();
+        const size_t n = C::position_in_kind(layer_index);
+        const bool full = C::attention_kind(layer_index) == GemmaAttentionKind::Full;
+        const bool shared = C::shares_kv(layer_index);
 
-    // Head width is what physically distinguishes the two shapes, so it is
-    // what selects one. The static_assert makes that a compile error rather
-    // than a silent mis-selection if a future config makes them equal.
-    static_assert(C::LOCAL_HEAD_DIM != C::GLOBAL_HEAD_DIM, "attention shape is selected by head width");
-    template <class Attention>
-    using shape_of = std::conditional_t<Attention::HEAD_DIM == C::LOCAL_HEAD_DIM, SlidingShape, FullShape>;
+        Matrix<D> next = [&]() -> Matrix<D> {
+            if (!shared && !full) return gemma_layer(sliding_.at(n), X, state.local(layer_index), LocalRope{}, pos, C::SLIDING_WINDOW, ple.view());
+            if (!shared) return gemma_layer(global_.at(n), X, state.global(layer_index), GlobalRope{}, pos, /*window=*/0, ple.view());
+            if (!full) return gemma_layer(sliding_shared_.at(n), X, state.local(layer_index), LocalRope{}, pos, C::SLIDING_WINDOW, ple.view());
+            return gemma_layer(global_shared_.at(n), X, state.global(layer_index), GlobalRope{}, pos, /*window=*/0, ple.view());
+        }();
+        residual.set_matrix(std::move(next));
+    }
 
-    // Layers 24..41 own no K/V: they contribute no rows and attend against what
-    // layer 22 (sliding) or 23 (full) wrote earlier in this same pass, which is
-    // why cache() redirects rather than the layer holding a cache of its own.
-    // forward_layer() picks gemma_attend_layer or gemma_attend_shared_layer
-    // from Attention::OWNS_KV.
+    GemmaTokenIO<D, V> token_io_;
+    GemmaE4BModelData per_layer_inputs_;
+    std::vector<SlidingLayer> sliding_;              // 20 layers
+    std::vector<GlobalLayer> global_;                //  4 (5, 11, 17, 23)
+    std::vector<SlidingSharedLayer> sliding_shared_;  // 15
+    std::vector<GlobalSharedLayer> global_shared_;    //  3 (29, 35, 41)
+    RMSNorm<D> final_norm_;
 };
-
-using Gemma4E4BTransformer = Transformer<Gemma4E4BArchitecture>;
+static_assert(TokenInputOutput<GemmaTokenIO<Gemma4E4BTextConfig::D, Gemma4E4BTextConfig::V>, Gemma4E4BTextConfig::D, Gemma4E4BTextConfig::V>);
 
 // ============================ Gemma 4 12B Unified ============================
 //
@@ -627,6 +474,13 @@ struct Gemma4_12BTextConfig {
     static constexpr bool shares_kv(size_t) { return false; }  // 0 shared layers
     static constexpr GemmaKVKind kv_kind(size_t layer) { return attention_kind(layer) == GemmaAttentionKind::Full ? GemmaKVKind::Unified : GemmaKVKind::Owned; }
     static constexpr size_t kv_heads(size_t layer) { return attention_kind(layer) == GemmaAttentionKind::Full ? GLOBAL_HKV : LOCAL_HKV; }
+    // Which slot of its shape's weights vector layer `i` occupies.
+    static constexpr size_t position_in_kind(size_t layer) {
+        size_t n = 0;
+        for (size_t i = 0; i < layer; ++i)
+            if (attention_kind(i) == attention_kind(layer)) ++n;
+        return n;
+    }
 };
 
 // The model card requires the FINAL layer to be global. The period-6 rule
@@ -655,23 +509,55 @@ constexpr size_t gemma_dense_param_count() {
 }
 static_assert(gemma_dense_param_count<Gemma4_12BTextConfig>() > 11'700'000'000 && gemma_dense_param_count<Gemma4_12BTextConfig>() < 12'100'000'000, "Gemma 4 12B lands on its advertised ~11.95B");
 
-using Gemma12BSlidingAttention = GemmaAttentionWeights<Gemma4_12BTextConfig::D, Gemma4_12BTextConfig::Hq, Gemma4_12BTextConfig::LOCAL_HKV, Gemma4_12BTextConfig::LOCAL_HEAD_DIM, GemmaKVKind::Owned>;
-using Gemma12BGlobalAttention = GemmaAttentionWeights<Gemma4_12BTextConfig::D, Gemma4_12BTextConfig::Hq, Gemma4_12BTextConfig::GLOBAL_HKV, Gemma4_12BTextConfig::GLOBAL_HEAD_DIM, GemmaKVKind::Unified>;
+// The two layer shapes the 12B checkpoint actually has, written out flat.
+// They differ in head width (256 vs 512), KV head count (8 vs 1), and KV
+// anatomy: a global layer carries no W_v tensor, so this struct has no WV
+// member — V is the raw W_k output under the scale-free norm, which
+// gemma_attention() reads directly off the member list.
+struct Gemma12BSlidingLayer {
+    static constexpr size_t D = Gemma4_12BTextConfig::D;
+    static constexpr size_t Hq = Gemma4_12BTextConfig::Hq;
+    static constexpr size_t HEAD_DIM = Gemma4_12BTextConfig::LOCAL_HEAD_DIM;
+    static constexpr size_t Hkv = Gemma4_12BTextConfig::LOCAL_HKV;
+    static constexpr size_t Dh = HEAD_DIM;
 
-template <class Attention>
-using Gemma12BDenseLayer = GemmaDenseDecoderLayer<Gemma4_12BTextConfig::D, Gemma4_12BTextConfig::FF, Attention, GemmaLayerScaleTail<Gemma4_12BTextConfig::D>>;
-
-using Gemma12BLayer = std::variant<Gemma12BDenseLayer<Gemma12BSlidingAttention>, Gemma12BDenseLayer<Gemma12BGlobalAttention>>;
-
-struct Gemma12BLayerSchedule {
-    static void validate(const Gemma12BLayer& layer, size_t index) {
-        using C = Gemma4_12BTextConfig;
-        const size_t expected = C::attention_kind(index) == GemmaAttentionKind::Full ? 1u : 0u;
-        if (layer.index() != expected) throw std::invalid_argument("Gemma4_12B: layer variant disagrees with the attention schedule");
-    }
+    RMSNorm<D> attn_norm;
+    Linear<D, Hq * Dh> WQ;
+    PerHeadNorm<Hq, Dh, RMSNorm<Dh>> q_norm;
+    Linear<D, Hkv * Dh> WK;
+    PerHeadNorm<Hkv, Dh, RMSNorm<Dh>> k_norm;
+    Linear<D, Hkv * Dh> WV;
+    PerHeadNorm<Hkv, Dh, RMSNormNoScale<Dh>> v_norm;
+    Linear<Hq * Dh, D> WO;
+    RMSNorm<D> post_attn_norm;
+    RMSNorm<D> ffn_norm;
+    GeluGatedMLP<D, Gemma4_12BTextConfig::FF> ffn;
+    RMSNorm<D> post_ffn_norm;
+    Scalar layer_output_scale;
 };
 
-using Gemma4_12BTextWeights = TransformerWeights<Gemma4_12BTextConfig::D, Gemma4_12BTextConfig::V, Gemma4_12BTextConfig::L, GemmaTokenIO<Gemma4_12BTextConfig::D, Gemma4_12BTextConfig::V>, Gemma12BLayer, RMSNorm<Gemma4_12BTextConfig::D>, NoArchitectureData, Gemma12BLayerSchedule>;
+struct Gemma12BGlobalLayer {
+    static constexpr size_t D = Gemma4_12BTextConfig::D;
+    static constexpr size_t Hq = Gemma4_12BTextConfig::Hq;
+    static constexpr size_t HEAD_DIM = Gemma4_12BTextConfig::GLOBAL_HEAD_DIM;
+    static constexpr size_t Hkv = Gemma4_12BTextConfig::GLOBAL_HKV;
+    static constexpr size_t Dh = HEAD_DIM;
+
+    RMSNorm<D> attn_norm;
+    Linear<D, Hq * Dh> WQ;
+    PerHeadNorm<Hq, Dh, RMSNorm<Dh>> q_norm;
+    Linear<D, Hkv * Dh> WK;                         // one projection...
+    PerHeadNorm<Hkv, Dh, RMSNorm<Dh>> k_norm;       // ...the key's learned norm
+    PerHeadNorm<Hkv, Dh, RMSNormNoScale<Dh>> v_norm;  // ...and the value's scale-free one
+    Linear<Hq * Dh, D> WO;
+    RMSNorm<D> post_attn_norm;
+    RMSNorm<D> ffn_norm;
+    GeluGatedMLP<D, Gemma4_12BTextConfig::FF> ffn;
+    RMSNorm<D> post_ffn_norm;
+    Scalar layer_output_scale;
+};
+
+static_assert(TokenInputOutput<GemmaTokenIO<Gemma4_12BTextConfig::D, Gemma4_12BTextConfig::V>, Gemma4_12BTextConfig::D, Gemma4_12BTextConfig::V>);
 
 // Every layer owns its cache; the two kinds differ in head count, head width,
 // and whether they are windowed. Sliding layers keep a ring of SLIDING_WINDOW
@@ -706,70 +592,62 @@ private:
     size_t tokens_ = 0;
 };
 
-struct Gemma4_12BArchitecture {
+// Gemma 4 12B: same shape of entity as E4B, minus the PLE tensors.
+class Gemma4_12BModel {
+public:
     using C = Gemma4_12BTextConfig;
     static constexpr size_t D = C::D;
     static constexpr size_t V = C::V;
     static constexpr size_t L = C::L;
     static constexpr size_t CTX = C::CTX;
-    using Weights = Gemma4_12BTextWeights;
     using PrefixState = Gemma4_12BCache;
-    using PreparedInput = NoPreparedInput;  // no PLE to prepare
     using LocalRope = RotaryEmbedding<C::LOCAL_HEAD_DIM, C::LOCAL_ROPE_BASE>;
     using GlobalRope = RotaryEmbedding<C::GLOBAL_HEAD_DIM, C::GLOBAL_ROPE_BASE, 1, 4>;
 
-    static PrefixState make_prefix_state() { return {}; }
-    static size_t prefix_tokens(const PrefixState& state) { return state.tokens(); }
-    static void advance_prefix(PrefixState& state, size_t count) { state.advance(count); }
-
-    static EmbeddedSequence<D> embed(const Weights& weights, std::span<const TokenId> tokens, size_t first_position) {
-        return embed_text_tokens<D>(tokens, first_position, [&](std::span<const TokenId> batch) { return weights.token_io().tokens(batch); });
+    Gemma4_12BModel(GemmaTokenIO<D, V> token_io, std::vector<Gemma12BSlidingLayer> sliding, std::vector<Gemma12BGlobalLayer> global, RMSNorm<D> final_norm) : token_io_(std::move(token_io)), sliding_(std::move(sliding)), global_(std::move(global)), final_norm_(std::move(final_norm)) {
+        if (sliding_.size() != 40 || global_.size() != 8) throw std::invalid_argument("Gemma4_12BModel: layer shape counts disagree with the schedule");
     }
 
-    static PreparedInput prepare(const Weights&, const EmbeddedSequence<D>&) { return {}; }
+    Gemma4_12BModel(const Gemma4_12BModel&) = delete;
+    Gemma4_12BModel& operator=(const Gemma4_12BModel&) = delete;
+    Gemma4_12BModel(Gemma4_12BModel&&) = default;
+    Gemma4_12BModel& operator=(Gemma4_12BModel&&) = delete;
 
-    // The same equation as E4B minus the PLE tail, written out here rather than
-    // shared, so that reading 12B is reading one function. What genuinely
-    // differs from E4B: no per-layer input, and the two attention kinds differ
-    // in KV head count (8 sliding, 1 global) as well as head width, so their
-    // caches are different types and the branch stays an if constexpr.
-    static void forward_layer(const Weights& weights, PrefixState& state, const EmbeddedSequence<D>& input, ResidualStream<D>& residual, const PreparedInput&, size_t layer_index) {
-        const size_t first_position = input.position(0).i;
-        const MatrixView<D> X = residual.matrix();
-        Matrix<D> next = std::visit(
-            [&](const auto& layer) {
-                using Attention = std::decay_t<decltype(layer.attention)>;
+    Vec<D> token(TokenId id) const { return token_io_.token(id); }
 
-                // h = x + post_norm( attn( pre_norm(x) ) )
-                Matrix<D> U = layer.attention_norm(X);
-                Matrix<D> A = [&] {
-                    if constexpr (Attention::HEAD_DIM == C::LOCAL_HEAD_DIM)
-                        return gemma_attend_layer(layer.attention.query_output(), layer.attention.key_value(), U.view(), state.local(layer_index), LocalRope{}, first_position, C::SLIDING_WINDOW);
-                    else
-                        return gemma_attend_layer(layer.attention.query_output(), layer.attention.key_value(), U.view(), state.global(layer_index), GlobalRope{}, first_position, /*window=*/0);
-                }();
-                A = layer.post_attention_norm(A);
-                Matrix<D> H = add(X, A.view());
-
-                // h = h + post_norm( mlp( pre_norm(h) ) )
-                Matrix<D> Z = layer.ffn_norm(H.view());
-                Matrix<D> F = layer.ffn(Z.view());
-                F = layer.post_ffn_norm(F);
-                H = add(H.view(), F.view());
-
-                // h = layer_output_scale * h
-                return layer.tail(std::move(H));
-            },
-            weights.layer(layer_index));
-        residual.set_matrix(std::move(next));
+    EmbeddedSequence<D> embed(std::span<const TokenId> tokens, size_t first_position) const {
+        return embed_text_tokens<D>(tokens, first_position, [&](std::span<const TokenId> batch) { return token_io_.tokens(batch); });
     }
 
-    static Vec<V> output(const Weights& weights, const ResidualStream<D>& residual) {
-        Vec<D> last = weights.final_norm()(residual.token(residual.tokens() - 1));
-        Vec<V> logits = weights.token_io().logits(last);
+    // The same shape of pass as E4B, with nothing to precompute: 12B has no PLE.
+    Vec<V> forward(PrefixState& state, const EmbeddedSequence<D>& input) const {
+        if (input.tokens() > CTX - state.tokens()) throw std::length_error("Gemma4_12BModel: context exhausted");
+
+        ResidualStream<D> residual(input);
+        for (size_t layer = 0; layer < L; ++layer) forward_layer(state, input, residual, layer);
+        state.advance(input.tokens());
+
+        Vec<D> last = final_norm_(residual.token(residual.tokens() - 1));
+        Vec<V> logits = token_io_.logits(last);
         gemma_softcap(logits, C::LOGIT_SOFTCAP);
         return logits;
     }
-};
 
-using Gemma4_12BTransformer = Transformer<Gemma4_12BArchitecture>;
+private:
+    // The same gemma_layer() E4B runs. 12B's layer structs carry no `ple`
+    // member, so the PLE line inside it compiles away — that is the entire
+    // difference between the two sizes' layer equations.
+    void forward_layer(PrefixState& state, const EmbeddedSequence<D>& input, ResidualStream<D>& residual, size_t layer_index) const {
+        const size_t pos = input.position(0).i;
+        const MatrixView<D> X = residual.matrix();
+        const size_t n = C::position_in_kind(layer_index);
+
+        Matrix<D> next = C::attention_kind(layer_index) == GemmaAttentionKind::Sliding ? gemma_layer(sliding_.at(n), X, state.local(layer_index), LocalRope{}, pos, C::SLIDING_WINDOW) : gemma_layer(global_.at(n), X, state.global(layer_index), GlobalRope{}, pos, /*window=*/0);
+        residual.set_matrix(std::move(next));
+    }
+
+    GemmaTokenIO<D, V> token_io_;
+    std::vector<Gemma12BSlidingLayer> sliding_;  // 40 layers
+    std::vector<Gemma12BGlobalLayer> global_;    //  8 (every 6th)
+    RMSNorm<D> final_norm_;
+};

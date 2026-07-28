@@ -28,55 +28,52 @@ static void fill(Scalar* p, size_t n, float sd = 1.0f) {
     for (size_t i = 0; i < n; ++i) p[i] = N(rng);
 }
 
-struct ToyWeights {
-    static constexpr size_t D = 2;
-    static constexpr size_t V = 3;
-    static constexpr size_t L = 1;
-
-    explicit ToyWeights(Scalar scale) : scale_(scale) {}
-    Scalar scale() const { return scale_; }
-
-private:
-    Scalar scale_;
-};
-
 struct ToyCache {
-    size_t tokens = 0;
+    size_t tokens() const { return tokens_; }
+    void advance(size_t count) { tokens_ += count; }
+
+    size_t tokens_ = 0;
     Vec<2> prefix_sum;
 };
 
-struct ToyArchitecture {
-    static constexpr size_t D = ToyWeights::D;
-    static constexpr size_t V = ToyWeights::V;
-    static constexpr size_t L = ToyWeights::L;
+// A model small enough to reason about exactly: one layer that replaces each
+// token by the running prefix sum, so the PrefixCache purity property has a
+// closed form. Same shape of entity as a real model — tensors (here, one
+// scale) and math together, immutable and non-copyable.
+class ToyModel {
+public:
+    static constexpr size_t D = 2;
+    static constexpr size_t V = 3;
+    static constexpr size_t L = 1;
     static constexpr size_t CTX = 16;
-    using Weights = ToyWeights;
     using PrefixState = ToyCache;
     using PreparedInput = NoPreparedInput;
 
-    static PrefixState make_prefix_state() { return {}; }
-    static size_t prefix_tokens(const PrefixState& prefix_state) { return prefix_state.tokens; }
-    static void advance_prefix(PrefixState& prefix_state, size_t count) { prefix_state.tokens += count; }
-    static EmbeddedSequence<D> embed(const Weights& weights, std::span<const TokenId> ids, size_t first_position) {
+    explicit ToyModel(Scalar scale) : scale_(scale) {}
+    ToyModel(const ToyModel&) = delete;
+    ToyModel& operator=(const ToyModel&) = delete;
+    ToyModel(ToyModel&&) = default;
+
+    EmbeddedSequence<D> embed(std::span<const TokenId> ids, size_t first_position) const {
         return embed_text_tokens<D>(ids, first_position, [&](std::span<const TokenId> batch) {
             Matrix<D> X(batch.size());
             for (size_t row = 0; row < batch.size(); ++row) {
-                X.row_mut(row)[0] = weights.scale() * Scalar(int32_t(batch[row]));
-                X.row_mut(row)[1] = weights.scale() * Scalar(int32_t(batch[row]) + 1);
+                X.row_mut(row)[0] = scale_ * Scalar(int32_t(batch[row]));
+                X.row_mut(row)[1] = scale_ * Scalar(int32_t(batch[row]) + 1);
             }
             return X;
         });
     }
-    static PreparedInput prepare(const Weights&, const EmbeddedSequence<D>&) { return {}; }
-    static void forward_layer(const Weights&, PrefixState& prefix_state, const EmbeddedSequence<D>&, ResidualStream<D>& residual, PreparedInput&, size_t) {
+    Vec<V> forward(PrefixState& prefix_state, const EmbeddedSequence<D>& input) const {
+        ResidualStream<D> residual(input);
         Vec<D> sum = copy(VecView<D>(prefix_state.prefix_sum));
         for (size_t row = 0; row < residual.tokens(); ++row) {
             sum += residual.token(row);
             residual.set_token(row, sum);
         }
         prefix_state.prefix_sum = std::move(sum);
-    }
-    static Vec<V> output(const Weights&, const ResidualStream<D>& residual) {
+        prefix_state.advance(input.tokens());
+
         const VecView<D> last = residual.token(residual.tokens() - 1);
         Vec<V> logits;
         logits[0] = last[0];
@@ -84,9 +81,12 @@ struct ToyArchitecture {
         logits[2] = last[0] + last[1];
         return logits;
     }
+
+private:
+    Scalar scale_;
 };
 
-static_assert(TransformerArchitecture<ToyArchitecture>);
+static_assert(TransformerModel<ToyModel>);
 
 int main() {
     std::printf("== RoPE offset identity (half-split pairing) ==\n");
@@ -187,16 +187,16 @@ int main() {
 
     std::printf("== PrefixCache changes cost, never the result ==\n");
     {
-        const Transformer<ToyArchitecture> T(ToyWeights{0.5f});
-        PrefixCache<ToyArchitecture> memo;
+        const ToyModel model(0.5f);
+        PrefixCache<ToyModel> memo;
         std::vector<TokenId> X{TokenId{1}, TokenId{2}};
         const auto from_scratch = [&](std::span<const TokenId> input) {
-            PrefixCache<ToyArchitecture> empty;
-            return T(input, empty);
+            PrefixCache<ToyModel> empty;
+            return evaluate(model, input, empty);
         };
         const auto embedded_from_scratch = [&](const EmbeddedSequence<2>& input) {
-            PrefixCache<ToyArchitecture> empty;
-            return T(input, empty);
+            PrefixCache<ToyModel> empty;
+            return evaluate(model, input, empty);
         };
         const auto same = [](const Vec<3>& a, const Vec<3>& b) {
             for (size_t i = 0; i < 3; ++i)
@@ -205,32 +205,32 @@ int main() {
         };
 
         const Vec<3> pure_prefix = from_scratch(X);
-        const Vec<3> cached_prefix = T(X, memo);
+        const Vec<3> cached_prefix = evaluate(model, X, memo);
         bool equal = same(pure_prefix, cached_prefix);
         equal = equal && memo.reused_tokens() == 0 && memo.computed_tokens() == 2;
 
         X.push_back(TokenId{3});
         const Vec<3> pure_extension = from_scratch(X);
-        const Vec<3> cached_extension = T(X, memo);
+        const Vec<3> cached_extension = evaluate(model, X, memo);
         equal = equal && same(pure_extension, cached_extension) && memo.reused_tokens() == 2 && memo.computed_tokens() == 1;
 
-        const Vec<3> repeated = T(X, memo);
+        const Vec<3> repeated = evaluate(model, X, memo);
         equal = equal && same(repeated, pure_extension) && memo.reused_tokens() == 3 && memo.computed_tokens() == 0;
 
         const std::vector<TokenId> divergent{TokenId{1}, TokenId{9}};
         const Vec<3> pure_divergent = from_scratch(divergent);
-        const Vec<3> cached_divergent = T(divergent, memo);
+        const Vec<3> cached_divergent = evaluate(model, divergent, memo);
         equal = equal && same(cached_divergent, pure_divergent) && memo.reused_tokens() == 0 && memo.computed_tokens() == 2;
 
-        auto embedded = ToyArchitecture::embed(T.weights(), std::span<const TokenId>(divergent), 0);
-        PrefixCache<ToyArchitecture> embedded_memo;
-        const Vec<3> embedded_prefix = T(embedded, embedded_memo);
+        auto embedded = model.embed(std::span<const TokenId>(divergent), 0);
+        PrefixCache<ToyModel> embedded_memo;
+        const Vec<3> embedded_prefix = evaluate(model, embedded, embedded_memo);
         Matrix<2> next_embedding(1);
         next_embedding.row_mut(0)[0] = 2.5f;
         next_embedding.row_mut(0)[1] = 3.f;
         embedded.append(EmbeddingSegment<2>(std::move(next_embedding), std::vector<TokenId>{TokenId{5}}));
         const Vec<3> pure_embedded_extension = embedded_from_scratch(embedded);
-        const Vec<3> cached_embedded_extension = T(embedded, embedded_memo);
+        const Vec<3> cached_embedded_extension = evaluate(model, embedded, embedded_memo);
         equal = equal && same(embedded_prefix, pure_divergent) && same(cached_embedded_extension, pure_embedded_extension) && embedded_memo.reused_tokens() == 2 && embedded_memo.computed_tokens() == 1;
 
         check(equal, "pure, extended, repeated, and divergent evaluations agree");

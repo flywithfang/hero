@@ -13,10 +13,10 @@
 // A text-only adapter over any architecture whose input is token ids and whose
 // turns are rendered as text. Qwen 3.5 uses it; a future text-only family
 // should too rather than growing a second copy of this loop.
-template <class C, class Architecture, class RenderTurn>
+template <class C, class Model, class RenderTurn>
 class TextChatModel : public ChatModel {
 public:
-    TextChatModel(Transformer<Architecture> transformer, const GGUF& gguf, std::string description, std::string system, SamplerCfg sampling, RenderTurn render) : transformer_(std::move(transformer)), tokenizer_(gguf), sampler_(sampling), system_(std::move(system)), description_(std::move(description)), render_(std::move(render)) {}
+    TextChatModel(Model model, const GGUF& gguf, std::string description, std::string system, SamplerCfg sampling, RenderTurn render) : model_(std::move(model)), tokenizer_(gguf), sampler_(sampling), system_(std::move(system)), description_(std::move(description)), render_(std::move(render)) {}
 
     std::string description() const override { return description_; }
     bool supports_images() const override { return false; }
@@ -41,7 +41,7 @@ public:
 
         ChatTurnResult result;
         const auto prefill_start = std::chrono::steady_clock::now();
-        Vec<C::V> logits = transformer_(history_, prefix_memo_);
+        Vec<C::V> logits = evaluate(model_, history_, prefix_memo_);
         result.delta.prefill_seconds = seconds_since(prefill_start);
         result.delta.prefill_tokens = ids.size();
 
@@ -75,7 +75,7 @@ private:
     static double seconds_since(std::chrono::steady_clock::time_point start) { return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(); }
     Vec<C::V> accept(ChatStats& delta) {
         const auto start = std::chrono::steady_clock::now();
-        Vec<C::V> logits = transformer_(history_, prefix_memo_);
+        Vec<C::V> logits = evaluate(model_, history_, prefix_memo_);
         delta.decode_seconds += seconds_since(start);
         return logits;
     }
@@ -86,8 +86,8 @@ private:
         stats_.decode_seconds += result.delta.decode_seconds;
     }
 
-    Transformer<Architecture> transformer_;
-    PrefixCache<Architecture> prefix_memo_;
+    Model model_;
+    PrefixCache<Model> prefix_memo_;
     Tokenizer tokenizer_;
     Sampler<C::V> sampler_;
     std::string system_;
@@ -103,20 +103,20 @@ static std::unique_ptr<ChatModel> make_gemma4_12b_chat_model(const GGUF& gguf, s
         const GemmaChatTurn turn = render_gemma_chat_turn(user, first, system, /*has_image=*/false);
         return turn.before_image + turn.after_image;
     };
-    return std::make_unique<TextChatModel<Gemma4_12BTextConfig, Gemma4_12BArchitecture, decltype(render)>>(gemma4_loader::load_12b_text(gguf), gguf, "Gemma 4 12B D=3840 L=48 (40 sliding + 8 global unified-K/V, text only)", std::move(system), sampling, render);
+    return std::make_unique<TextChatModel<Gemma4_12BTextConfig, Gemma4_12BModel, decltype(render)>>(gemma4_loader::load_12b_text(gguf), gguf, "Gemma 4 12B D=3840 L=48 (40 sliding + 8 global unified-K/V, text only)", std::move(system), sampling, render);
 }
 
 template <class C>
 static std::unique_ptr<ChatModel> make_qwen35_chat_model(const GGUF& gguf, std::string system, SamplerCfg sampling, const char* name) {
     auto render = [](std::string_view user, bool first, std::string_view system) { return render_chatml_turn(user, first, system); };
-    return std::make_unique<TextChatModel<C, Qwen35Architecture<C>, decltype(render)>>(qwen35_loader::load<C>(gguf), gguf, std::string("Qwen 3.5 ") + name + " D=" + std::to_string(C::D) + " L=" + std::to_string(C::L) + " (" + std::to_string(C::L - C::L / C::FULL_ATTENTION_INTERVAL) + " gated-deltanet + " + std::to_string(C::L / C::FULL_ATTENTION_INTERVAL) + " attention)", std::move(system), sampling, render);
+    return std::make_unique<TextChatModel<C, Qwen35Model<C>, decltype(render)>>(qwen35_loader::load<C>(gguf), gguf, std::string("Qwen 3.5 ") + name + " D=" + std::to_string(C::D) + " L=" + std::to_string(C::L) + " (" + std::to_string(C::L - C::L / C::FULL_ATTENTION_INTERVAL) + " gated-deltanet + " + std::to_string(C::L / C::FULL_ATTENTION_INTERVAL) + " attention)", std::move(system), sampling, render);
 }
 
 class Gemma4E4BChatModel final : public ChatModel {
     using C = Gemma4E4BTextConfig;
 
 public:
-    Gemma4E4BChatModel(const GGUF& text_gguf, const std::string& mmproj, std::string system, SamplerCfg sampling) : transformer_(gemma4_loader::load_e4b_text(text_gguf)), tokenizer_(text_gguf), sampler_(sampling), system_(std::move(system)) {
+    Gemma4E4BChatModel(const GGUF& text_gguf, const std::string& mmproj, std::string system, SamplerCfg sampling) : model_(gemma4_loader::load_e4b_text(text_gguf)), tokenizer_(text_gguf), sampler_(sampling), system_(std::move(system)) {
         const auto end = tokenizer_.encode("<turn|>", false, true);
         if (end.size() != 1 || !tokenizer_.is_eog(end.front())) throw std::runtime_error("Gemma 4 tokenizer has no unique <turn|> terminator");
         turn_end_ = TokenId{end.front()};
@@ -169,7 +169,7 @@ public:
         for (int32_t id : after_ids) history_.push_back(TokenId{id});
 
         const auto prefill_start = std::chrono::steady_clock::now();
-        Vec<C::V> logits = transformer_(*complete_input_, prefix_memo_);
+        Vec<C::V> logits = evaluate(model_, *complete_input_, prefix_memo_);
         result.delta.prefill_seconds = seconds_since(prefill_start);
         result.delta.prefill_tokens = new_tokens;
         GemmaChannelFormatter output(sink);
@@ -220,7 +220,7 @@ private:
         for (size_t i = 0; i < ids.size(); ++i) {
             const TokenId id{ids[i]};
             identities.push_back(id);
-            embeddings.set_row(i, transformer_.weights().token_io().token(id));
+            embeddings.set_row(i, model_.token(id));
         }
         return EmbeddingSegment<C::D>(std::move(embeddings), std::move(identities));
     }
@@ -229,7 +229,7 @@ private:
         std::vector<int32_t> token{int32_t(id)};
         complete_input_->append(text_segment(token));
         const auto start = std::chrono::steady_clock::now();
-        Vec<C::V> logits = transformer_(*complete_input_, prefix_memo_);
+        Vec<C::V> logits = evaluate(model_, *complete_input_, prefix_memo_);
         delta.decode_seconds += seconds_since(start);
         return logits;
     }
@@ -246,8 +246,8 @@ private:
         stats_.vision_seconds += result.delta.vision_seconds;
     }
 
-    Gemma4E4BTransformer transformer_;
-    PrefixCache<Gemma4E4BArchitecture> prefix_memo_;
+    Gemma4E4BModel model_;
+    PrefixCache<Gemma4E4BModel> prefix_memo_;
     std::optional<EmbeddedSequence<C::D>> complete_input_;
     Tokenizer tokenizer_;
     Sampler<C::V> sampler_;

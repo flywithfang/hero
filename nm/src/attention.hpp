@@ -84,7 +84,9 @@ class RotaryEmbedding {
 
 public:
     RotaryEmbedding() {
-        for (size_t i = 0; i < Planes; ++i) inv_freq_[i] = i < RotaryPlanes ? Scalar(std::pow(double(Base), -double(2 * i) / double(HeadDim))) : 0.f;
+        for (size_t i = 0; i < Planes; ++i){
+                 inv_freq_[i] = i < RotaryPlanes ? Scalar(std::pow(double(Base), -double(2 * i) / double(HeadDim))) : 0.f;
+        }
     }
 
     void apply(MutVecView<HeadDim> value, size_t position) const {
@@ -105,13 +107,18 @@ private:
 
 template <size_t Heads, size_t HeadDim, class Rope>
 void rotate_heads(Vec<Heads * HeadDim>& value, const Rope& rope, size_t position) {
-    for (size_t h = 0; h < Heads; ++h) rope.apply(slice_mut<HeadDim>(value, h * HeadDim), position);
+    for (size_t h = 0; h < Heads; ++h) {
+        rope.apply(slice_mut<HeadDim>(value, h * HeadDim), position);
+    }
 }
 
 template <size_t Heads, size_t HeadDim, class Rope>
 void rotate_heads(Matrix<Heads * HeadDim>& values, const Rope& rope, size_t first_position) {
-    for (size_t row = 0; row < values.rows(); ++row)
-        for (size_t head = 0; head < Heads; ++head) rope.apply(MutVecView<HeadDim>{values.data() + row * Heads * HeadDim + head * HeadDim}, first_position + row);
+    for (size_t row = 0; row < values.rows(); ++row) {
+        for (size_t head = 0; head < Heads; ++head) {
+            rope.apply(MutVecView<HeadDim>{values.data() + row * Heads * HeadDim + head * HeadDim}, first_position + row);
+        }
+    }
 }
 
 // ---- the K/V cache ----------------------------------------------------------

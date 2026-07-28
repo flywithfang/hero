@@ -89,9 +89,8 @@ QwenAttentionMixer<C> load_attention(const GGUF& gguf, size_t layer) {
     using Mixer = QwenAttentionMixer<C>;
     auto head_norm = [&](const char* suffix) { return PerHeadNorm<C::Hq, C::HEAD_DIM, RMSNorm<C::HEAD_DIM>>(RMSNorm<C::HEAD_DIM>(tensor_loader::load_vector<C::HEAD_DIM>(gguf, block(layer, suffix)), C::RMS_EPS)); };
     auto kv_head_norm = [&](const char* suffix) { return PerHeadNorm<C::Hkv, C::HEAD_DIM, RMSNorm<C::HEAD_DIM>>(RMSNorm<C::HEAD_DIM>(tensor_loader::load_vector<C::HEAD_DIM>(gguf, block(layer, suffix)), C::RMS_EPS)); };
-    return Mixer(
-        // One projection, double width: [query | gate] per head.
-        Linear<C::D, Mixer::GATED_QW>(tensor_loader::load_weight<C::D, Mixer::GATED_QW>(gguf, block(layer, "attn_q.weight"))), head_norm("attn_q_norm.weight"), Linear<C::D, Mixer::KW>(tensor_loader::load_weight<C::D, Mixer::KW>(gguf, block(layer, "attn_k.weight"))), kv_head_norm("attn_k_norm.weight"), Linear<C::D, Mixer::KW>(tensor_loader::load_weight<C::D, Mixer::KW>(gguf, block(layer, "attn_v.weight"))), Linear<Mixer::QW, C::D>(tensor_loader::load_weight<Mixer::QW, C::D>(gguf, block(layer, "attn_output.weight"))));
+    // WQG is one projection at double width: [query | gate] per head.
+    return Mixer{.WQG = Linear<C::D, Mixer::GATED_QW>(tensor_loader::load_weight<C::D, Mixer::GATED_QW>(gguf, block(layer, "attn_q.weight"))), .q_norm = head_norm("attn_q_norm.weight"), .WK = Linear<C::D, Mixer::KW>(tensor_loader::load_weight<C::D, Mixer::KW>(gguf, block(layer, "attn_k.weight"))), .k_norm = kv_head_norm("attn_k_norm.weight"), .WV = Linear<C::D, Mixer::KW>(tensor_loader::load_weight<C::D, Mixer::KW>(gguf, block(layer, "attn_v.weight"))), .WO = Linear<Mixer::QW, C::D>(tensor_loader::load_weight<Mixer::QW, C::D>(gguf, block(layer, "attn_output.weight")))};
 }
 
 template <class C>
@@ -112,18 +111,20 @@ QwenRecurrentMixer<C> load_recurrent(const GGUF& gguf, size_t layer) {
     for (size_t h = 0; h < C::VALUE_HEADS; ++h)
         if (decay_scale[h] > 0.f) decay_scale[h] = -std::exp(decay_scale[h]);
 
-    return Mixer(Linear<C::D, Mixer::CONV_CHANNELS>(tensor_loader::load_weight<C::D, Mixer::CONV_CHANNELS>(gguf, block(layer, "attn_qkv.weight"))), Linear<C::D, Mixer::VALUE_WIDTH>(tensor_loader::load_weight<C::D, Mixer::VALUE_WIDTH>(gguf, block(layer, "attn_gate.weight"))), std::move(conv), Linear<C::D, C::VALUE_HEADS>(tensor_loader::load_weight<C::D, C::VALUE_HEADS>(gguf, block(layer, "ssm_beta.weight"))), Linear<C::D, C::VALUE_HEADS>(tensor_loader::load_weight<C::D, C::VALUE_HEADS>(gguf, block(layer, "ssm_alpha.weight"))), tensor_loader::load_vector<C::VALUE_HEADS>(gguf, block(layer, "ssm_dt.bias")), std::move(decay_scale), PerHeadNorm<C::VALUE_HEADS, C::VALUE_HEAD_DIM, RMSNorm<C::VALUE_HEAD_DIM>>(RMSNorm<C::VALUE_HEAD_DIM>(tensor_loader::load_vector<C::VALUE_HEAD_DIM>(gguf, block(layer, "ssm_norm.weight")), C::RMS_EPS)), Linear<Mixer::VALUE_WIDTH, C::D>(tensor_loader::load_weight<Mixer::VALUE_WIDTH, C::D>(gguf, block(layer, "ssm_out.weight"))));
+    // After normalization the scale must be <= 0, so exp(gate) is a contraction.
+    // A positive value would make the state grow with every token and the logits
+    // diverge a few layers later, which is very hard to read backwards from.
+    for (size_t h = 0; h < C::VALUE_HEADS; ++h)
+        tensor_loader::expect(decay_scale[h] <= 0.f, block(layer, "ssm_a") + ": decay scale must be <= 0 (-exp(A_log))");
+
+    return Mixer{.WQKV = Linear<C::D, Mixer::CONV_CHANNELS>(tensor_loader::load_weight<C::D, Mixer::CONV_CHANNELS>(gguf, block(layer, "attn_qkv.weight"))), .WZ = Linear<C::D, Mixer::VALUE_WIDTH>(tensor_loader::load_weight<C::D, Mixer::VALUE_WIDTH>(gguf, block(layer, "attn_gate.weight"))), .conv = std::move(conv), .Wbeta = Linear<C::D, C::VALUE_HEADS>(tensor_loader::load_weight<C::D, C::VALUE_HEADS>(gguf, block(layer, "ssm_beta.weight"))), .Walpha = Linear<C::D, C::VALUE_HEADS>(tensor_loader::load_weight<C::D, C::VALUE_HEADS>(gguf, block(layer, "ssm_alpha.weight"))), .dt_bias = tensor_loader::load_vector<C::VALUE_HEADS>(gguf, block(layer, "ssm_dt.bias")), .decay_scale = std::move(decay_scale), .head_norm = PerHeadNorm<C::VALUE_HEADS, C::VALUE_HEAD_DIM, RMSNorm<C::VALUE_HEAD_DIM>>(RMSNorm<C::VALUE_HEAD_DIM>(tensor_loader::load_vector<C::VALUE_HEAD_DIM>(gguf, block(layer, "ssm_norm.weight")), C::RMS_EPS)), .WO = Linear<Mixer::VALUE_WIDTH, C::D>(tensor_loader::load_weight<Mixer::VALUE_WIDTH, C::D>(gguf, block(layer, "ssm_out.weight")))};
 }
 
-template <class C>
-Qwen35Layer<C> load_layer(const GGUF& gguf, size_t layer) {
-    RMSNorm<C::D> mixer_norm = load_norm<C>(gguf, block(layer, "attn_norm.weight"));
-    // Named `post_attention_norm` in the checkpoint, but it is the channel
-    // mixer's INPUT norm — plain pre-norm, two norms per layer.
-    auto channel_norm = [&] { return load_norm<C>(gguf, block(layer, "post_attention_norm.weight")); };
-
-    if (C::is_recurrent(layer)) return Qwen35Block<C, QwenRecurrentMixer<C>>{std::move(mixer_norm), load_recurrent<C>(gguf, layer), channel_norm(), load_channel_mixer<C>(gguf, layer)};
-    return Qwen35Block<C, QwenAttentionMixer<C>>{std::move(mixer_norm), load_attention<C>(gguf, layer), channel_norm(), load_channel_mixer<C>(gguf, layer)};
+// Named `post_attention_norm` in the checkpoint, but it is the channel
+// mixer's INPUT norm — plain pre-norm, two norms per layer.
+template <class C, class Mixer>
+Qwen35Block<C, Mixer> load_block(const GGUF& gguf, size_t layer, Mixer mixer) {
+    return Qwen35Block<C, Mixer>{load_norm<C>(gguf, block(layer, "attn_norm.weight")), std::move(mixer), load_norm<C>(gguf, block(layer, "post_attention_norm.weight")), load_channel_mixer<C>(gguf, layer)};
 }
 
 template <class C>
@@ -139,12 +140,19 @@ QwenTokenIO<C> load_token_io(const GGUF& gguf) {
 }
 
 template <class C>
-Qwen35Transformer<C> load(const GGUF& gguf) {
+Qwen35Model<C> load(const GGUF& gguf) {
     validate_metadata<C>(gguf);
-    std::vector<Qwen35Layer<C>> layers;
-    layers.reserve(C::L);
-    for (size_t layer = 0; layer < C::L; ++layer) layers.push_back(load_layer<C>(gguf, layer));
-    return Qwen35Transformer<C>(Qwen35Weights<C>(load_token_io<C>(gguf), std::move(layers), load_norm<C>(gguf, "output_norm.weight")));
+    // One vector per layer kind, in schedule order; the model's constructor
+    // checks the 3:1 ratio.
+    std::vector<typename Qwen35Model<C>::RecurrentLayer> recurrent;
+    std::vector<typename Qwen35Model<C>::AttentionLayer> attention;
+    for (size_t layer = 0; layer < C::L; ++layer) {
+        if (C::is_recurrent(layer))
+            recurrent.push_back(load_block<C>(gguf, layer, load_recurrent<C>(gguf, layer)));
+        else
+            attention.push_back(load_block<C>(gguf, layer, load_attention<C>(gguf, layer)));
+    }
+    return Qwen35Model<C>(load_token_io<C>(gguf), std::move(recurrent), std::move(attention), load_norm<C>(gguf, "output_norm.weight"));
 }
 
 }  // namespace qwen35_loader

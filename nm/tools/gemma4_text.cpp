@@ -14,15 +14,15 @@
 #include <numeric>
 #include <string>
 
-template <class C, class Architecture>
-static int run(Transformer<Architecture> transformer, const Tokenizer& tokenizer, const std::vector<int32_t>& ids, size_t generate_count) {
+template <class C, class Model>
+static int run(Model model, const Tokenizer& tokenizer, const std::vector<int32_t>& ids, size_t generate_count) {
     std::vector<TokenId> tokens;
     tokens.reserve(ids.size());
     for (int32_t id : ids) tokens.push_back(TokenId{id});
 
-    PrefixCache<Architecture> memo;
+    PrefixCache<Model> memo;
     const auto start = std::chrono::steady_clock::now();
-    auto logits = transformer(tokens, memo);
+    auto logits = evaluate(model, tokens, memo);
     const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 
     size_t best = 0;
@@ -55,7 +55,7 @@ static int run(Transformer<Architecture> transformer, const Tokenizer& tokenizer
             text += tokenizer.decode1(int32_t(token));
             if (tokenizer.is_eog(int32_t(token)) || i + 1 == generate_count) break;
             tokens.push_back(TokenId{int32_t(token)});
-            logits = transformer(tokens, memo);
+            logits = evaluate(model, tokens, memo);
         }
         const double decode_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_start).count();
         std::printf("\ntext: %s\ndecode: %.3fs (%zu tokens, %.2f tok/s)\n", text.c_str(), decode_seconds, produced, double(produced) / decode_seconds);
@@ -77,11 +77,11 @@ int main(int argc, char** argv) {
         const size_t blocks = size_t(gguf.get_int("gemma4.block_count", 0));
         if (blocks == Gemma4_12BTextConfig::L) {
             std::fprintf(stderr, "Gemma 4 12B (%zu layers)\n", blocks);
-            return run<Gemma4_12BTextConfig, Gemma4_12BArchitecture>(gemma4_loader::load_12b_text(gguf), tokenizer, ids, generate_count);
+            return run<Gemma4_12BTextConfig, Gemma4_12BModel>(gemma4_loader::load_12b_text(gguf), tokenizer, ids, generate_count);
         }
         if (blocks == Gemma4E4BTextConfig::L) {
             std::fprintf(stderr, "Gemma 4 E4B (%zu layers)\n", blocks);
-            return run<Gemma4E4BTextConfig, Gemma4E4BArchitecture>(gemma4_loader::load_e4b_text(gguf), tokenizer, ids, generate_count);
+            return run<Gemma4E4BTextConfig, Gemma4E4BModel>(gemma4_loader::load_e4b_text(gguf), tokenizer, ids, generate_count);
         }
         std::fprintf(stderr, "no compiled Gemma 4 config has %zu blocks\n", blocks);
         return 1;

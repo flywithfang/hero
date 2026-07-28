@@ -131,45 +131,54 @@ Matrix<Channels> average_pool_2d(MatrixView<Channels> input, size_t width, size_
     return output;
 }
 
+// One ViT block. Unlike a decoder layer this one CAN run itself: an encoder
+// pass has no cache, no positions carried in from a schedule, and no window —
+// the patch grid is the whole input. So the tensors are public data and the
+// equation is right below them.
 template <size_t D, size_t H, size_t HeadDim, size_t FF>
-class GemmaVisionLayer {
+struct GemmaVisionLayer {
     static_assert(D == H * HeadDim);
-
-public:
     using DLinear = ClippedLinear<D, D>;
 
-    GemmaVisionLayer(RMSNorm<D> input_norm, DLinear query, DLinear key, DLinear value, DLinear output, PerHeadNorm<H, HeadDim, RMSNorm<HeadDim>> query_norm, PerHeadNorm<H, HeadDim, RMSNorm<HeadDim>> key_norm, RMSNormNoScale<HeadDim> value_norm, RMSNorm<D> attention_post_norm, RMSNorm<D> ffn_norm, ClippedLinear<D, FF> ffn_gate, ClippedLinear<D, FF> ffn_up, ClippedLinear<FF, D> ffn_down, RMSNorm<D> ffn_post_norm) : input_norm_(std::move(input_norm)), query_(std::move(query)), key_(std::move(key)), value_(std::move(value)), output_(std::move(output)), query_norm_(std::move(query_norm)), key_norm_(std::move(key_norm)), value_norm_(std::move(value_norm)), attention_post_norm_(std::move(attention_post_norm)), ffn_norm_(std::move(ffn_norm)), ffn_gate_(std::move(ffn_gate)), ffn_up_(std::move(ffn_up)), ffn_down_(std::move(ffn_down)), ffn_post_norm_(std::move(ffn_post_norm)) {}
+    RMSNorm<D> input_norm;
+    DLinear WQ;
+    PerHeadNorm<H, HeadDim, RMSNorm<HeadDim>> q_norm;
+    DLinear WK;
+    PerHeadNorm<H, HeadDim, RMSNorm<HeadDim>> k_norm;
+    DLinear WV;
+    PerHeadNorm<H, HeadDim, RMSNormNoScale<HeadDim>> v_norm;  // no learned scale
+    DLinear WO;
+    RMSNorm<D> attention_post_norm;
+    RMSNorm<D> ffn_norm;
+    ClippedLinear<D, FF> W_gate;
+    ClippedLinear<D, FF> W_up;
+    ClippedLinear<FF, D> W_down;
+    RMSNorm<D> ffn_post_norm;
 
+    //  Q = rope2d( q_norm( U WQ ) ),  K = rope2d( k_norm( U WK ) ),  U = norm(x)
+    //  V = v_norm( U WV )                                (never rotated)
+    //  h = x + post_norm( softmax(Q K^T) V WO )          (dense: every patch
+    //  out = h + post_norm( (gelu(h W_gate) (*) h W_up) W_down )   sees every patch)
     Matrix<D> operator()(MatrixView<D> input, size_t patches_x, size_t patches_y) const {
         if (input.rows() != patches_x * patches_y) throw std::invalid_argument("GemmaVisionLayer: patch grid mismatch");
-        Matrix<D> normalized = input_norm_(input);
-        Matrix<D> queries = query_norm_(query_(normalized.view()));
-        Matrix<D> keys = key_norm_(key_(normalized.view()));
-        Matrix<D> values = transform_heads<H, HeadDim>(value_(normalized.view()).view(), [&](VecView<HeadDim> head) { return value_norm_(head); });
+        Matrix<D> U = input_norm(input);
+        Matrix<D> Q = q_norm(WQ(U.view()));
+        Matrix<D> K = k_norm(WK(U.view()));
+        Matrix<D> V = v_norm(WV(U.view()));
 
-        apply_vision_rope_2d<H, HeadDim, 100>(queries, keys, patches_x, patches_y);
-        Matrix<D> attended = scaled_dot_product_attention<H, HeadDim, HeadDim>(queries.view(), keys.view(), values.view(), 1.f);
+        apply_vision_rope_2d<H, HeadDim, 100>(Q, K, patches_x, patches_y);
+        Matrix<D> A = scaled_dot_product_attention<H, HeadDim, HeadDim>(Q.view(), K.view(), V.view(), 1.f);
 
-        Matrix<D> attention_branch = attention_post_norm_(output_(attended.view()));
+        Matrix<D> attention_branch = attention_post_norm(WO(A.view()));
         Matrix<D> residual = add(input, attention_branch.view());
 
-        Matrix<D> ffn_input = ffn_norm_(residual.view());
-        Matrix<FF> gate = ffn_gate_(ffn_input.view());
+        Matrix<D> ffn_input = ffn_norm(residual.view());
+        Matrix<FF> gate = W_gate(ffn_input.view());
         gelu_in_place(gate.mutable_view());
-        Matrix<FF> up = ffn_up_(ffn_input.view());
-        Matrix<D> ffn = ffn_post_norm_(ffn_down_(hadamard(gate.view(), up.view()).view()));
+        Matrix<FF> up = W_up(ffn_input.view());
+        Matrix<D> ffn = ffn_post_norm(W_down(hadamard(gate.view(), up.view()).view()));
         return add(residual.view(), ffn.view());
     }
-
-private:
-    RMSNorm<D> input_norm_;
-    DLinear query_, key_, value_, output_;
-    PerHeadNorm<H, HeadDim, RMSNorm<HeadDim>> query_norm_, key_norm_;
-    RMSNormNoScale<HeadDim> value_norm_;
-    RMSNorm<D> attention_post_norm_, ffn_norm_;
-    ClippedLinear<D, FF> ffn_gate_, ffn_up_;
-    ClippedLinear<FF, D> ffn_down_;
-    RMSNorm<D> ffn_post_norm_;
 };
 
 class Gemma4E4BVisionEncoder {

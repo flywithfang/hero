@@ -72,81 +72,6 @@ static_assert(Gemma4E4BTextConfig::position_in_kind(24) == 0 && Gemma4E4BTextCon
 // parameter count); the layer structs themselves just have or lack tensors.
 enum class GemmaKVKind : uint8_t { Owned, Unified, Shared };
 
-// One layer's token mixer, shared by every Gemma 4 size:
-//
-//     Q = rope( rmsnorm_per_head( X W_q ) )      [T, Hq  * Dh]
-//     K = rope( rmsnorm_per_head( X W_k ) )      [T, Hkv * Dh]
-//     V =       rmsnorm_per_head( X W_v )        [T, Hkv * Dh]   (never rotated)
-//     A = softmax_masked( Q K^T ) V              over the cache, K/V appended
-//     out = A W_o                                [T, D]
-//
-// `layer` is any flat layer struct carrying WQ/q_norm/WO and the Hq/HEAD_DIM
-// constants; the `requires` checks read the anatomy straight off the member
-// list: no WK member = shared KV (attend against what an earlier layer cached),
-// WK without WV = unified (V is the RAW W_k output under the scale-free norm).
-// The rope table, start position and window are the caller's schedule (window
-// 0 = look back to position 0). Gemma's score scale stays at attention.hpp's
-// default 1.0: the usual 1/sqrt(Dh) is folded into the learned per-head Q norm.
-template <class Layer, size_t Hkv, size_t Dh, class Rope>
-Matrix<Layer::D> gemma_attention(const Layer& layer, MatrixView<Layer::D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) {
-    static_assert(Layer::HEAD_DIM == Dh, "layer and cache disagree on head width");
-    constexpr size_t Hq = Layer::Hq;
-
-    Matrix<Hq * Dh> Q = layer.q_norm(layer.WQ(X));
-    rotate_heads<Hq, Dh>(Q, rope, first_position);
-
-    if constexpr (!requires { layer.WK; }) {
-        // No K/V weights at all (E4B's last 18 layers): nothing to project and
-        // nothing to cache — the query attends against rows an earlier layer
-        // of the same attention kind already wrote this pass.
-        Matrix<Hq * Dh> A = attend<Hq, Hkv, Dh>(Q.view(), cache, first_position, window);
-        return layer.WO(A.view());
-    } else {
-        Matrix<Hkv * Dh> projected = layer.WK(X);  // X W_k, computed once
-        Matrix<Hkv * Dh> K = layer.k_norm(projected.view());
-        rotate_heads<Hkv, Dh>(K, rope, first_position);
-
-        Matrix<Hkv * Dh> V = [&] {
-            if constexpr (requires { layer.WV; })
-                return layer.v_norm(layer.WV(X));
-            else
-                return layer.v_norm(projected.view());  // no W_v: V is the raw W_k output
-        }();
-
-        Matrix<Hq * Dh> A = attend_and_cache<Hq, Hkv, Dh>(Q.view(), K.view(), V.view(), cache, first_position, window);
-        return layer.WO(A.view());
-    }
-}
-
-// One Gemma 4 decoder layer — EVERY size, E4B and 12B alike:
-//
-//     h   = x + post_norm( attn( pre_norm(x) ) )
-//     h   = h + post_norm( mlp( pre_norm(h) ) )
-//     h   = h + norm( (gelu(h W_gate) (*) ple) W_proj )   <- only if the layer has `ple`
-//     out = layer_output_scale * h
-//
-// The two sizes differ by exactly that PLE line, so this is one function and
-// the difference is whether the layer struct HAS a `ple` member — the same way
-// gemma_attention() reads KV anatomy off `WK`/`WV`. Nothing here is a flag.
-template <class Layer, size_t Hkv, size_t Dh, class Rope, class PerLayerInput = std::monostate>
-Matrix<Layer::D> gemma_layer(const Layer& layer, MatrixView<Layer::D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window, PerLayerInput ple = {}) {
-    constexpr size_t D = Layer::D;
-
-    Matrix<D> U = layer.attn_norm(X);
-    Matrix<D> A = gemma_attention(layer, U.view(), cache, rope, first_position, window);
-    A = layer.post_attn_norm(A);
-    Matrix<D> H = add(X, A.view());
-
-    Matrix<D> Z = layer.ffn_norm(H.view());
-    Matrix<D> F = layer.ffn(Z.view());
-    F = layer.post_ffn_norm(F);
-    H = add(H.view(), F.view());
-
-    if constexpr (requires { layer.ple; }) H = layer.ple(H.view(), ple);
-    scale_in_place(H.mutable_view(), layer.layer_output_scale);
-    return H;
-}
-
 template <size_t D>
 constexpr Scalar gemma_embedding_scale() {
     // The reference stores the scale at the embedding weight dtype. For BF16
@@ -266,8 +191,8 @@ private:
 //
 // Two head widths exist (sliding 256, full 512), and the last 18 layers carry
 // no K/V tensors at all — so there are two structs, each instantiated at two
-// widths. No variant, no wrapper types: a layer is its tensor list, and
-// gemma_attention() reads the KV anatomy off which members exist.
+// widths. Each type implements the operation appropriate to its physical
+// tensors; no member-detection convention decides its behavior elsewhere.
 template <size_t Dh>
 struct GemmaE4BLayer {
     static constexpr size_t D = Gemma4E4BTextConfig::D;
@@ -289,6 +214,36 @@ struct GemmaE4BLayer {
     RMSNorm<D> post_ffn_norm;
     GemmaPerLayerResidual<D, Gemma4E4BTextConfig::PLE> ple;
     Scalar layer_output_scale;
+
+    // This layer owns K and V: project, normalize and append both to its cache.
+    template <class Rope>
+    Matrix<D> attention(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) const {
+        Matrix<Hq * Dh> Q = q_norm(WQ(X));
+        rotate_heads<Hq, Dh>(Q, rope, first_position);
+
+        Matrix<Hkv * Dh> K = k_norm(WK(X));
+        rotate_heads<Hkv, Dh>(K, rope, first_position);
+        Matrix<Hkv * Dh> V = v_norm(WV(X));
+
+        Matrix<Hq * Dh> A = attend_and_cache<Hq, Hkv, Dh>(Q.view(), K.view(), V.view(), cache, first_position, window);
+        return WO(A.view());
+    }
+
+    template <class Rope>
+    Matrix<D> forward(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window, MatrixView<Gemma4E4BTextConfig::PLE> per_layer_input) const {
+        Matrix<D> U = attn_norm(X);
+        Matrix<D> A = attention(U.view(), cache, rope, first_position, window);
+        A = post_attn_norm(A);
+        Matrix<D> H = add(X, A.view());
+
+        Matrix<D> Z = ffn_norm(H.view());
+        Matrix<D> F = post_ffn_norm(ffn(Z.view()));
+        H = add(H.view(), F.view());
+
+        H = ple(H.view(), per_layer_input);
+        scale_in_place(H.mutable_view(), layer_output_scale);
+        return H;
+    }
 };
 
 // The last 18 layers: the same layer minus the K/V tensors, which the
@@ -298,6 +253,7 @@ template <size_t Dh>
 struct GemmaE4BSharedLayer {
     static constexpr size_t D = Gemma4E4BTextConfig::D;
     static constexpr size_t Hq = Gemma4E4BTextConfig::Hq;
+    static constexpr size_t Hkv = Gemma4E4BTextConfig::Hkv;
     static constexpr size_t HEAD_DIM = Dh;
 
     RMSNorm<D> attn_norm;
@@ -310,6 +266,32 @@ struct GemmaE4BSharedLayer {
     RMSNorm<D> post_ffn_norm;
     GemmaPerLayerResidual<D, Gemma4E4BTextConfig::PLE> ple;
     Scalar layer_output_scale;
+
+    // This layer owns no K/V. It only forms Q and attends to an earlier
+    // owning layer's cache; in particular, it never appends cache rows.
+    template <class Rope>
+    Matrix<D> attention(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) const {
+        Matrix<Hq * Dh> Q = q_norm(WQ(X));
+        rotate_heads<Hq, Dh>(Q, rope, first_position);
+        Matrix<Hq * Dh> A = attend<Hq, Hkv, Dh>(Q.view(), cache, first_position, window);
+        return WO(A.view());
+    }
+
+    template <class Rope>
+    Matrix<D> forward(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window, MatrixView<Gemma4E4BTextConfig::PLE> per_layer_input) const {
+        Matrix<D> U = attn_norm(X);
+        Matrix<D> A = attention(U.view(), cache, rope, first_position, window);
+        A = post_attn_norm(A);
+        Matrix<D> H = add(X, A.view());
+
+        Matrix<D> Z = ffn_norm(H.view());
+        Matrix<D> F = post_ffn_norm(ffn(Z.view()));
+        H = add(H.view(), F.view());
+
+        H = ple(H.view(), per_layer_input);
+        scale_in_place(H.mutable_view(), layer_output_scale);
+        return H;
+    }
 };
 
 using GemmaE4BModelData = GemmaPerLayerInputs<Gemma4E4BTextConfig::D, Gemma4E4BTextConfig::PLE, Gemma4E4BTextConfig::L, Gemma4E4BTextConfig::V>;
@@ -411,8 +393,8 @@ public:
 
 private:
     // Run layer `layer_index` in place: `residual` is the only in/out. The
-    // equation is gemma_layer(), shared with 12B; the schedule is two plain
-    // booleans, and each of the four branches names exactly which vector, which
+    // equation is the selected layer type's forward() method; the schedule is
+    // two plain booleans, and each branch names exactly which vector, which
     // cache, which rope table and which window that layer kind uses. Layers
     // 24..41 own no K/V: they attend against what layer 22 (sliding) or 23
     // (full) wrote earlier in this same pass, which is why local()/global()
@@ -426,10 +408,10 @@ private:
         const bool shared = C::shares_kv(layer_index);
 
         Matrix<D> next = [&]() -> Matrix<D> {
-            if (!shared && !full) return gemma_layer(sliding_.at(n), X, state.local(layer_index), LocalRope{}, pos, C::SLIDING_WINDOW, ple.view());
-            if (!shared) return gemma_layer(global_.at(n), X, state.global(layer_index), GlobalRope{}, pos, /*window=*/0, ple.view());
-            if (!full) return gemma_layer(sliding_shared_.at(n), X, state.local(layer_index), LocalRope{}, pos, C::SLIDING_WINDOW, ple.view());
-            return gemma_layer(global_shared_.at(n), X, state.global(layer_index), GlobalRope{}, pos, /*window=*/0, ple.view());
+            if (!shared && !full) return sliding_.at(n).forward(X, state.local(layer_index), LocalRope{}, pos, C::SLIDING_WINDOW, ple.view());
+            if (!shared) return global_.at(n).forward(X, state.global(layer_index), GlobalRope{}, pos, /*window=*/0, ple.view());
+            if (!full) return sliding_shared_.at(n).forward(X, state.local(layer_index), LocalRope{}, pos, C::SLIDING_WINDOW, ple.view());
+            return global_shared_.at(n).forward(X, state.global(layer_index), GlobalRope{}, pos, /*window=*/0, ple.view());
         }();
         residual.set_matrix(std::move(next));
     }
@@ -509,11 +491,10 @@ constexpr size_t gemma_dense_param_count() {
 }
 static_assert(gemma_dense_param_count<Gemma4_12BTextConfig>() > 11'700'000'000 && gemma_dense_param_count<Gemma4_12BTextConfig>() < 12'100'000'000, "Gemma 4 12B lands on its advertised ~11.95B");
 
-// The two layer shapes the 12B checkpoint actually has, written out flat.
-// They differ in head width (256 vs 512), KV head count (8 vs 1), and KV
-// anatomy: a global layer carries no W_v tensor, so this struct has no WV
-// member — V is the raw W_k output under the scale-free norm, which
-// gemma_attention() reads directly off the member list.
+// The two layer shapes the 12B checkpoint actually has. They differ in head
+// width (256 vs 512), KV head count (8 vs 1), and KV behavior. The methods make
+// that behavior explicit: sliding owns separate K/V projections; global uses
+// one projection as both K and V and therefore carries no W_v tensor.
 struct Gemma12BSlidingLayer {
     static constexpr size_t D = Gemma4_12BTextConfig::D;
     static constexpr size_t Hq = Gemma4_12BTextConfig::Hq;
@@ -534,6 +515,36 @@ struct Gemma12BSlidingLayer {
     GeluGatedMLP<D, Gemma4_12BTextConfig::FF> ffn;
     RMSNorm<D> post_ffn_norm;
     Scalar layer_output_scale;
+
+    // Sliding attention owns separate K and V projections and appends them to
+    // its bounded cache.
+    template <class Rope>
+    Matrix<D> attention(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) const {
+        Matrix<Hq * Dh> Q = q_norm(WQ(X));
+        rotate_heads<Hq, Dh>(Q, rope, first_position);
+
+        Matrix<Hkv * Dh> K = k_norm(WK(X));
+        rotate_heads<Hkv, Dh>(K, rope, first_position);
+        Matrix<Hkv * Dh> V = v_norm(WV(X));
+
+        Matrix<Hq * Dh> A = attend_and_cache<Hq, Hkv, Dh>(Q.view(), K.view(), V.view(), cache, first_position, window);
+        return WO(A.view());
+    }
+
+    template <class Rope>
+    Matrix<D> forward(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) const {
+        Matrix<D> U = attn_norm(X);
+        Matrix<D> A = attention(U.view(), cache, rope, first_position, window);
+        A = post_attn_norm(A);
+        Matrix<D> H = add(X, A.view());
+
+        Matrix<D> Z = ffn_norm(H.view());
+        Matrix<D> F = post_ffn_norm(ffn(Z.view()));
+        H = add(H.view(), F.view());
+
+        scale_in_place(H.mutable_view(), layer_output_scale);
+        return H;
+    }
 };
 
 struct Gemma12BGlobalLayer {
@@ -555,6 +566,37 @@ struct Gemma12BGlobalLayer {
     GeluGatedMLP<D, Gemma4_12BTextConfig::FF> ffn;
     RMSNorm<D> post_ffn_norm;
     Scalar layer_output_scale;
+
+    // Unified K/V: project once. K gets its learned norm and RoPE; V gets the
+    // scale-free norm directly from the same unrotated projection.
+    template <class Rope>
+    Matrix<D> attention(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) const {
+        Matrix<Hq * Dh> Q = q_norm(WQ(X));
+        rotate_heads<Hq, Dh>(Q, rope, first_position);
+
+        Matrix<Hkv * Dh> projected = WK(X);
+        Matrix<Hkv * Dh> K = k_norm(projected.view());
+        rotate_heads<Hkv, Dh>(K, rope, first_position);
+        Matrix<Hkv * Dh> V = v_norm(projected.view());
+
+        Matrix<Hq * Dh> A = attend_and_cache<Hq, Hkv, Dh>(Q.view(), K.view(), V.view(), cache, first_position, window);
+        return WO(A.view());
+    }
+
+    template <class Rope>
+    Matrix<D> forward(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) const {
+        Matrix<D> U = attn_norm(X);
+        Matrix<D> A = attention(U.view(), cache, rope, first_position, window);
+        A = post_attn_norm(A);
+        Matrix<D> H = add(X, A.view());
+
+        Matrix<D> Z = ffn_norm(H.view());
+        Matrix<D> F = post_ffn_norm(ffn(Z.view()));
+        H = add(H.view(), F.view());
+
+        scale_in_place(H.mutable_view(), layer_output_scale);
+        return H;
+    }
 };
 
 static_assert(TokenInputOutput<GemmaTokenIO<Gemma4_12BTextConfig::D, Gemma4_12BTextConfig::V>, Gemma4_12BTextConfig::D, Gemma4_12BTextConfig::V>);
@@ -634,15 +676,14 @@ public:
     }
 
 private:
-    // The same gemma_layer() E4B runs. 12B's layer structs carry no `ple`
-    // member, so the PLE line inside it compiles away — that is the entire
-    // difference between the two sizes' layer equations.
+    // Each concrete 12B layer owns its equation. Unlike E4B's methods these
+    // methods have no per-layer-input argument and perform no PLE residual.
     void forward_layer(PrefixState& state, const EmbeddedSequence<D>& input, ResidualStream<D>& residual, size_t layer_index) const {
         const size_t pos = input.position(0).i;
         const MatrixView<D> X = residual.matrix();
         const size_t n = C::position_in_kind(layer_index);
 
-        Matrix<D> next = C::attention_kind(layer_index) == GemmaAttentionKind::Sliding ? gemma_layer(sliding_.at(n), X, state.local(layer_index), LocalRope{}, pos, C::SLIDING_WINDOW) : gemma_layer(global_.at(n), X, state.global(layer_index), GlobalRope{}, pos, /*window=*/0);
+        Matrix<D> next = C::attention_kind(layer_index) == GemmaAttentionKind::Sliding ? sliding_.at(n).forward(X, state.local(layer_index), LocalRope{}, pos, C::SLIDING_WINDOW) : global_.at(n).forward(X, state.global(layer_index), GlobalRope{}, pos, /*window=*/0);
         residual.set_matrix(std::move(next));
     }
 

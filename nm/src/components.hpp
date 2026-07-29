@@ -164,7 +164,7 @@ public:
         Vec<D> y;
         for (size_t k = 0; k < TOPK; ++k) {  // routed experts
             Vec<D> ye = experts_[idx[k]](x);
-            axpy(s[idx[k]] / norm, VecView<D>(ye), y);
+            y.scaled_add(VecView<D>(ye), s[idx[k]] / norm);
         }
         for (const auto& sh : shared_) y += sh(x);  // always-on path
         return y;

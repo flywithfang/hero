@@ -69,15 +69,15 @@ flat layer structs (`Gemma12BSlidingLayer` / `Gemma12BGlobalLayer`):
    layers `Hkv=1`, so `Hkv` is a per-layer-struct constant and the cache
    follows it.
 2. **Unified K/V.** Three K/V anatomies exist across Gemma 4 — owned, unified,
-   shared — and each is expressed by which members a layer struct HAS: a
-   unified layer has `WK`/`k_norm`/`v_norm` but no `WV`; a shared layer has
-   none of them. On a unified layer the VALUE is the raw `W_k` output taken
-   *before* the key's learned norm and *before* RoPE, then given the scale-free
-   RMS the ordinary value path uses; `gemma_attention()` computes `X W_k` once
-   and applies both norms to it.
-PLE is likewise a member (`ple` + `layer_output_scale` on E4B's layer structs)
-that a 12B layer simply does not have — never a "has PLE" bool. E4B's numerics
-and tests were unchanged by all of this.
+   shared — and the concrete layer types expose each equation explicitly. A
+   unified layer has `WK`/`k_norm`/`v_norm` but no `WV`; a shared layer has none
+   of them. On a unified layer the VALUE is the raw `W_k` output taken *before*
+   the key's learned norm and *before* RoPE, then given the scale-free RMS the
+   ordinary value path uses; `Gemma12BGlobalLayer::attention()` computes
+   `X W_k` once and applies both norms to it.
+PLE is likewise explicit: E4B layer `forward()` methods apply their `ple`
+member, while 12B layer methods have neither the member nor that operation.
+There is no runtime "has PLE" bool.
 Its multimodality is also encoder-free: raw image patches and audio are
 projected straight into the decoder embedding space (`patch_size=16`,
 `num_soft_tokens=280`, `mm_embed_dim=3840`), so there is no ViT to port —

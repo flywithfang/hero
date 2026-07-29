@@ -26,16 +26,30 @@ static Linear<N, N> identity_linear() {
     return Linear<N, N>(Weight<N, N>(std::move(matrix)));
 }
 
-// A toy unified layer: one head of width 2, no WV member — exactly the 12B
-// global anatomy at toy size. gemma_attention() must read that off the members.
+// A toy-sized statement of the unified K/V equation used by the concrete 12B
+// global layer: one projection, with different K and V normalization paths.
 struct ToyUnifiedLayer {
-    static constexpr size_t D = 2, Hq = 1, HEAD_DIM = 2;
+    static constexpr size_t D = 2, Hq = 1, Hkv = 1, Dh = 2;
     Linear<2, 2> WQ;
     PerHeadNorm<1, 2, RMSNorm<2>> q_norm;
     Linear<2, 2> WK;
     PerHeadNorm<1, 2, RMSNorm<2>> k_norm;
     PerHeadNorm<1, 2, RMSNormNoScale<2>> v_norm;
     Linear<2, 2> WO;
+
+    template <class Rope>
+    Matrix<D> attention(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) const {
+        Matrix<Hq * Dh> Q = q_norm(WQ(X));
+        rotate_heads<Hq, Dh>(Q, rope, first_position);
+
+        Matrix<Hkv * Dh> projected = WK(X);
+        Matrix<Hkv * Dh> K = k_norm(projected.view());
+        rotate_heads<Hkv, Dh>(K, rope, first_position);
+        Matrix<Hkv * Dh> V = v_norm(projected.view());
+
+        Matrix<Hq * Dh> A = attend_and_cache<Hq, Hkv, Dh>(Q.view(), K.view(), V.view(), cache, first_position, window);
+        return WO(A.view());
+    }
 };
 
 template <size_t N>
@@ -205,10 +219,10 @@ int main() {
         x.row_mut(0)[1] = 4.f;
 
         // One token, one visible key: the softmax weight is 1 regardless of K,
-        // and WO is identity, so gemma_attention() returns V itself — which for
+        // and WO is identity, so attention() returns V itself — which for
         // unified K/V must be the raw W_k output under the scale-free norm.
         KVCache<1, 2> cache;
-        Matrix<2> out = gemma_attention(layer, x.view(), cache, RotaryEmbedding<2, 10000>{}, /*first_position=*/0, /*window=*/0);
+        Matrix<2> out = layer.attention(x.view(), cache, RotaryEmbedding<2, 10000>{}, /*first_position=*/0, /*window=*/0);
 
         // rms([3,4]) = sqrt(12.5); normalized = [0.8485, 1.1314]
         const Scalar inv = 1.f / std::sqrt(12.5f);

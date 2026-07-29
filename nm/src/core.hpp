@@ -99,6 +99,9 @@ inline uint16_t fp32_to_bf16(float f) {
 // ================= stratum 0: typed storage ================================
 
 template <size_t N>
+struct VecView;
+
+template <size_t N>
 struct Vec {
     static constexpr size_t extent = N;
     std::unique_ptr<Scalar[]> p = std::make_unique<Scalar[]>(N);  // zeroed
@@ -106,6 +109,8 @@ struct Vec {
     const Scalar& operator[](size_t i) const { return p[i]; }
     Scalar* begin() { return p.get(); }
     Scalar* end() { return p.get() + N; }
+
+    void scaled_add(VecView<N> addend, Scalar scale);
 };
 
 template <size_t N>
@@ -117,6 +122,11 @@ struct VecView {
     const Scalar* begin() const { return p; }
     const Scalar* end() const { return p + N; }
 };
+
+template <size_t N>
+void Vec<N>::scaled_add(VecView<N> addend, Scalar scale) {
+    for (size_t i = 0; i < N; ++i) (*this)[i] += scale * addend[i];
+}
 
 template <size_t N>
 struct MutVecView {
@@ -283,11 +293,6 @@ Scalar dot(VecView<N> a, VecView<N> b) {
     for (size_t i = 0; i < N; ++i) s += a[i] * b[i];
     return s;  // fp32 accum (T6)
 }
-template <size_t N>
-void axpy(Scalar a, VecView<N> x, Vec<N>& y) {
-    for (size_t i = 0; i < N; ++i) y[i] += a * x[i];
-}
-
 template <size_t N>
 Vec<N> hadamard(VecView<N> left, VecView<N> right) {
     Vec<N> output;
@@ -539,7 +544,7 @@ Matrix<Heads * ValueDim> scaled_dot_product_attention(MatrixView<Heads * QueryKe
         softmax(scores);
 
         Vec<ValueDim> attended;
-        for (size_t key_row = 0; key_row < keys.rows(); ++key_row) axpy(scores[key_row], slice<ValueDim>(values.row(key_row), head * ValueDim), attended);
+        for (size_t key_row = 0; key_row < keys.rows(); ++key_row) attended.scaled_add(slice<ValueDim>(values.row(key_row), head * ValueDim), scores[key_row]);
         std::copy(attended.begin(), attended.end(), output.data() + (query_row * Heads + head) * ValueDim);
     });
     return output;

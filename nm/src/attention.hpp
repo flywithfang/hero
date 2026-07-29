@@ -255,7 +255,8 @@ Vec<HeadDim> attend_head(VecView<Hq * HeadDim> query, const KVCache<Hkv, HeadDim
     softmax(alpha);
 
     Vec<HeadDim> attended;  // zero-initialized; this is the sum
-    for (size_t n = 0; n < J.size(); ++n) axpy(alpha[n], cache.value(J[n], group), attended);
+    ///score*V
+    for (size_t n = 0; n < J.size(); ++n) attended.scaled_add(cache.value(J[n], group), alpha[n]);
     return attended;
 }
 

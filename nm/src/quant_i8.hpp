@@ -353,10 +353,7 @@ template <size_t In, size_t Out>
 Vec<Out> Weight<In, Out>::matvec(VecView<In> x) const {
     Vec<Out> y;
     const GT t = type_;
-    if (t == GT::F32) {
-        par_for(Out, [&](size_t o) { y[o] = dot(x, f32_.row(o)); });
-        return y;
-    }
+    if (t == GT::F32) return f32_.matvec(x);
     const size_t rb = type_size_bytes(t, In);
     if (!nm_fp32_act() && has_i8_kernel(t)) {  // int8 activations (default)
         // Plain local, captured by reference: workers must read THIS act.

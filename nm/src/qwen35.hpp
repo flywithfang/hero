@@ -184,11 +184,11 @@ public:
 
     Vec<C::D> token(TokenId id) const { return tokens_.dequant_row(size_t(id)); }
     Matrix<C::D> tokens(std::span<const TokenId> ids) const { return tokens_.gather_rows(ids); }
-    Vec<C::V> logits(VecView<C::D> hidden) const {
+    Logits<C::V> logits(VecView<C::D> hidden) const {
         if constexpr (std::is_same_v<OutputWeight, std::monostate>)
-            return tokens_.matvec(hidden);
+            return Logits<C::V>(tokens_.matvec(hidden));
         else
-            return unembed_.matvec(hidden);
+            return Logits<C::V>(unembed_.matvec(hidden));
     }
 
 private:
@@ -313,7 +313,7 @@ public:
     }
 
     // Nothing to precompute: a Qwen layer reads only the residual stream.
-    Vec<V> forward(PrefixState& state, const EmbeddedSequence<D>& input) const {
+    Logits<V> forward(PrefixState& state, const EmbeddedSequence<D>& input) const {
         if (input.tokens() > CTX - state.tokens()) throw std::length_error("Qwen35Model: context exhausted");
 
         ResidualStream<D> residual(input);

@@ -21,13 +21,6 @@ EmbeddingSegment<Gemma4E4BTextConfig::D> text_segment(const Gemma4E4BModel& mode
     return EmbeddingSegment<Gemma4E4BTextConfig::D>(std::move(embeddings), std::move(identities));
 }
 
-size_t argmax(const Vec<Gemma4E4BTextConfig::V>& logits) {
-    size_t best = 0;
-    for (size_t i = 1; i < Gemma4E4BTextConfig::V; ++i)
-        if (logits[i] > logits[best]) best = i;
-    return best;
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -68,8 +61,8 @@ int main(int argc, char** argv) {
         std::printf("image_tokens: %zu\nvision_elapsed: %.3fs\nprefill_elapsed: %.3fs\n", image_tokens, vision_seconds, text_seconds);
         std::printf("generated:");
         for (size_t i = 0; i < count; ++i) {
-            const size_t token = argmax(logits);
-            std::printf(" %zu", token);
+            const int32_t token = int32_t(logits.argmax());
+            std::printf(" %d", token);
             answer += tokenizer.decode1(int32_t(token));
             if (tokenizer.is_eog(int32_t(token))) break;
             std::vector<int32_t> generated{int32_t(token)};

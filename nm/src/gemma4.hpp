@@ -82,7 +82,7 @@ constexpr Scalar gemma_embedding_scale() {
 inline Scalar gemma_softcap(Scalar value, Scalar cap) { return cap * std::tanh(value / cap); }
 
 template <size_t N>
-void gemma_softcap(Vec<N>& values, Scalar cap) {
+void gemma_softcap(MutVecView<N> values, Scalar cap) {
     for (size_t i = 0; i < N; ++i) values[i] = gemma_softcap(values[i], cap);
 }
 
@@ -173,7 +173,7 @@ public:
         scale_in_place(values.mutable_view(), input_scale_);
         return values;
     }
-    Vec<V> logits(VecView<D> hidden) const { return tokens_.matvec(hidden); }
+    Logits<V> logits(VecView<D> hidden) const { return Logits<V>(tokens_.matvec(hidden)); }
 
 private:
     Weight<D, V> tokens_;  // tied input embedding and LM head
@@ -374,7 +374,7 @@ public:
     // Run `input` (the rows not yet in `state`) all the way to logits. How this
     // model runs is entirely inside here: the PLE table is built once, the 42
     // layers each take their slice of it, and the state advances at the end.
-    Vec<V> forward(PrefixState& state, const EmbeddedSequence<D>& input) const {
+    Logits<V> forward(PrefixState& state, const EmbeddedSequence<D>& input) const {
         if (input.tokens() > CTX - state.tokens()) throw std::length_error("Gemma4E4BModel: context exhausted");
 
         // Once per pass, not once per layer: every layer reads its own P-wide
@@ -386,8 +386,8 @@ public:
         state.advance(input.tokens());
 
         Vec<D> last = final_norm_(residual.token(residual.tokens() - 1));
-        Vec<V> logits = token_io_.logits(last);
-        gemma_softcap(logits, C::LOGIT_SOFTCAP);
+        Logits<V> logits = token_io_.logits(last);
+        gemma_softcap<V>(logits.mutable_view(), C::LOGIT_SOFTCAP);
         return logits;
     }
 
@@ -662,7 +662,7 @@ public:
     }
 
     // The same shape of pass as E4B, with nothing to precompute: 12B has no PLE.
-    Vec<V> forward(PrefixState& state, const EmbeddedSequence<D>& input) const {
+    Logits<V> forward(PrefixState& state, const EmbeddedSequence<D>& input) const {
         if (input.tokens() > CTX - state.tokens()) throw std::length_error("Gemma4_12BModel: context exhausted");
 
         ResidualStream<D> residual(input);
@@ -670,8 +670,8 @@ public:
         state.advance(input.tokens());
 
         Vec<D> last = final_norm_(residual.token(residual.tokens() - 1));
-        Vec<V> logits = token_io_.logits(last);
-        gemma_softcap(logits, C::LOGIT_SOFTCAP);
+        Logits<V> logits = token_io_.logits(last);
+        gemma_softcap<V>(logits.mutable_view(), C::LOGIT_SOFTCAP);
         return logits;
     }
 

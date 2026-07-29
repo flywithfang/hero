@@ -1,6 +1,6 @@
 // chat_models.hpp — model-specific adapters for the model-neutral chat loop.
 // An adapter owns its chat template, prefix memoization, sampling, and any
-// modality encoder; the REPL sees only the ChatModel interface.
+// modality encoder; the REPL sees only what ChatModelInterface names.
 #pragma once
 #include "chat_session.hpp"
 #include "gemma4_loader.hpp"
@@ -13,25 +13,25 @@
 // A text-only adapter over any architecture whose input is token ids and whose
 // turns are rendered as text. Qwen 3.5 uses it; a future text-only family
 // should too rather than growing a second copy of this loop.
-template <class C, class Model, class RenderTurn>
-class TextChatModel : public ChatModel {
+template <class C, class Model, class RenderTurn, class FormatOutput>
+class TextChatModel {
 public:
     TextChatModel(Model model, const GGUF& gguf, std::string description, std::string system, SamplerCfg sampling, RenderTurn render) : model_(std::move(model)), tokenizer_(gguf), sampler_(sampling), system_(std::move(system)), description_(std::move(description)), render_(std::move(render)) {}
 
-    std::string description() const override { return description_; }
-    bool supports_images() const override { return false; }
-    size_t context_used() const override { return history_.size(); }
-    size_t context_limit() const override { return C::CTX; }
-    const ChatStats& stats() const override { return stats_; }
+    std::string description() const { return description_; }
+    bool supports_images() const { return false; }
+    size_t context_used() const { return history_.size(); }
+    size_t context_limit() const { return C::CTX; }
+    const ChatStats& stats() const { return stats_; }
 
-    void reset() override {
+    void reset() {
         prefix_memo_.clear();
         history_.clear();
         stats_ = {};
         first_ = true;
     }
 
-    ChatTurnResult respond(std::string_view user, const RGBImage* image, size_t max_new, const ChatTokenSink& sink) override {
+    ChatTurnResult respond(std::string_view user, const RGBImage* image, size_t max_new, const ChatTokenSink& sink) {
         if (image) throw std::invalid_argument("this model has no image encoder");
         const std::string rendered = render_(user, first_, system_);
         const auto ids = tokenizer_.encode(rendered, first_, /*parse_special=*/true);
@@ -41,12 +41,18 @@ public:
 
         ChatTurnResult result;
         const auto prefill_start = std::chrono::steady_clock::now();
-        Vec<C::V> logits = evaluate(model_, history_, prefix_memo_);
+        Logits<C::V> logits = evaluate(model_, history_, prefix_memo_);
         result.delta.prefill_seconds = seconds_since(prefill_start);
         result.delta.prefill_tokens = ids.size();
+        FormatOutput output(sink);
+        auto complete = [&]() {
+            output.flush();
+            finish(result);
+            return result;
+        };
 
         for (size_t generated = 0; generated < max_new; ++generated) {
-            TokenId id = sampler_(logits, history_);
+            TokenId id = sampler_(logits);
             ++result.delta.generated_tokens;
             if (tokenizer_.is_eog(int32_t(id))) {
                 if (history_.size() < C::CTX) {
@@ -54,28 +60,25 @@ public:
                     (void)accept(result.delta);
                 }
                 result.truncated = false;
-                finish(result);
-                return result;
+                return complete();
             }
-            sink(tokenizer_.decode1(int32_t(id)));
+            output.push(tokenizer_.decode1(int32_t(id)));
             if (history_.size() == C::CTX) {
                 result.truncated = true;
-                finish(result);
-                return result;
+                return complete();
             }
             history_.push_back(id);
             logits = accept(result.delta);
         }
         result.truncated = true;
-        finish(result);
-        return result;
+        return complete();
     }
 
 private:
     static double seconds_since(std::chrono::steady_clock::time_point start) { return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(); }
-    Vec<C::V> accept(ChatStats& delta) {
+    Logits<C::V> accept(ChatStats& delta) {
         const auto start = std::chrono::steady_clock::now();
-        Vec<C::V> logits = evaluate(model_, history_, prefix_memo_);
+        Logits<C::V> logits = evaluate(model_, history_, prefix_memo_);
         delta.decode_seconds += seconds_since(start);
         return logits;
     }
@@ -98,21 +101,24 @@ private:
     bool first_ = true;
 };
 
-static std::unique_ptr<ChatModel> make_gemma4_12b_chat_model(const GGUF& gguf, std::string system, SamplerCfg sampling) {
+// The factories return the concrete adapter. Its type names a lambda's closure
+// type, so it is only ever spelled `auto` — which is exactly what the caller
+// wants: it constructs the adapter in place and hands it straight to the REPL.
+static auto make_gemma4_12b_chat_model(const GGUF& gguf, std::string system, SamplerCfg sampling) {
     auto render = [](std::string_view user, bool first, std::string_view system) {
         const GemmaChatTurn turn = render_gemma_chat_turn(user, first, system, /*has_image=*/false);
         return turn.before_image + turn.after_image;
     };
-    return std::make_unique<TextChatModel<Gemma4_12BTextConfig, Gemma4_12BModel, decltype(render)>>(gemma4_loader::load_12b_text(gguf), gguf, "Gemma 4 12B D=3840 L=48 (40 sliding + 8 global unified-K/V, text only)", std::move(system), sampling, render);
+    return TextChatModel<Gemma4_12BTextConfig, Gemma4_12BModel, decltype(render), GemmaChannelFormatter>(gemma4_loader::load_12b_text(gguf), gguf, "Gemma 4 12B D=3840 L=48 (40 sliding + 8 global unified-K/V, text only)", std::move(system), sampling, render);
 }
 
 template <class C>
-static std::unique_ptr<ChatModel> make_qwen35_chat_model(const GGUF& gguf, std::string system, SamplerCfg sampling, const char* name) {
+static auto make_qwen35_chat_model(const GGUF& gguf, std::string system, SamplerCfg sampling, const char* name) {
     auto render = [](std::string_view user, bool first, std::string_view system) { return render_chatml_turn(user, first, system); };
-    return std::make_unique<TextChatModel<C, Qwen35Model<C>, decltype(render)>>(qwen35_loader::load<C>(gguf), gguf, std::string("Qwen 3.5 ") + name + " D=" + std::to_string(C::D) + " L=" + std::to_string(C::L) + " (" + std::to_string(C::L - C::L / C::FULL_ATTENTION_INTERVAL) + " gated-deltanet + " + std::to_string(C::L / C::FULL_ATTENTION_INTERVAL) + " attention)", std::move(system), sampling, render);
+    return TextChatModel<C, Qwen35Model<C>, decltype(render), PlainChatOutput>(qwen35_loader::load<C>(gguf), gguf, std::string("Qwen 3.5 ") + name + " D=" + std::to_string(C::D) + " L=" + std::to_string(C::L) + " (" + std::to_string(C::L - C::L / C::FULL_ATTENTION_INTERVAL) + " gated-deltanet + " + std::to_string(C::L / C::FULL_ATTENTION_INTERVAL) + " attention)", std::move(system), sampling, render);
 }
 
-class Gemma4E4BChatModel final : public ChatModel {
+class Gemma4E4BChatModel {
     using C = Gemma4E4BTextConfig;
 
 public:
@@ -126,21 +132,20 @@ public:
         }
     }
 
-    std::string description() const override { return std::string("Gemma 4 E4B D=2560 L=42 V=262144") + (vision_ ? " + vision" : " (text only)"); }
-    bool supports_images() const override { return bool(vision_); }
-    size_t context_used() const override { return complete_input_ ? complete_input_->tokens() : 0; }
-    size_t context_limit() const override { return C::CTX; }
-    const ChatStats& stats() const override { return stats_; }
+    std::string description() const { return std::string("Gemma 4 E4B D=2560 L=42 V=262144") + (vision_ ? " + vision" : " (text only)"); }
+    bool supports_images() const { return bool(vision_); }
+    size_t context_used() const { return complete_input_ ? complete_input_->tokens() : 0; }
+    size_t context_limit() const { return C::CTX; }
+    const ChatStats& stats() const { return stats_; }
 
-    void reset() override {
+    void reset() {
         prefix_memo_.clear();
         complete_input_.reset();
-        history_.clear();
         stats_ = {};
         first_ = true;
     }
 
-    ChatTurnResult respond(std::string_view user, const RGBImage* image, size_t max_new, const ChatTokenSink& sink) override {
+    ChatTurnResult respond(std::string_view user, const RGBImage* image, size_t max_new, const ChatTokenSink& sink) {
         if (image && !vision_) throw std::invalid_argument("image supplied without --mmproj");
 
         const GemmaChatTurn rendered = render_gemma_chat_turn(user, first_, system_, image != nullptr);
@@ -165,11 +170,9 @@ public:
             for (auto& segment : segments) complete_input_->append(std::move(segment));
         }
         first_ = false;
-        for (int32_t id : before_ids) history_.push_back(TokenId{id});
-        for (int32_t id : after_ids) history_.push_back(TokenId{id});
 
         const auto prefill_start = std::chrono::steady_clock::now();
-        Vec<C::V> logits = evaluate(model_, *complete_input_, prefix_memo_);
+        Logits<C::V> logits = evaluate(model_, *complete_input_, prefix_memo_);
         result.delta.prefill_seconds = seconds_since(prefill_start);
         result.delta.prefill_tokens = new_tokens;
         GemmaChannelFormatter output(sink);
@@ -180,13 +183,10 @@ public:
         };
 
         for (size_t generated = 0; generated < max_new; ++generated) {
-            TokenId id = sampler_(logits, history_);
+            TokenId id = sampler_(logits);
             ++result.delta.generated_tokens;
             if (tokenizer_.is_eog(int32_t(id))) {
-                if (context_used() < C::CTX) {
-                    history_.push_back(id);
-                    (void)accept(id, result.delta);
-                }
+                if (context_used() < C::CTX) (void)accept(id, result.delta);
                 result.truncated = false;
                 return complete();
             }
@@ -197,7 +197,6 @@ public:
                 result.truncated = true;
                 return complete();
             }
-            history_.push_back(id);
             logits = accept(id, result.delta);
 
             if (generated + 1 == max_new) {
@@ -224,18 +223,17 @@ private:
         }
         return EmbeddingSegment<C::D>(std::move(embeddings), std::move(identities));
     }
-    Vec<C::V> accept(TokenId id, ChatStats& delta) {
+    Logits<C::V> accept(TokenId id, ChatStats& delta) {
         if (!complete_input_) throw std::logic_error("Gemma chat has no complete input");
         std::vector<int32_t> token{int32_t(id)};
         complete_input_->append(text_segment(token));
         const auto start = std::chrono::steady_clock::now();
-        Vec<C::V> logits = evaluate(model_, *complete_input_, prefix_memo_);
+        Logits<C::V> logits = evaluate(model_, *complete_input_, prefix_memo_);
         delta.decode_seconds += seconds_since(start);
         return logits;
     }
     void close_truncated_turn(ChatStats& delta) {
         if (context_used() == C::CTX) return;
-        history_.push_back(turn_end_);
         (void)accept(turn_end_, delta);
     }
     void finish(ChatTurnResult& result) {
@@ -253,7 +251,6 @@ private:
     Sampler<C::V> sampler_;
     std::unique_ptr<Gemma4E4BVisionEncoder> vision_;
     std::string system_;
-    std::vector<TokenId> history_;
     ChatStats stats_;
     TokenId turn_end_{0};
     bool first_ = true;

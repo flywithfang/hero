@@ -10,6 +10,7 @@
 // So: no layer loop, no "prepare" step, no output head, no idea whether a
 // model has layers at all.
 #pragma once
+#include "logits.hpp"
 #include "multimodal.hpp"
 #include <concepts>
 #include <functional>
@@ -49,7 +50,7 @@ template <class TokenIO, size_t D, size_t V>
 concept TokenInputOutput = requires(const TokenIO& token_io, TokenId id, std::span<const TokenId> ids, VecView<D> hidden) {
     { token_io.token(id) } -> std::same_as<Vec<D>>;
     { token_io.tokens(ids) } -> std::same_as<Matrix<D>>;
-    { token_io.logits(hidden) } -> std::same_as<Vec<V>>;
+    { token_io.logits(hidden) } -> std::same_as<Logits<V>>;
 };
 
 // Shared text frontend: model families differ in the embedding operation, not
@@ -70,7 +71,7 @@ EmbeddedSequence<D> embed_text_tokens(std::span<const TokenId> ids, size_t first
 // turn tokens into embeddings, and run a suffix to logits:
 //
 //     embed(token_ids, first_position) -> EmbeddedSequence<D>
-//     forward(state, input)            -> Vec<V>
+//     forward(state, input)            -> Logits<V>
 //
 // How a model runs — how many layers, in what order, what it precomputes once
 // per pass, whether it even HAS layers — is its own business and appears
@@ -86,7 +87,7 @@ concept TransformerModel = requires(const M& model, typename M::PrefixState& pre
     typename M::PrefixState;
     { prefix_state.tokens() } -> std::convertible_to<size_t>;
     { model.embed(token_ids, size_t{}) } -> std::same_as<EmbeddedSequence<M::D>>;
-    { model.forward(prefix_state, input) } -> std::same_as<Vec<M::V>>;
+    { model.forward(prefix_state, input) } -> std::same_as<Logits<M::V>>;
 };
 
 // A suffix must begin exactly where the carried state ends. This is the cache
@@ -94,7 +95,7 @@ concept TransformerModel = requires(const M& model, typename M::PrefixState& pre
 // rows it has not seen yet.
 template <class Model>
     requires TransformerModel<Model>
-Vec<Model::V> run_suffix(const Model& model, typename Model::PrefixState& prefix_state, const EmbeddedSequence<Model::D>& input) {
+Logits<Model::V> run_suffix(const Model& model, typename Model::PrefixState& prefix_state, const EmbeddedSequence<Model::D>& input) {
     if (input.tokens() == 0) throw std::invalid_argument("transformer: empty input");
     if (input.position(0).i != prefix_state.tokens()) throw std::invalid_argument("transformer: cache/input prefix mismatch");
     return model.forward(prefix_state, input);
@@ -138,16 +139,16 @@ private:
     std::vector<TokenId> token_prefix_;
     uint64_t embedded_sequence_id_ = 0;
     size_t cached_tokens_ = 0;
-    std::optional<Vec<Model::V>> last_logits_;
+    std::optional<Logits<Model::V>> last_logits_;
     size_t reused_tokens_ = 0;
     size_t computed_tokens_ = 0;
 
     template <class M>
         requires TransformerModel<M>
-    friend Vec<M::V> evaluate(const M&, std::span<const TokenId>, PrefixCache<M>&);
+    friend Logits<M::V> evaluate(const M&, std::span<const TokenId>, PrefixCache<M>&);
     template <class M>
         requires TransformerModel<M>
-    friend Vec<M::V> evaluate(const M&, const EmbeddedSequence<M::D>&, PrefixCache<M>&);
+    friend Logits<M::V> evaluate(const M&, const EmbeddedSequence<M::D>&, PrefixCache<M>&);
 };
 
 // evaluate(model, complete_input, memo) — the public entry point, and the only
@@ -157,7 +158,7 @@ private:
 // function here instead of a copy inside each model.
 template <class Model>
     requires TransformerModel<Model>
-Vec<Model::V> evaluate(const Model& model, std::span<const TokenId> complete_input, PrefixCache<Model>& memo) {
+Logits<Model::V> evaluate(const Model& model, std::span<const TokenId> complete_input, PrefixCache<Model>& memo) {
     if (complete_input.empty()) throw std::invalid_argument("evaluate: empty input");
     if (complete_input.size() > Model::CTX) throw std::length_error("evaluate: context exhausted");
 
@@ -169,16 +170,16 @@ Vec<Model::V> evaluate(const Model& model, std::span<const TokenId> complete_inp
     memo.computed_tokens_ = complete_input.size() - reused;
     if (reused == complete_input.size()) {
         if (!memo.last_logits_) throw std::logic_error("evaluate: prefix cache has no logits");
-        return copy(VecView<Model::V>(*memo.last_logits_));
+        return memo.last_logits_->copy();
     }
 
     try {
         EmbeddedSequence<Model::D> suffix = model.embed(complete_input.subspan(reused), reused);
-        Vec<Model::V> logits = run_suffix(model, memo.prefix_state_, suffix);
+        Logits<Model::V> logits = run_suffix(model, memo.prefix_state_, suffix);
         memo.input_kind_ = PrefixCache<Model>::InputKind::TokenIds;
         memo.token_prefix_.assign(complete_input.begin(), complete_input.end());
         memo.cached_tokens_ = complete_input.size();
-        memo.last_logits_ = copy(VecView<Model::V>(logits));
+        memo.last_logits_ = logits.copy();
         return logits;
     } catch (...) {
         memo.clear();
@@ -190,7 +191,7 @@ Vec<Model::V> evaluate(const Model& model, std::span<const TokenId> complete_inp
 // (text + image + audio segments), so there is nothing to tokenize.
 template <class Model>
     requires TransformerModel<Model>
-Vec<Model::V> evaluate(const Model& model, const EmbeddedSequence<Model::D>& complete_input, PrefixCache<Model>& memo) {
+Logits<Model::V> evaluate(const Model& model, const EmbeddedSequence<Model::D>& complete_input, PrefixCache<Model>& memo) {
     if (complete_input.tokens() == 0) throw std::invalid_argument("evaluate: empty input");
     if (complete_input.first_position() != 0) throw std::invalid_argument("evaluate: expected a complete prefix at position zero");
     if (complete_input.tokens() > Model::CTX) throw std::length_error("evaluate: context exhausted");
@@ -203,11 +204,11 @@ Vec<Model::V> evaluate(const Model& model, const EmbeddedSequence<Model::D>& com
     memo.computed_tokens_ = complete_input.tokens() - reused;
     if (reused == complete_input.tokens()) {
         if (!memo.last_logits_) throw std::logic_error("evaluate: prefix cache has no logits");
-        return copy(VecView<Model::V>(*memo.last_logits_));
+        return memo.last_logits_->copy();
     }
 
     try {
-        Vec<Model::V> logits = [&] {
+        Logits<Model::V> logits = [&] {
             if (reused == 0) return run_suffix(model, memo.prefix_state_, complete_input);
             EmbeddedSequence<Model::D> suffix = complete_input.suffix(reused);
             return run_suffix(model, memo.prefix_state_, suffix);
@@ -215,7 +216,7 @@ Vec<Model::V> evaluate(const Model& model, const EmbeddedSequence<Model::D>& com
         memo.input_kind_ = PrefixCache<Model>::InputKind::EmbeddedSequence;
         memo.embedded_sequence_id_ = complete_input.sequence_id();
         memo.cached_tokens_ = complete_input.tokens();
-        memo.last_logits_ = copy(VecView<Model::V>(logits));
+        memo.last_logits_ = logits.copy();
         return logits;
     } catch (...) {
         memo.clear();

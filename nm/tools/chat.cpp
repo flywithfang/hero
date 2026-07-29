@@ -1,6 +1,7 @@
 // chat.cpp — model-neutral interactive chat over GGUF models.
 //
-// Model selection is metadata-driven. The REPL speaks only to ChatModel; each
+// Model selection is metadata-driven: one switch picks the adapter, and the
+// REPL is instantiated for that concrete type — no base class, no vtable. Each
 // family adapter owns its template, prefix memoization, sampling, and any
 // modality encoder.
 #include "../src/chat_models.hpp"
@@ -28,27 +29,6 @@ static std::optional<ChatModelKind> requested_kind(const Opts& options, const GG
     return std::nullopt;
 }
 
-static std::unique_ptr<ChatModel> load_chat_model(const GGUF& gguf, const Opts& options) {
-    const auto kind = requested_kind(options, gguf);
-    if (!kind) {
-        const ChatModelIdentity identity = chat_model_identity(gguf);
-        throw std::runtime_error("no compiled chat adapter matches architecture='" + identity.architecture + "' D=" + std::to_string(identity.embedding_length) + " L=" + std::to_string(identity.block_count));
-    }
-
-    if (*kind != ChatModelKind::Gemma4E4B && !options.mmproj.empty()) throw std::invalid_argument("--mmproj is only supported by a multimodal model adapter");
-
-    switch (*kind) {
-        case ChatModelKind::Gemma4E4B:
-            return std::make_unique<Gemma4E4BChatModel>(gguf, options.mmproj, options.system.value_or(""), options.sampling);
-        case ChatModelKind::Gemma4_12B:
-            return make_gemma4_12b_chat_model(gguf, options.system.value_or(""), options.sampling);
-        case ChatModelKind::Qwen35_4B:
-            return make_qwen35_chat_model<Qwen35_4BConfig>(gguf, options.system.value_or(""), options.sampling, "4B");
-        case ChatModelKind::Qwen35_9B:
-            return make_qwen35_chat_model<Qwen35_9BConfig>(gguf, options.system.value_or(""), options.sampling, "9B");
-    }
-    throw std::logic_error("unreachable chat model kind");
-}
 
 static void print_help(bool images) {
     std::printf(
@@ -62,7 +42,8 @@ static void print_help(bool images) {
             "  /image clear remove the pending image\n");
 }
 
-static int chat_loop(ChatModel& model, const Opts& options) {
+template <ChatModelInterface Model>
+static int chat_loop(Model& model, const Opts& options) {
     std::printf("\n=== nm chat — %s ===\n", model.description().c_str());
     std::printf("commands: /reset  /stats  /help  /quit%s   (%s sampling)\n\n", model.supports_images() ? "  /image PATH" : "", options.sampling.temp <= 0 ? "greedy" : "stochastic");
 
@@ -142,11 +123,51 @@ static int chat_loop(ChatModel& model, const Opts& options) {
     return 0;
 }
 
+template <ChatModelInterface Model>
+static int start_chat(Model& model, const Opts& options) {
+    if (!options.initial_image.empty() && !model.supports_images()) throw std::invalid_argument("--image requires a Gemma model with --mmproj");
+    return chat_loop(model, options);
+}
+
+// The one dispatch: metadata picks a case, the case names a concrete adapter,
+// and each case instantiates the REPL for that type. The adapter is a named
+// local, so its address is stable for as long as it runs — which matters
+// because its PrefixCache identifies the model it memoized BY ADDRESS.
+static int load_and_chat(const GGUF& gguf, const Opts& options) {
+    const auto kind = requested_kind(options, gguf);
+    if (!kind) {
+        const ChatModelIdentity identity = chat_model_identity(gguf);
+        throw std::runtime_error("no compiled chat adapter matches architecture='" + identity.architecture + "' D=" + std::to_string(identity.embedding_length) + " L=" + std::to_string(identity.block_count));
+    }
+
+    if (*kind != ChatModelKind::Gemma4E4B && !options.mmproj.empty()) throw std::invalid_argument("--mmproj is only supported by a multimodal model adapter");
+
+    switch (*kind) {
+        case ChatModelKind::Gemma4E4B: {
+            Gemma4E4BChatModel model(gguf, options.mmproj, options.system.value_or(""), options.sampling);
+            return start_chat(model, options);
+        }
+        case ChatModelKind::Gemma4_12B: {
+            auto model = make_gemma4_12b_chat_model(gguf, options.system.value_or(""), options.sampling);
+            return start_chat(model, options);
+        }
+        case ChatModelKind::Qwen35_4B: {
+            auto model = make_qwen35_chat_model<Qwen35_4BConfig>(gguf, options.system.value_or(""), options.sampling, "4B");
+            return start_chat(model, options);
+        }
+        case ChatModelKind::Qwen35_9B: {
+            auto model = make_qwen35_chat_model<Qwen35_9BConfig>(gguf, options.system.value_or(""), options.sampling, "9B");
+            return start_chat(model, options);
+        }
+    }
+    throw std::logic_error("unreachable chat model kind");
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
                      "usage: %s model.gguf [--mmproj FILE] [--image FILE] [--system S]\n"
-                     "          [--temp T] [--top-k K] [--top-p P] [--rep-penalty R]\n"
+                     "          [--temp T] [--top-k K] [--top-p P]\n"
                      "          [--seed S] [--max N] [--arch e4b|12b|qwen35-4b|qwen35-9b]\n",
                      argv[0]);
         return 2;
@@ -173,8 +194,6 @@ int main(int argc, char** argv) {
                 options.sampling.top_k = std::stoi(next());
             else if (argument == "--top-p")
                 options.sampling.top_p = std::stof(next());
-            else if (argument == "--rep-penalty")
-                options.sampling.rep_penalty = std::stof(next());
             else if (argument == "--seed")
                 options.sampling.seed = std::stoull(next());
             else if (argument == "--max") {
@@ -194,9 +213,7 @@ int main(int argc, char** argv) {
         GGUF gguf(options.model);
         const ChatModelIdentity identity = chat_model_identity(gguf);
         std::fprintf(stderr, "loading %s D=%zu L=%zu (%zu tensors, %zu threads)...\n", identity.architecture.c_str(), identity.embedding_length, identity.block_count, gguf.tensors().size(), nm_num_threads());
-        std::unique_ptr<ChatModel> model = load_chat_model(gguf, options);
-        if (!options.initial_image.empty() && !model->supports_images()) throw std::invalid_argument("--image requires a Gemma model with --mmproj");
-        return chat_loop(*model, options);
+        return load_and_chat(gguf, options);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "error: %s\n", error.what());
         return 1;

@@ -44,14 +44,8 @@ static int check(const GGUF& gguf, const char* name, const char* prompt, size_t 
     const double prefill = std::chrono::duration<double>(std::chrono::steady_clock::now() - prefill_start).count();
     std::printf("prefill: %.3fs (%zu tokens, %.2f tok/s)\n", prefill, ids.size(), double(ids.size()) / prefill);
 
-    std::vector<size_t> top(C::V);
-    std::iota(top.begin(), top.end(), 0);
-    std::partial_sort(top.begin(), top.begin() + 5, top.end(), [&](size_t a, size_t b) { return logits[a] > logits[b]; });
-    const Scalar max_logit = logits[top[0]];
-    double exp_sum = 0;
-    for (size_t v = 0; v < C::V; ++v) exp_sum += std::exp(double(logits[v] - max_logit));
-    const double log_z = double(max_logit) + std::log(exp_sum);
-    for (size_t i = 0; i < 5; ++i) std::printf("top%zu: id=%zu logprob=%.9f piece=%s\n", i + 1, top[i], double(logits[top[i]]) - log_z, tokenizer.decode1(int32_t(top[i])).c_str());
+    const std::vector<ScoredToken> top = logits.top(5);
+    for (size_t i = 0; i < top.size(); ++i) std::printf("top%zu: id=%d logprob=%.9f piece=%s\n", i + 1, int32_t(top[i].id), top[i].logprob, tokenizer.decode1(int32_t(top[i].id)).c_str());
 
     if (generate_count > 1) {
         const auto decode_start = std::chrono::steady_clock::now();
@@ -59,14 +53,12 @@ static int check(const GGUF& gguf, const char* name, const char* prompt, size_t 
         size_t produced = 0;
         std::printf("generated:");
         for (size_t i = 0; i < generate_count; ++i) {
-            size_t token = 0;
-            for (size_t v = 1; v < C::V; ++v)
-                if (logits[v] > logits[token]) token = v;
-            std::printf(" %zu", token);
+            const TokenId token = logits.argmax();
+            std::printf(" %d", int32_t(token));
             ++produced;
             text += tokenizer.decode1(int32_t(token));
             if (tokenizer.is_eog(int32_t(token)) || i + 1 == generate_count) break;
-            tokens.push_back(TokenId{int32_t(token)});
+            tokens.push_back(token);
             logits = evaluate(model, tokens, memo);
         }
         const double decode = std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_start).count();

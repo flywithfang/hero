@@ -6,7 +6,7 @@
 //
 //   Mat<R,C>   row-major, y = x·W  (In dimension outer).      concept default.
 //   MatT<In,Out> row-major with row = one OUTPUT's weights (length In),
-//                contiguous per output. y = matvec_T(x,W). This is EXACTLY
+//                contiguous per output. y = W.matvec(x). This is EXACTLY
 //                how ggml/llama.cpp store a 2-D weight (ne0 = In contiguous),
 //                so a GGUF fp32 tensor loads zero-copy into a MatT view over
 //                the mmap, and each output is a single contiguous dot product.
@@ -560,6 +560,14 @@ struct MatT {
     std::shared_ptr<Scalar[]> own;  // optional backing; null => view
     VecView<In> row(size_t o) const { return VecView<In>(p + o * In); }
 
+    // y = W x: Out independent dot products of length In, y[o] = dot(x, row(o)).
+    // [BANDWIDTH] streams the whole weight once; [COMPUTE] In*Out MACs.
+    Vec<Out> matvec(VecView<In> x) const {
+        Vec<Out> y;
+        par_for(Out, [&](size_t o) { y[o] = dot(x, row(o)); });
+        return y;
+    }
+
     static MatT owning() {  // allocate [Out*In], zeroed
         MatT m;
         m.own = std::shared_ptr<Scalar[]>(new Scalar[In * Out]());
@@ -569,11 +577,3 @@ struct MatT {
     Scalar* raw() { return const_cast<Scalar*>(p); }
 };
 
-// matvec_T: y[o] = dot(x, W.row(o)), Out independent dot products of length In.
-// [BANDWIDTH] streams the whole weight once; [COMPUTE] In*Out MACs.
-template <size_t In, size_t Out>
-Vec<Out> matvec_T(VecView<In> x, const MatT<In, Out>& W) {
-    Vec<Out> y;
-    par_for(Out, [&](size_t o) { y[o] = dot(x, W.row(o)); });
-    return y;
-}

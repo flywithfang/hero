@@ -231,14 +231,14 @@ int main() {
         std::vector<TokenId> input{TokenId{1}, TokenId{4}, TokenId{2}, TokenId{7}, TokenId{0}};
 
         PrefixCache<Qwen35Model<ToyQwen>> scratch;
-        const Vec<ToyQwen::V> whole = evaluate(model, input, scratch);
+        const Logits<ToyQwen::V> whole = evaluate(model, input, scratch);
 
         // Incremental decode must equal one-shot prefill. This is the property
         // the recurrent mixer could most easily break: its state is sequential,
         // so an off-by-one in the conv history or a missed decay shows up here
         // and nowhere else.
         PrefixCache<Qwen35Model<ToyQwen>> incremental;
-        Vec<ToyQwen::V> stepwise;
+        Logits<ToyQwen::V> stepwise;
         for (size_t n = 1; n <= input.size(); ++n) stepwise = evaluate(model, std::span<const TokenId>(input.data(), n), incremental);
 
         Scalar worst = 0;

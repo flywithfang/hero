@@ -1,5 +1,5 @@
 // quant.hpp — GGUF tensor element types, block formats, dequant kernels, and
-// the unified Weight<In,Out> that dispatches matvec_T across storage formats.
+// the unified Weight<In,Out> that dispatches matvec across storage formats.
 //
 // Block layouts and dequant math are copied VERBATIM from ggml (ggml-common.h,
 // ggml-quants.c) — the bit-unpacking is fiddly and any deviation is silent

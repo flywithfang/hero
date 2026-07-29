@@ -64,7 +64,7 @@ public:
             return X;
         });
     }
-    Vec<V> forward(PrefixState& prefix_state, const EmbeddedSequence<D>& input) const {
+    Logits<V> forward(PrefixState& prefix_state, const EmbeddedSequence<D>& input) const {
         ResidualStream<D> residual(input);
         Vec<D> sum = copy(VecView<D>(prefix_state.prefix_sum));
         for (size_t row = 0; row < residual.tokens(); ++row) {
@@ -75,7 +75,7 @@ public:
         prefix_state.advance(input.tokens());
 
         const VecView<D> last = residual.token(residual.tokens() - 1);
-        Vec<V> logits;
+        Logits<V> logits;
         logits[0] = last[0];
         logits[1] = last[1];
         logits[2] = last[0] + last[1];
@@ -198,39 +198,39 @@ int main() {
             PrefixCache<ToyModel> empty;
             return evaluate(model, input, empty);
         };
-        const auto same = [](const Vec<3>& a, const Vec<3>& b) {
+        const auto same = [](const Logits<3>& a, const Logits<3>& b) {
             for (size_t i = 0; i < 3; ++i)
                 if (a[i] != b[i]) return false;
             return true;
         };
 
-        const Vec<3> pure_prefix = from_scratch(X);
-        const Vec<3> cached_prefix = evaluate(model, X, memo);
+        const Logits<3> pure_prefix = from_scratch(X);
+        const Logits<3> cached_prefix = evaluate(model, X, memo);
         bool equal = same(pure_prefix, cached_prefix);
         equal = equal && memo.reused_tokens() == 0 && memo.computed_tokens() == 2;
 
         X.push_back(TokenId{3});
-        const Vec<3> pure_extension = from_scratch(X);
-        const Vec<3> cached_extension = evaluate(model, X, memo);
+        const Logits<3> pure_extension = from_scratch(X);
+        const Logits<3> cached_extension = evaluate(model, X, memo);
         equal = equal && same(pure_extension, cached_extension) && memo.reused_tokens() == 2 && memo.computed_tokens() == 1;
 
-        const Vec<3> repeated = evaluate(model, X, memo);
+        const Logits<3> repeated = evaluate(model, X, memo);
         equal = equal && same(repeated, pure_extension) && memo.reused_tokens() == 3 && memo.computed_tokens() == 0;
 
         const std::vector<TokenId> divergent{TokenId{1}, TokenId{9}};
-        const Vec<3> pure_divergent = from_scratch(divergent);
-        const Vec<3> cached_divergent = evaluate(model, divergent, memo);
+        const Logits<3> pure_divergent = from_scratch(divergent);
+        const Logits<3> cached_divergent = evaluate(model, divergent, memo);
         equal = equal && same(cached_divergent, pure_divergent) && memo.reused_tokens() == 0 && memo.computed_tokens() == 2;
 
         auto embedded = model.embed(std::span<const TokenId>(divergent), 0);
         PrefixCache<ToyModel> embedded_memo;
-        const Vec<3> embedded_prefix = evaluate(model, embedded, embedded_memo);
+        const Logits<3> embedded_prefix = evaluate(model, embedded, embedded_memo);
         Matrix<2> next_embedding(1);
         next_embedding.row_mut(0)[0] = 2.5f;
         next_embedding.row_mut(0)[1] = 3.f;
         embedded.append(EmbeddingSegment<2>(std::move(next_embedding), std::vector<TokenId>{TokenId{5}}));
-        const Vec<3> pure_embedded_extension = embedded_from_scratch(embedded);
-        const Vec<3> cached_embedded_extension = evaluate(model, embedded, embedded_memo);
+        const Logits<3> pure_embedded_extension = embedded_from_scratch(embedded);
+        const Logits<3> cached_embedded_extension = evaluate(model, embedded, embedded_memo);
         equal = equal && same(embedded_prefix, pure_divergent) && same(cached_embedded_extension, pure_embedded_extension) && embedded_memo.reused_tokens() == 2 && embedded_memo.computed_tokens() == 1;
 
         check(equal, "pure, extended, repeated, and divergent evaluations agree");

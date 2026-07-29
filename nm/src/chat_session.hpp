@@ -2,8 +2,10 @@
 #pragma once
 #include "gguf.hpp"
 #include "multimodal.hpp"
+#include <concepts>
 #include <functional>
 #include <optional>
+#include <string>
 #include <string_view>
 
 // One entry per compiled adapter. A checkpoint is matched on the architecture
@@ -91,9 +93,26 @@ struct ChatTurnResult {
 
 using ChatTokenSink = std::function<void(std::string_view)>;
 
+// The family's text protocol coming OUT, the counterpart to the render lambda
+// that supplies the protocol going in. An adapter is given the type; it builds
+// one per turn around the terminal's sink, pushes every decoded piece through
+// it, and flushes at the end of the turn.
+//
+// For families whose token pieces are already the final text.
+class PlainChatOutput {
+public:
+    explicit PlainChatOutput(ChatTokenSink sink) : sink_(std::move(sink)) {}
+
+    void push(std::string_view piece) { sink_(piece); }
+    void flush() {}
+
+private:
+    ChatTokenSink sink_;
+};
+
 // Gemma 4 may emit a small channel protocol before reasoning/final text:
-// `<|channel>thought\n...`. Keep that protocol model-specific while presenting
-// readable streaming output to the shared terminal frontend.
+// `<|channel>thought\n...`. This is FAMILY anatomy — every Gemma 4 size emits
+// it — so both the E4B and 12B adapters format with it.
 class GemmaChannelFormatter {
 public:
     explicit GemmaChannelFormatter(ChatTokenSink sink) : sink_(std::move(sink)) {}
@@ -138,14 +157,23 @@ private:
     bool reading_channel_ = false;
 };
 
-class ChatModel {
-public:
-    virtual ~ChatModel() = default;
-    virtual std::string description() const = 0;
-    virtual bool supports_images() const = 0;
-    virtual size_t context_used() const = 0;
-    virtual size_t context_limit() const = 0;
-    virtual const ChatStats& stats() const = 0;
-    virtual void reset() = 0;
-    virtual ChatTurnResult respond(std::string_view user, const RGBImage* image, size_t max_new, const ChatTokenSink& sink) = 0;
+// What a CHAT ADAPTER is. An adapter owns its chat template, prefix
+// memoization, sampling, and any modality encoder; the REPL calls these seven
+// operations by name and knows nothing else about it.
+//
+// No adapter inherits anything. WHICH adapter runs is decided once, by a switch
+// on the checkpoint's metadata, so the variance is in which instantiation the
+// dispatch picks — not in a vtable consulted on every call. Like
+// TransformerModel and TokenInputOutput, this concept generates no code: it
+// exists so a mistake in a new adapter reports itself here rather than deep
+// inside the REPL.
+template <class M>
+concept ChatModelInterface = requires(M& model, const M& adapter, std::string_view user, const RGBImage* image, size_t max_new, const ChatTokenSink& sink) {
+    { adapter.description() } -> std::same_as<std::string>;
+    { adapter.supports_images() } -> std::same_as<bool>;
+    { adapter.context_used() } -> std::same_as<size_t>;
+    { adapter.context_limit() } -> std::same_as<size_t>;
+    { adapter.stats() } -> std::same_as<const ChatStats&>;
+    { model.reset() } -> std::same_as<void>;
+    { model.respond(user, image, max_new, sink) } -> std::same_as<ChatTurnResult>;
 };

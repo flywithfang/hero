@@ -4,7 +4,7 @@
 // REPL is instantiated for that concrete type — no base class, no vtable. Each
 // family adapter owns its template, prefix memoization, sampling, and any
 // modality encoder.
-#include "../src/chat_models.hpp"
+#include "chat_models.hpp"
 #include "../src/image_io.hpp"
 #include <cstdio>
 #include <iostream>
@@ -144,7 +144,7 @@ static int load_and_chat(const GGUF& gguf, const Opts& options) {
 
     switch (*kind) {
         case ChatModelKind::Gemma4E4B: {
-            Gemma4E4BChatModel model(gguf, options.mmproj, options.system.value_or(""), options.sampling);
+            auto model = make_gemma4_e4b_chat_model(gguf, options.mmproj, options.system.value_or(""), options.sampling);
             return start_chat(model, options);
         }
         case ChatModelKind::Gemma4_12B: {

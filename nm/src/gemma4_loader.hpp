@@ -105,7 +105,7 @@ GemmaE4BSharedLayer<Dh> load_e4b_shared_layer(const GGUF& gguf, size_t layer) {
 inline Gemma4E4BModel load_e4b_text(const GGUF& gguf) {
     validate_e4b_text_metadata(gguf);
 
-    GemmaTokenIO<C::D, C::V> token_io(tensor_loader::load_weight<C::D, C::V>(gguf, "token_embd.weight"), std::sqrt(Scalar(C::D)));
+    auto embedding = tensor_loader::load_weight<C::D, C::V>(gguf, "token_embd.weight");
 
     constexpr size_t PackedPLE = C::PLE * C::L;
     GemmaPerLayerInputs<C::D, C::PLE, C::L, C::V> ple(tensor_loader::load_weight<PackedPLE, C::V>(gguf, "per_layer_token_embd.weight"), Linear<C::D, PackedPLE>(tensor_loader::load_weight<C::D, PackedPLE>(gguf, "per_layer_model_proj.weight")), PerHeadNorm<C::L, C::PLE, RMSNorm<C::PLE>>(RMSNorm<C::PLE>(tensor_loader::load_vector<C::PLE>(gguf, "per_layer_proj_norm.weight"), C::RMS_EPS)), std::sqrt(Scalar(C::PLE)), 1.f / std::sqrt(Scalar(C::D)), 1.f / std::sqrt(2.f));
@@ -125,7 +125,7 @@ inline Gemma4E4BModel load_e4b_text(const GGUF& gguf) {
         else if (!full) sliding_shared.push_back(load_e4b_shared_layer<C::LOCAL_HEAD_DIM>(gguf, layer));
         else global_shared.push_back(load_e4b_shared_layer<C::GLOBAL_HEAD_DIM>(gguf, layer));
     }
-    return Gemma4E4BModel(std::move(token_io), std::move(ple), std::move(sliding), std::move(global), std::move(sliding_shared), std::move(global_shared), RMSNorm<C::D>(tensor_loader::load_vector<C::D>(gguf, "output_norm.weight"), C::RMS_EPS));
+    return Gemma4E4BModel(std::move(embedding), std::move(ple), std::move(sliding), std::move(global), std::move(sliding_shared), std::move(global_shared), RMSNorm<C::D>(tensor_loader::load_vector<C::D>(gguf, "output_norm.weight"), C::RMS_EPS));
 }
 
 // ============================ Gemma 4 12B Unified ============================
@@ -189,7 +189,7 @@ inline Gemma12BGlobalLayer load_12b_global_layer(const GGUF& gguf, size_t layer)
 inline Gemma4_12BModel load_12b_text(const GGUF& gguf) {
     validate_12b_text_metadata(gguf);
 
-    GemmaTokenIO<C12::D, C12::V> token_io(tensor_loader::load_weight<C12::D, C12::V>(gguf, "token_embd.weight"), std::sqrt(Scalar(C12::D)));
+    auto embedding = tensor_loader::load_weight<C12::D, C12::V>(gguf, "token_embd.weight");
 
     std::vector<Gemma12BSlidingLayer> sliding;
     std::vector<Gemma12BGlobalLayer> global;
@@ -199,7 +199,7 @@ inline Gemma4_12BModel load_12b_text(const GGUF& gguf) {
         else
             global.push_back(load_12b_global_layer(gguf, layer));
     }
-    return Gemma4_12BModel(std::move(token_io), std::move(sliding), std::move(global), RMSNorm<C12::D>(tensor_loader::load_vector<C12::D>(gguf, "output_norm.weight"), C12::RMS_EPS));
+    return Gemma4_12BModel(std::move(embedding), std::move(sliding), std::move(global), RMSNorm<C12::D>(tensor_loader::load_vector<C12::D>(gguf, "output_norm.weight"), C12::RMS_EPS));
 }
 
 }  // namespace gemma4_loader

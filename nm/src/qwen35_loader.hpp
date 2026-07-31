@@ -101,8 +101,9 @@ QwenRecurrentMixer<C> load_recurrent(const GGUF& gguf, size_t layer) {
     // exactly Matrix<CONV_WIDTH> with one row per channel — no transpose.
     const TensorInfo& conv_tensor = gguf.require(block(layer, "ssm_conv1d.weight"));
     tensor_loader::expect(conv_tensor.dims.size() == 2 && conv_tensor.dims[0] == C::CONV_WIDTH && conv_tensor.dims[1] == Mixer::CONV_CHANNELS, block(layer, "ssm_conv1d.weight") + " has the wrong shape");
-    Matrix<C::CONV_WIDTH> conv(Mixer::CONV_CHANNELS);
-    dequant_to_f32(conv_tensor.type, conv_tensor.data, conv.data(), C::CONV_WIDTH * Mixer::CONV_CHANNELS);
+    std::vector<Scalar> taps(Matrix<C::CONV_WIDTH>::element_count(Mixer::CONV_CHANNELS));
+    dequant_to_f32(conv_tensor.type, conv_tensor.data, taps.data(), taps.size());
+    Matrix<C::CONV_WIDTH> conv = Matrix<C::CONV_WIDTH>::from_row_major(std::move(taps));
 
     Vec<C::VALUE_HEADS> decay_scale = tensor_loader::load_vector<C::VALUE_HEADS>(gguf, block(layer, "ssm_a"));
     // Some converters store A_log and others store -exp(A_log). The sign tells
@@ -128,14 +129,12 @@ Qwen35Block<C, Mixer> load_block(const GGUF& gguf, size_t layer, Mixer mixer) {
 }
 
 template <class C>
-QwenTokenIO<C> load_token_io(const GGUF& gguf) {
-    using OutputWeight = typename C::OutputWeight;
-    auto tokens = tensor_loader::load_weight<C::D, C::V>(gguf, "token_embd.weight");
-    if constexpr (std::is_same_v<OutputWeight, std::monostate>) {
+typename C::OutputWeight load_unembedding(const GGUF& gguf) {
+    if constexpr (std::is_same_v<typename C::OutputWeight, std::monostate>) {
         expect(gguf.find("output.weight") == nullptr, "config says tied embeddings but the checkpoint has output.weight");
-        return QwenTokenIO<C>(std::move(tokens), std::monostate{});
+        return std::monostate{};
     } else {
-        return QwenTokenIO<C>(std::move(tokens), tensor_loader::load_weight<C::D, C::V>(gguf, "output.weight"));
+        return tensor_loader::load_weight<C::D, C::V>(gguf, "output.weight");
     }
 }
 
@@ -152,7 +151,7 @@ Qwen35Model<C> load(const GGUF& gguf) {
         else
             attention.push_back(load_block<C>(gguf, layer, load_attention<C>(gguf, layer)));
     }
-    return Qwen35Model<C>(load_token_io<C>(gguf), std::move(recurrent), std::move(attention), load_norm<C>(gguf, "output_norm.weight"));
+    return Qwen35Model<C>(tensor_loader::load_weight<C::D, C::V>(gguf, "token_embd.weight"), load_unembedding<C>(gguf), std::move(recurrent), std::move(attention), load_norm<C>(gguf, "output_norm.weight"));
 }
 
 }  // namespace qwen35_loader

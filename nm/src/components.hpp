@@ -28,7 +28,7 @@ public:
     }
     Matrix<Out> operator()(MatrixView<In> x) const {
         Matrix<Out> y = weight_.matmul(x);
-        if (has_bias_) add_bias_in_place(y.mutable_view(), VecView<Out>(bias_));
+        if (has_bias_) add_bias_in_place(y, VecView<Out>(bias_));
         return y;
     }
 
@@ -107,7 +107,7 @@ public:
     }
     Matrix<D> operator()(MatrixView<D> x) const {
         Matrix<FF> gate = gate_(x);
-        silu_in_place(gate.mutable_view());
+        silu_in_place(gate);
         Matrix<FF> up = up_(x);
         return down_(hadamard(gate.view(), up.view()));
     }
@@ -132,7 +132,7 @@ public:
     }
     Matrix<D> operator()(MatrixView<D> x) const {
         Matrix<FF> gate = gate_(x);
-        gelu_in_place(gate.mutable_view());
+        gelu_in_place(gate);
         Matrix<FF> up = up_(x);
         return down_(hadamard(gate.view(), up.view()));
     }

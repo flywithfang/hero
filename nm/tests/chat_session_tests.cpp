@@ -1,4 +1,4 @@
-#include "../src/chat_session.hpp"
+#include "../tools/chat_session.hpp"
 #include "../src/image_io.hpp"
 #include <cstdio>
 
@@ -25,12 +25,12 @@ int main(int argc, char** argv) {
 
     std::printf("== Gemma chat rendering ==\n");
     {
-        const GemmaChatTurn turn = render_gemma_chat_turn("Hello", true, "Be concise.", false);
+        const ChatTurnText turn = render_gemma_chat_turn("Hello", true, "Be concise.", false);
         check(turn.before_image == "<|turn>system\n<|think|>\nBe concise.<turn|>\n<|turn>user\n", "first turn renders system and thinking control exactly");
         check(turn.after_image == "Hello<turn|>\n<|turn>model\n", "text-only user and model boundaries are exact");
     }
     {
-        const GemmaChatTurn turn = render_gemma_chat_turn("Describe it.", false, "ignored", true);
+        const ChatTurnText turn = render_gemma_chat_turn("Describe it.", false, "ignored", true);
         check(turn.before_image == "<|turn>user\n<|image>", "later image turn opens an image segment without repeating system");
         check(turn.after_image == "<image|>Describe it.<turn|>\n<|turn>model\n", "image close and user text retain canonical order");
     }

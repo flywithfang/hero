@@ -78,9 +78,9 @@ PPM P6/P3. `/reset`, `/stats`, `/help`, and `/quit` work for every adapter.
 | 2 token mixing | `src/recurrent.hpp` | `CausalConv1dState`, `DeltaNetState`, the gated delta rule — **model-neutral** |
 | 3 transformer | `src/transformer.hpp` | shared residual stream, the two-operation model contract, `evaluate` + explicit `PrefixCache` (caching only — no pipeline) |
 | 3 models | `src/gemma4.hpp`, `src/qwen35.hpp` | `Gemma4E4BModel`/`Gemma4_12BModel`/`Qwen35Model` — dimensions, flat layer structs, cache/state, and each model's own `forward()` |
-| 3 modalities | `src/multimodal.hpp`, `src/gemma4_vision.hpp` | modality segments, image preprocessing, ViT, soft-token projection |
+| 3 modalities | `src/multimodal.hpp`, `src/gemma4_vision.hpp` | the decoder input, image preprocessing, ViT, soft-token projection |
 | 4 runtime | `src/runtime.hpp` | model-neutral sampling |
-| chat application | `tools/chat.cpp`, `src/chat_session.hpp`, `src/chat_models.hpp` | conversation history, model detection, tokenization, sampling, family adapters |
+| chat application | `tools/chat.cpp`, `tools/chat_session.hpp`, `tools/chat_models.hpp` | conversation history, model detection, tokenization, sampling, family adapters |
 | tensor loader | `src/tensor_loader.hpp` | architecture-neutral, shape-safe GGUF tensor construction |
 | model loaders | `src/gemma4_loader.hpp`, `src/gemma4_vision_loader.hpp`, `src/qwen35_loader.hpp` | schema validation → immutable assemblies |
 | tokenizer | `src/tokenizer.{hpp,cpp}` | byte-level BPE and sentence-style BPE |
@@ -157,21 +157,26 @@ normalization, activation, and the attention reduction; transformer, Gemma,
 vision, and future Qwen code do not change.
 
 Loops that express architecture topology stay visible — layer traversal,
-heterogeneous attention schedules, expert routing, modality segments. Numeric
+heterogeneous attention schedules, expert routing, soft tokens. Numeric
 loops over tokens/channels/heads belong inside algebra, cache, image, or
 backend kernels so they do not obscure the model equations.
 
 ### The transformer contract
 
 The implementation follows the general transformer map in
-`General_Multimodal_Transformer_Architecture_Wide.pdf`. Each encoder produces an
-`EmbeddingSegment<D>`; `compose_embeddings` creates one residual-width token
-sequence with modality spans. A model is one entity — `Gemma4E4BModel` owns
+`General_Multimodal_Transformer_Architecture_Wide.pdf`. Every encoder produces
+decoder-width rows — `model.tokens(ids)` for text, the ViT for pixels — and they
+go into one `EmbeddedSequence<D>` via `append(rows, ids)` or
+`append_soft_tokens(rows)`. It carries the one thing rows cannot carry
+themselves — the vocabulary id each row came from, which Gemma E4B keys its
+per-layer table with. Row i is at conversation position i; a warm cache runs
+`from_row(n)`, a VIEW of the rows it has not computed, so nothing is copied to
+resume a conversation. A model is one entity — `Gemma4E4BModel` owns
 its token I/O, one plain vector of flat layers per physical layer shape, and
 the final norm — immutable and non-copyable. Evaluate it with:
 
 ```text
-logits = evaluate(model, complete_input, prefix_cache)
+logits = prefix_cache.evaluate(model, complete_input)
 ```
 
 `PrefixCache` is explicit but contains only derived, prefix-indexed memoized

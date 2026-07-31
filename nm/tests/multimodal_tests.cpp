@@ -8,26 +8,12 @@ static void check(bool ok, const char* msg) {
     if (!ok) ++g_fail;
 }
 
-template <size_t D>
-static TokenMatrix<D> rows(std::initializer_list<std::initializer_list<Scalar>> values) {
-    TokenMatrix<D> out(values.size());
-    size_t r = 0;
-    for (const auto& value : values) {
-        if (value.size() != D) throw std::invalid_argument("test row has the wrong width");
-        auto dst = out.row_mut(r++);
-        std::copy(value.begin(), value.end(), dst.begin());
-    }
-    return out;
-}
-
 int main() {
-    static_assert(!std::is_default_constructible_v<TokenMatrix<3>>);
     static_assert(!std::is_default_constructible_v<RGBImage>);
-    static_assert(!std::is_default_constructible_v<MultimodalPrompt>);
 
     std::printf("== runtime token matrix ==\n");
     {
-        auto m = rows<3>({{1, 2, 3}, {4, 5, 6}});
+        Matrix<3> m{{1, 2, 3}, {4, 5, 6}};
         check(m.rows() == 2 && m.cols() == 3, "runtime rows, static channels");
         check(m.row(1)[0] == 4 && m.row(1)[2] == 6, "rows preserve values");
         bool threw = false;
@@ -39,33 +25,51 @@ int main() {
         check(threw, "row bounds are enforced");
     }
 
-    std::printf("== multimodal embedding composition ==\n");
+    std::printf("== a decoder input is rows, wherever they came from ==\n");
     {
-        std::vector<EmbeddingSegment<2>> segments;
-        segments.emplace_back(rows<2>({{1, 10}, {2, 20}}), std::vector<TokenId>{TokenId{11}, TokenId{12}});
-        segments.emplace_back(Modality::Image, rows<2>({{3, 30}, {4, 40}, {5, 50}}));
-        segments.emplace_back(rows<2>({{6, 60}}), std::vector<TokenId>{TokenId{13}});
-        auto seq = compose_embeddings(std::move(segments), 100);
-        check(seq.tokens() == 6, "segments concatenate to one decoder sequence");
-        check(seq.embedding(0)[0] == 1 && seq.embedding(5)[1] == 60, "composition preserves segment order and values");
-        check(seq.position(0).i == 100 && seq.position(5).i == 105, "absolute positions remain continuous");
-        check(seq.spans().size() == 3 && seq.spans()[1].modality() == Modality::Image && seq.spans()[1].begin() == 2 && seq.spans()[1].end() == 5, "modality spans track soft-token placement");
-        check(seq.ple_token_identity(0) == TokenId{11} && seq.ple_token_identity(2) == TokenId{0} && seq.ple_token_identity(5) == TokenId{13}, "PLE preserves text identities and substitutes PAD for soft tokens");
+        // Two rows the vocabulary produced, three an encoder invented, one more
+        // from the vocabulary. The sequence cannot tell them apart afterwards,
+        // and that is the point.
+        const std::vector<TokenId> opening{TokenId{11}, TokenId{12}};
+        const std::vector<TokenId> closing{TokenId{13}};
 
-        DecoderVisibility causal(seq.tokens());
-        check(causal.allows(4, 1) && !causal.allows(1, 4), "causal visibility is lower triangular");
-        DecoderVisibility image_bidir(seq.tokens(), {seq.spans()[1]});
-        check(image_bidir.allows(2, 4), "image soft tokens can be bidirectional");
-        check(!image_bidir.allows(1, 4), "bidirectionality does not leak into text");
+        EmbeddedSequence<2> seq;
+        seq.append(Matrix<2>{{1, 10}, {2, 20}}, opening);
+        seq.append_soft_tokens(Matrix<2>{{3, 30}, {4, 40}, {5, 50}});
+        seq.append(Matrix<2>{{6, 60}}, closing);
+
+        const EmbeddedRows<2> all = seq.view();
+        check(seq.tokens() == 6, "appends concatenate into one decoder sequence");
+        check(all.embedding(0)[0] == 1 && all.embedding(5)[1] == 60, "appending preserves order and values");
+        check(all.position(0).i == 0 && all.position(5).i == 5, "row i is at conversation position i");
+        check(all.token_id(0) == TokenId{11} && all.token_id(2) == SOFT_TOKEN_ID && all.token_id(5) == TokenId{13}, "rows keep the vocabulary id they came from, and soft tokens carry the placeholder");
+
+        // What a warm cache is handed: the tail, as a view, knowing where it
+        // was cut from. No copy, and nothing called a suffix.
+        const EmbeddedRows<2> uncached = seq.from_row(2);
+        check(uncached.tokens() == 4 && uncached.position(0).i == 2, "the uncached tail knows where it starts");
+        check(uncached.embedding(0)[0] == 3 && uncached.token_id(3) == TokenId{13}, "the tail views the same rows and ids, not copies of them");
+
+        // Rows and their ids are one append or none: they can never drift.
+        bool mismatch_rejected = false;
+        try {
+            seq.append(Matrix<2>{{7, 70}, {8, 80}}, closing);
+        } catch (const std::invalid_argument&) {
+            mismatch_rejected = true;
+        }
+        check(mismatch_rejected && seq.tokens() == 6, "an id count that does not match the rows is refused, and changes nothing");
+
+        bool empty_rejected = false;
+        try {
+            seq.append_soft_tokens(Matrix<2>{});
+        } catch (const std::invalid_argument&) {
+            empty_rejected = true;
+        }
+        check(empty_rejected, "appending nothing is a caller bug, not a no-op");
     }
 
-    std::printf("== owned prompt inputs ==\n");
+    std::printf("== owned image input ==\n");
     {
-        MultimodalPrompt prompt({
-            TextPrompt({TokenId{1}, TokenId{2}}),
-            RGBImage(2, 1, {255, 0, 0, 0, 255, 0}),
-        });
-        check(prompt.parts().size() == 2, "prompt owns ordered text and image parts");
         bool threw = false;
         try {
             (void)RGBImage(2, 2, {0, 0, 0});

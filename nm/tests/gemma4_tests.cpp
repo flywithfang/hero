@@ -135,13 +135,8 @@ int main() {
         check(cache.global(23).capacity() == 0 && &cache.global(29) == &cache.global(23), "shared global layers reuse the layer-23 cache");
     }
 
-    std::printf("== embedding scale and logit cap ==\n");
-    {
-        const Scalar scale = gemma_embedding_scale<2560>();
-        const Scalar reference = bf16_to_fp32(fp32_to_bf16(std::sqrt(2560.f)));
-        check(scale == reference, "embedding sqrt(D) includes BF16 rounding");
-        check(std::fabs(gemma_softcap(1000.f, 30.f) - 30.f) < 1e-4f && gemma_softcap(-4.f, 30.f) < 0.f, "logit softcap is cap*tanh(x/cap)");
-    }
+    std::printf("== logit cap ==\n");
+    check(std::fabs(gemma_softcap(1000.f, 30.f) - 30.f) < 1e-4f && gemma_softcap(-4.f, 30.f) < 0.f, "logit softcap is cap*tanh(x/cap)");
 
     std::printf("== the PLE residual and the layer output scale ==\n");
     {
@@ -160,15 +155,15 @@ int main() {
         Vec<1> per_layer;
         per_layer[0] = 7;
         Vec<2> y = ple(VecView<2>(x()), VecView<1>(per_layer));
-        scale_in_place(y, 2.f);  // exactly run_layer()'s tail: PLE residual, then layer_output_scale
+        y.scale(2.f);  // exactly run_layer()'s tail: PLE residual, then layer_output_scale
         check(y[0] == 6 && y[1] == -8, "the PLE residual precedes layer scaling");
 
-        Matrix<2> batch(1);
-        batch.set_row(0, x());
-        Matrix<1> batch_per_layer(1);
-        batch_per_layer.set_row(0, per_layer);
+        Matrix<2> batch;
+        batch.append(x());
+        Matrix<1> batch_per_layer;
+        batch_per_layer.append(per_layer);
         Matrix<2> batch_output = ple(batch.view(), batch_per_layer.view());
-        scale_in_place(batch_output.mutable_view(), 2.f);
+        batch_output.scale(2.f);
         check(batch_output.row(0)[0] == 6 && batch_output.row(0)[1] == -8, "the matrix PLE residual states the same equation as the scalar one");
 
         // A shared-KV layer carries no K/V tensors — the members do not exist.
@@ -188,11 +183,11 @@ int main() {
         check(params > 11.7e9 && params < 12.1e9, "parameter count lands on the advertised ~11.95B");
 
         // Every Gemma 4 layer carries a scalar layer_output_scale, applied
-        // last in run_layer(): scale_in_place on the finished residual.
+        // last in run_layer(): scale() on the finished residual.
         Vec<2> h;
         h[0] = 6.f;
         h[1] = -8.f;
-        scale_in_place(h, 0.5f);
+        h.scale(0.5f);
         check(h[0] == 3.f && h[1] == -4.f, "the layer output scale is applied last");
 
         Gemma4_12BCache cache;
@@ -214,9 +209,11 @@ int main() {
         gamma[1] = 3.f;
         ToyUnifiedLayer layer{identity_linear<2>(), PerHeadNorm<1, 2, RMSNorm<2>>(unit_norm<2>()), Linear<2, 2>(Weight<2, 2>(std::move(w))), PerHeadNorm<1, 2, RMSNorm<2>>(RMSNorm<2>(std::move(gamma), 1e-6f)), PerHeadNorm<1, 2, RMSNormNoScale<2>>(RMSNormNoScale<2>(1e-6f)), identity_linear<2>()};
 
-        Matrix<2> x(1);
-        x.row_mut(0)[0] = 3.f;
-        x.row_mut(0)[1] = 4.f;
+        Vec<2> token;
+        token[0] = 3.f;
+        token[1] = 4.f;
+        Matrix<2> x;
+        x.append(token);
 
         // One token, one visible key: the softmax weight is 1 regardless of K,
         // and WO is identity, so attention() returns V itself — which for

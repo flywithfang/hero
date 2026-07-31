@@ -81,9 +81,11 @@ static GatedMLP<ToyQwen::D, ToyQwen::FF> make_toy_mlp() {
 static Qwen35Block<ToyQwen, QwenRecurrentMixer<ToyQwen>> make_recurrent_layer() {
     using C = ToyQwen;
     using Mixer = QwenRecurrentMixer<C>;
-    Matrix<C::CONV_WIDTH> conv(Mixer::CONV_CHANNELS);
-    for (size_t c = 0; c < Mixer::CONV_CHANNELS; ++c)
-        for (size_t tap = 0; tap < C::CONV_WIDTH; ++tap) conv.row_mut(c)[tap] = tap == C::CONV_WIDTH - 1 ? 1.f : 0.25f;
+    Vec<C::CONV_WIDTH> taps;  // the same taps on every channel
+    for (size_t tap = 0; tap < C::CONV_WIDTH; ++tap) taps[tap] = tap == C::CONV_WIDTH - 1 ? 1.f : 0.25f;
+    Matrix<C::CONV_WIDTH> conv;
+    conv.reserve(Mixer::CONV_CHANNELS);
+    for (size_t c = 0; c < Mixer::CONV_CHANNELS; ++c) conv.append(taps);
     // decay_scale must be <= 0: the checkpoint stores -exp(A_log), which is
     // what makes exp(gate) a contraction. A positive value here makes the
     // state grow every token; the loader rejects that.
@@ -108,7 +110,7 @@ static Qwen35Model<ToyQwen> make_toy_model(size_t drop_attention_layers = 0) {
             attention.push_back(make_attention_layer());
     }
     for (size_t i = 0; i < drop_attention_layers; ++i) attention.pop_back();
-    return Qwen35Model<ToyQwen>(QwenTokenIO<ToyQwen>(weight_from<ToyQwen::D, ToyQwen::V>(small), std::monostate{}), std::move(recurrent), std::move(attention), unit_norm<ToyQwen::D>());
+    return Qwen35Model<ToyQwen>(weight_from<ToyQwen::D, ToyQwen::V>(small), std::monostate{}, std::move(recurrent), std::move(attention), unit_norm<ToyQwen::D>());
 }
 
 int main() {
@@ -131,12 +133,7 @@ int main() {
     {
         // Two channels, width 3, taps [1, 10, 100] on both channels: the
         // output at token t is x[t-2] + 10*x[t-1] + 100*x[t].
-        Matrix<3> taps(2);
-        for (size_t c = 0; c < 2; ++c) {
-            taps.row_mut(c)[0] = 1.f;
-            taps.row_mut(c)[1] = 10.f;
-            taps.row_mut(c)[2] = 100.f;
-        }
+        Matrix<3> taps{{1.f, 10.f, 100.f}, {1.f, 10.f, 100.f}};
         CausalConv1dState<2, 3> conv;
         Vec<2> x1, x2, x3;
         x1[0] = 1.f;
@@ -202,8 +199,7 @@ int main() {
     std::printf("== gated attention splits its query projection ==\n");
     {
         // Two heads of width 2, packed [q0 | g0 | q1 | g1].
-        Matrix<8> packed(1);
-        for (size_t i = 0; i < 8; ++i) packed.row_mut(0)[i] = Scalar(i);
+        Matrix<8> packed{{0.f, 1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 7.f}};
         HeadPair<2, 2> split = split_head_pairs<2, 2>(packed.view());
         check(split.first.row(0)[0] == 0.f && split.first.row(0)[1] == 1.f && split.first.row(0)[2] == 4.f && split.first.row(0)[3] == 5.f, "queries are the first half of each head pair");
         check(split.second.row(0)[0] == 2.f && split.second.row(0)[1] == 3.f && split.second.row(0)[2] == 6.f && split.second.row(0)[3] == 7.f, "gates are the second half of each head pair");
@@ -230,16 +226,23 @@ int main() {
         const Qwen35Model<ToyQwen> model = make_toy_model();
         std::vector<TokenId> input{TokenId{1}, TokenId{4}, TokenId{2}, TokenId{7}, TokenId{0}};
 
-        PrefixCache<Qwen35Model<ToyQwen>> scratch;
-        const Logits<ToyQwen::V> whole = evaluate(model, input, scratch);
+        PrefixCache<Qwen35Model<ToyQwen>> scratch(model);
+        EmbeddedSequence<ToyQwen::D> one_shot;
+        one_shot.append(model.tokens(input), input);
+        const Logits<ToyQwen::V> whole = scratch.evaluate(one_shot);
 
         // Incremental decode must equal one-shot prefill. This is the property
         // the recurrent mixer could most easily break: its state is sequential,
         // so an off-by-one in the conv history or a missed decay shows up here
         // and nowhere else.
-        PrefixCache<Qwen35Model<ToyQwen>> incremental;
+        PrefixCache<Qwen35Model<ToyQwen>> incremental(model);
         Logits<ToyQwen::V> stepwise;
-        for (size_t n = 1; n <= input.size(); ++n) stepwise = evaluate(model, std::span<const TokenId>(input.data(), n), incremental);
+        EmbeddedSequence<ToyQwen::D> growing;
+        for (size_t n = 0; n < input.size(); ++n) {
+            const std::span<const TokenId> next(input.data() + n, 1);
+            growing.append(model.tokens(next), next);
+            stepwise = incremental.evaluate(growing);
+        }
 
         Scalar worst = 0;
         for (size_t v = 0; v < ToyQwen::V; ++v) worst = std::max(worst, std::fabs(whole[v] - stepwise[v]));

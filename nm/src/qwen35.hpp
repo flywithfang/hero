@@ -172,30 +172,6 @@ struct QwenGatedDeltaNet {
     static constexpr size_t key_head_of(size_t value_head) { return value_head % Hk; }
 };
 
-// ---- token I/O --------------------------------------------------------------
-
-template <class C>
-class QwenTokenIO {
-public:
-    using TokenWeight = Weight<C::D, C::V>;
-    using OutputWeight = typename C::OutputWeight;
-
-    QwenTokenIO(TokenWeight tokens, OutputWeight unembed) : tokens_(std::move(tokens)), unembed_(std::move(unembed)) {}
-
-    Vec<C::D> token(TokenId id) const { return tokens_.dequant_row(size_t(id)); }
-    Matrix<C::D> tokens(std::span<const TokenId> ids) const { return tokens_.gather_rows(ids); }
-    Logits<C::V> logits(VecView<C::D> hidden) const {
-        if constexpr (std::is_same_v<OutputWeight, std::monostate>)
-            return Logits<C::V>(tokens_.matvec(hidden));
-        else
-            return Logits<C::V>(unembed_.matvec(hidden));
-    }
-
-private:
-    TokenWeight tokens_;
-    [[no_unique_address]] OutputWeight unembed_;
-};
-
 // ---- layers -----------------------------------------------------------------
 //
 // One layer's weights. Both kinds are plain pre-norm: two norms, a token mixer,
@@ -268,7 +244,7 @@ private:
 //
 // Qwen 3.5: its tensors and its math, one entity — two layer vectors (3:1
 // recurrent to attention), immutable and non-copyable. Call it with
-// evaluate(model, input, cache).
+// cache.evaluate(model, input).
 template <class C>
 class Qwen35Model {
 public:
@@ -295,7 +271,7 @@ public:
     // sectioned form; that is a different Rope type, not a flag here.
     using Rope = RotaryEmbedding<C::HEAD_DIM, C::ROPE_BASE, C::ROTARY_NUM, C::ROTARY_DEN>;
 
-    Qwen35Model(QwenTokenIO<C> token_io, std::vector<RecurrentLayer> recurrent, std::vector<AttentionLayer> attention, RMSNorm<D> final_norm) : token_io_(std::move(token_io)), recurrent_(std::move(recurrent)), attention_(std::move(attention)), final_norm_(std::move(final_norm)) {
+    Qwen35Model(Weight<C::D, C::V> embedding, typename C::OutputWeight unembedding, std::vector<RecurrentLayer> recurrent, std::vector<AttentionLayer> attention, RMSNorm<D> final_norm) : embedding_(std::move(embedding)), unembedding_(std::move(unembedding)), recurrent_(std::move(recurrent)), attention_(std::move(attention)), final_norm_(std::move(final_norm)) {
         if (recurrent_.size() != 3 * attention_.size() || recurrent_.size() + attention_.size() != L) throw std::invalid_argument("Qwen35Model: layer kind counts disagree with the 3:1 hybrid schedule");
     }
 
@@ -304,16 +280,12 @@ public:
     Qwen35Model(Qwen35Model&&) = default;
     Qwen35Model& operator=(Qwen35Model&&) = delete;
 
-    static_assert(TokenInputOutput<QwenTokenIO<C>, C::D, C::V>);
 
-    Vec<D> token(TokenId id) const { return token_io_.token(id); }
-
-    EmbeddedSequence<D> embed(std::span<const TokenId> tokens, size_t first_position) const {
-        return embed_text_tokens<D>(tokens, first_position, [&](std::span<const TokenId> batch) { return token_io_.tokens(batch); });
-    }
+    // Qwen reads embedding rows as they are: no input scale.
+    Matrix<D> tokens(std::span<const TokenId> ids) const { return embedding_.gather_rows(ids); }
 
     // Nothing to precompute: a Qwen layer reads only the residual stream.
-    Logits<V> forward(PrefixState& state, const EmbeddedSequence<D>& input) const {
+    Logits<V> forward(PrefixState& state, EmbeddedRows<D> input) const {
         if (input.tokens() > CTX - state.tokens()) throw std::length_error("Qwen35Model: context exhausted");
 
         ResidualStream<D> residual(input);
@@ -321,11 +293,16 @@ public:
         state.advance(input.tokens());
 
         Vec<D> last = final_norm_(residual.token(residual.tokens() - 1));
-        return token_io_.logits(last);
+        // 4B ties its embedding to the head; 9B carries a separate one. The
+        // config says which, so the choice costs nothing at run time.
+        if constexpr (std::is_same_v<typename C::OutputWeight, std::monostate>)
+            return Logits<V>(embedding_.matvec(last));
+        else
+            return Logits<V>(unembedding_.matvec(last));
     }
 
 private:
-    void forward_layer(PrefixState& state, const EmbeddedSequence<D>& input, ResidualStream<D>& residual, size_t layer_index) const {
+    void forward_layer(PrefixState& state, EmbeddedRows<D> input, ResidualStream<D>& residual, size_t layer_index) const {
         const size_t pos = input.position(0).i;
         const MatrixView<D> X = residual.matrix();
         const size_t n = position_in_kind(layer_index);
@@ -351,7 +328,8 @@ private:
         return add(H.view(), F.view());
     }
 
-    QwenTokenIO<C> token_io_;
+    Weight<C::D, C::V> embedding_;
+    [[no_unique_address]] typename C::OutputWeight unembedding_;  // empty when tied
     std::vector<RecurrentLayer> recurrent_;  // 3 of every 4 layers
     std::vector<AttentionLayer> attention_;  // every 4th
     RMSNorm<D> final_norm_;
@@ -382,7 +360,10 @@ private:
                                                            /*score_scale=*/1.f / std::sqrt(Scalar(Dh)));
 
         // The gate is applied to the attended value, before W_o.
-        for (size_t i = 0; i < A.rows() * QW; ++i) A.data()[i] *= sigmoid(query_gate.second.data()[i]);
+        A.transform_rows([&](size_t row, MutVecView<QW> attended) {
+            const VecView<QW> gate = query_gate.second.row(row);
+            for (size_t i = 0; i < QW; ++i) attended[i] *= sigmoid(gate[i]);
+        });
         return attention.WO(A.view());
     }
 
@@ -392,17 +373,17 @@ private:
     static Matrix<C::VALUE_HEADS> write_strength(const QwenRecurrentMixer<C>& mixer, MatrixView<D> X) {
         constexpr size_t Hv = C::VALUE_HEADS;
         Matrix<Hv> beta = mixer.Wbeta(X);
-        for (size_t i = 0; i < beta.rows() * Hv; ++i) beta.data()[i] = sigmoid(beta.data()[i]);
+        beta.transform_rows([](MutVecView<Hv> row) {
+            for (size_t h = 0; h < Hv; ++h) row[h] = sigmoid(row[h]);
+        });
         return beta;
     }
     static Matrix<C::VALUE_HEADS> decay_gate(const QwenRecurrentMixer<C>& mixer, MatrixView<D> X) {
         constexpr size_t Hv = C::VALUE_HEADS;
         Matrix<Hv> alpha = mixer.Walpha(X);
-        for (size_t row = 0; row < alpha.rows(); ++row)
-            for (size_t h = 0; h < Hv; ++h) {
-                const Scalar raw = alpha.row(row)[h];
-                alpha.row_mut(row)[h] = mixer.decay_scale[h] * softplus(raw + mixer.dt_bias[h]);
-            }
+        alpha.transform_rows([&](MutVecView<Hv> row) {
+            for (size_t h = 0; h < Hv; ++h) row[h] = mixer.decay_scale[h] * softplus(row[h] + mixer.dt_bias[h]);
+        });
         return alpha;
     }
 
@@ -422,7 +403,8 @@ private:
         Matrix<Mixer::CONV_CHANNELS> qkv = mixer.WQKV(X);
         Matrix<Hv> beta = write_strength(mixer, X);
         Matrix<Hv> gate = decay_gate(mixer, X);
-        Matrix<Mixer::VALUE_WIDTH> mixed(X.rows());
+        Matrix<Mixer::VALUE_WIDTH> mixed;
+        mixed.reserve(X.rows());
 
         for (size_t t = 0; t < X.rows(); ++t) {
             Vec<Mixer::CONV_CHANNELS> stream = entry.conv.step(qkv.row(t), mixer.conv);
@@ -437,18 +419,20 @@ private:
                 for (size_t i = 0; i < Dk; ++i) query[hk][i] *= query_scale;
             }
 
-            Scalar* row = mixed.data() + t * Mixer::VALUE_WIDTH;
+            Vec<Mixer::VALUE_WIDTH> row;
             for (size_t h = 0; h < Hv; ++h) {
                 const size_t hk = Mixer::key_head_of(h);
                 Vec<Dv> attended = gated_delta_step<Dk, Dv>(entry.delta.head(h), VecView<Dk>(query[hk]), VecView<Dk>(key[hk]), slice<Dv>(VecView<Mixer::CONV_CHANNELS>(stream), 2 * Mixer::KEY_WIDTH + h * Dv), gate.row(t)[h], beta.row(t)[h]);
-                std::copy(attended.begin(), attended.end(), row + h * Dv);
+                MutVecView<Dv> partition = slice_mut<Dv>(row, h * Dv);
+                for (size_t i = 0; i < Dv; ++i) partition[i] = attended[i];
             }
+            mixed.append(row);
         }
 
         // Gated output norm: rmsnorm per head, then the SiLU'd z gate.
         Matrix<Mixer::VALUE_WIDTH> normalized = mixer.head_norm(mixed.view());
         Matrix<Mixer::VALUE_WIDTH> z = mixer.WZ(X);
-        silu_in_place(z.mutable_view());
+        silu_in_place(z);
         return mixer.WO(hadamard(normalized.view(), z.view()).view());
     }
 };

@@ -9,16 +9,11 @@
 
 namespace {
 
-EmbeddingSegment<Gemma4E4BTextConfig::D> text_segment(const Gemma4E4BModel& model, const std::vector<int32_t>& ids) {
-    if (ids.empty()) throw std::invalid_argument("empty text segment");
-    TokenMatrix<Gemma4E4BTextConfig::D> embeddings(ids.size());
-    std::vector<TokenId> identities;
-    identities.reserve(ids.size());
-    for (size_t i = 0; i < ids.size(); ++i) {
-        identities.push_back(TokenId{ids[i]});
-        embeddings.set_row(i, model.token(TokenId{ids[i]}));
-    }
-    return EmbeddingSegment<Gemma4E4BTextConfig::D>(std::move(embeddings), std::move(identities));
+std::vector<TokenId> to_tokens(const std::vector<int32_t>& ids) {
+    std::vector<TokenId> tokens;
+    tokens.reserve(ids.size());
+    for (int32_t id : ids) tokens.push_back(TokenId{id});
+    return tokens;
 }
 
 }  // namespace
@@ -37,23 +32,25 @@ int main(int argc, char** argv) {
         RGBImage image = load_rgb_image(argv[3]);
 
         const auto vision_start = std::chrono::steady_clock::now();
-        auto image_segment = vision_model.encode(image);
+        Matrix<Gemma4E4BTextConfig::D> image_rows = vision_model.encode(image);
         const double vision_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - vision_start).count();
 
         const std::string prefix = "<|turn>system\n<|think|>\n<turn|>\n<|turn>user\n<|image>";
         const std::string suffix = std::string("<image|>") + argv[4] + "<turn|>\n<|turn>model\n";
         auto prefix_ids = tokenizer.encode(prefix, /*add_bos=*/true, /*parse_special=*/true);
         auto suffix_ids = tokenizer.encode(suffix, /*add_bos=*/false, /*parse_special=*/true);
-        std::vector<EmbeddingSegment<Gemma4E4BTextConfig::D>> segments;
-        segments.push_back(text_segment(model, prefix_ids));
-        const size_t image_tokens = image_segment.embeddings().rows();
-        segments.push_back(std::move(image_segment));
-        segments.push_back(text_segment(model, suffix_ids));
-        auto sequence = compose_embeddings(std::move(segments));
+        const std::vector<TokenId> prefix_tokens = to_tokens(prefix_ids);
+        const std::vector<TokenId> suffix_tokens = to_tokens(suffix_ids);
+        const size_t image_tokens = image_rows.rows();
 
-        PrefixCache<Gemma4E4BModel> memo;
+        EmbeddedSequence<Gemma4E4BTextConfig::D> sequence;
+        sequence.append(model.tokens(prefix_tokens), prefix_tokens);
+        sequence.append_soft_tokens(std::move(image_rows));
+        sequence.append(model.tokens(suffix_tokens), suffix_tokens);
+
+        PrefixCache<Gemma4E4BModel> memo(model);
         const auto text_start = std::chrono::steady_clock::now();
-        auto logits = evaluate(model, sequence, memo);
+        auto logits = memo.evaluate(sequence);
         const double text_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - text_start).count();
 
         const size_t count = argc == 6 ? std::strtoull(argv[5], nullptr, 10) : 32;
@@ -65,9 +62,9 @@ int main(int argc, char** argv) {
             std::printf(" %d", token);
             answer += tokenizer.decode1(int32_t(token));
             if (tokenizer.is_eog(int32_t(token))) break;
-            std::vector<int32_t> generated{int32_t(token)};
-            sequence.append(text_segment(model, generated));
-            logits = evaluate(model, sequence, memo);
+            const TokenId next{token};
+            sequence.append(model.tokens(std::span<const TokenId>(&next, 1)), std::span<const TokenId>(&next, 1));
+            logits = memo.evaluate(sequence);
         }
         std::printf("\nanswer: %s\n", answer.c_str());
         return 0;

@@ -423,18 +423,22 @@ Vec<Out> Weight<In, Out>::matvec(VecView<In> x) const {
 // it to all T activation rows. This streams W once per batch instead of once
 // per token. A tiled SME/GPU backend can replace this reference kernel without
 // changing components or architectures.
+//
+// One output is one COLUMN of the result, so this is the kernel that cannot
+// produce whole rows in order: it writes its own complete buffer and hands it
+// over in one piece (Matrix::from_row_major).
 template <size_t In, size_t Out>
 Matrix<Out> Weight<In, Out>::matmul(MatrixView<In> x) const {
-    Matrix<Out> y(x.rows());
-    if (x.rows() == 0) return y;
+    std::vector<Scalar> y(Matrix<Out>::element_count(x.rows()));
+    if (x.rows() == 0) return Matrix<Out>::from_row_major(std::move(y));
 
     const GT type = type_;
     if (type == GT::F32) {
         par_for(Out, [&](size_t output) {
             const VecView<In> weight = f32_.row(output);
-            for (size_t row = 0; row < x.rows(); ++row) y.data()[row * Out + output] = dot(x.row(row), weight);
+            for (size_t row = 0; row < x.rows(); ++row) y[row * Out + output] = dot(x.row(row), weight);
         });
-        return y;
+        return Matrix<Out>::from_row_major(std::move(y));
     }
 
     const size_t row_bytes = type_size_bytes(type, In);
@@ -463,10 +467,10 @@ Matrix<Out> Weight<In, Out>::matmul(MatrixView<In> x) const {
                     default:
                         break;
                 }
-                y.data()[row * Out + output] = result;
+                y[row * Out + output] = result;
             }
         });
-        return y;
+        return Matrix<Out>::from_row_major(std::move(y));
     }
 
     par_for(Out, [&](size_t output) {
@@ -503,8 +507,8 @@ Matrix<Out> Weight<In, Out>::matmul(MatrixView<In> x) const {
                 default:
                     break;
             }
-            y.data()[row * Out + output] = result;
+            y[row * Out + output] = result;
         }
     });
-    return y;
+    return Matrix<Out>::from_row_major(std::move(y));
 }

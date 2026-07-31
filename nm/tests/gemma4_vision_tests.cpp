@@ -32,24 +32,14 @@ int main() {
     Matrix<12> patches = patchify_rgb<2>(pixels, 2, 2);
     check(patches.rows() == 1 && patches.row(0)[0] == -1.f && patches.row(0)[4] == 2.f * (1.f / 255.f) - 1.f && patches.row(0)[8] == 2.f * (2.f / 255.f) - 1.f, "patchify produces channel-major patch rows");
 
-    Matrix<1> grid(4);
-    grid.row_mut(0)[0] = 1.f;
-    grid.row_mut(1)[0] = 2.f;
-    grid.row_mut(2)[0] = 3.f;
-    grid.row_mut(3)[0] = 4.f;
+    Matrix<1> grid{{1.f}, {2.f}, {3.f}, {4.f}};
     Matrix<1> pooled = average_pool_2d<2>(grid.view(), 2, 2);
     check(pooled.rows() == 1 && std::fabs(pooled.row(0)[0] - 2.5f) < 1e-6f, "2-D average pooling preserves the grid interpretation");
 
     std::printf("== dense vision attention equation ==\n");
-    Matrix<2> queries(2), keys(2), values(2);
-    queries.row_mut(0)[0] = 1.f;
-    queries.row_mut(1)[1] = 1.f;
-    keys.row_mut(0)[0] = 1.f;
-    keys.row_mut(1)[1] = 1.f;
-    values.row_mut(0)[0] = 10.f;
-    values.row_mut(0)[1] = 20.f;
-    values.row_mut(1)[0] = 30.f;
-    values.row_mut(1)[1] = 40.f;
+    Matrix<2> queries{{1.f, 0.f}, {0.f, 1.f}};
+    Matrix<2> keys{{1.f, 0.f}, {0.f, 1.f}};
+    Matrix<2> values{{10.f, 20.f}, {30.f, 40.f}};
     Matrix<2> attended = scaled_dot_product_attention<1, 2, 2>(queries.view(), keys.view(), values.view(), 1.f);
     const Scalar high = std::exp(1.f) / (std::exp(1.f) + 1.f);
     check(std::fabs(attended.row(0)[0] - (high * 10.f + (1.f - high) * 30.f)) < 1e-5f && std::fabs(attended.row(1)[1] - ((1.f - high) * 20.f + high * 40.f)) < 1e-5f, "full attention is softmax(QK^T)V");

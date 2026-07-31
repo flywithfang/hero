@@ -28,10 +28,18 @@ public:
     explicit PerHeadNorm(Norm norm) : norm_(std::move(norm)) {}
 
     Vec<Heads * HeadDim> operator()(VecView<Heads * HeadDim> x) const {
-        return transform_heads<Heads, HeadDim>(x, [&](VecView<HeadDim> head) { return norm_(head); });
+        Vec<Heads * HeadDim> output;
+        for (size_t head = 0; head < Heads; ++head) {
+            Vec<HeadDim> normalized = norm_(VecView<HeadDim>(x.begin() + head * HeadDim));
+            std::copy(normalized.begin(), normalized.end(), output.begin() + head * HeadDim);
+        }
+        return output;
     }
     Matrix<Heads * HeadDim> operator()(MatrixView<Heads * HeadDim> x) const {
-        return transform_heads<Heads, HeadDim>(x, [&](VecView<HeadDim> head) { return norm_(head); });
+        Matrix<Heads * HeadDim> output;
+        output.reserve(x.rows());
+        for (size_t row = 0; row < x.rows(); ++row) output.append((*this)(x.row(row)));
+        return output;
     }
 
 private:
@@ -51,16 +59,20 @@ struct HeadPair {
 
 template <size_t Heads, size_t HeadDim>
 HeadPair<Heads, HeadDim> split_head_pairs(MatrixView<2 * Heads * HeadDim> packed) {
-    HeadPair<Heads, HeadDim> split{Matrix<Heads * HeadDim>(packed.rows()), Matrix<Heads * HeadDim>(packed.rows())};
+    HeadPair<Heads, HeadDim> split;
+    split.first.reserve(packed.rows());
+    split.second.reserve(packed.rows());
     for (size_t row = 0; row < packed.rows(); ++row) {
-        const Scalar* source = packed.row(row).begin();
-        Scalar* first = split.first.data() + row * Heads * HeadDim;
-        Scalar* second = split.second.data() + row * Heads * HeadDim;
+        const VecView<2 * Heads * HeadDim> source = packed.row(row);
+        Vec<Heads * HeadDim> first, second;
         for (size_t head = 0; head < Heads; ++head) {
-            const Scalar* pair = source + head * 2 * HeadDim;
-            std::copy(pair, pair + HeadDim, first + head * HeadDim);
-            std::copy(pair + HeadDim, pair + 2 * HeadDim, second + head * HeadDim);
+            for (size_t i = 0; i < HeadDim; ++i) {
+                first[head * HeadDim + i] = source[head * 2 * HeadDim + i];
+                second[head * HeadDim + i] = source[head * 2 * HeadDim + HeadDim + i];
+            }
         }
+        split.first.append(first);
+        split.second.append(second);
     }
     return split;
 }
@@ -106,7 +118,7 @@ private:
 };
 
 template <size_t Heads, size_t HeadDim, class Rope>
-void rotate_heads(Vec<Heads * HeadDim>& value, const Rope& rope, size_t position) {
+void rotate_heads(MutVecView<Heads * HeadDim> value, const Rope& rope, size_t position) {
     for (size_t h = 0; h < Heads; ++h) {
         rope.apply(slice_mut<HeadDim>(value, h * HeadDim), position);
     }
@@ -114,11 +126,7 @@ void rotate_heads(Vec<Heads * HeadDim>& value, const Rope& rope, size_t position
 
 template <size_t Heads, size_t HeadDim, class Rope>
 void rotate_heads(Matrix<Heads * HeadDim>& values, const Rope& rope, size_t first_position) {
-    for (size_t row = 0; row < values.rows(); ++row) {
-        for (size_t head = 0; head < Heads; ++head) {
-            rope.apply(MutVecView<HeadDim>{values.data() + row * Heads * HeadDim + head * HeadDim}, first_position + row);
-        }
-    }
+    values.transform_rows([&](size_t row, MutVecView<Heads * HeadDim> value) { rotate_heads<Heads, HeadDim>(value, rope, first_position + row); });
 }
 
 // ---- the K/V cache ----------------------------------------------------------
@@ -278,17 +286,9 @@ Matrix<Hq * HeadDim> attend(MatrixView<Hq * HeadDim> queries, const KVCache<Hkv,
     for (size_t row = 0; row < queries.rows(); ++row) require_visible_key(cache, Position{first_query_position + row}, sliding_window);
 
     // Rows x heads are mutually independent, so the batch is one flat task
-    // space rather than a map over heads alone. par_for, not par_map, because
-    // each task writes its own slice of a shared output rather than returning
-    // a partition of a single vector.
-    Matrix<Hq * HeadDim> output(queries.rows());
-    par_for(queries.rows() * Hq, [&](size_t task) {
-        const size_t row = task / Hq;
-        const size_t head = task % Hq;
-        Vec<HeadDim> attended = attend_head<Hq>(queries.row(row), cache, Position{first_query_position + row}, head, sliding_window, score_scale);
-        std::copy(attended.begin(), attended.end(), output.data() + (row * Hq + head) * HeadDim);
-    });
-    return output;
+    // space rather than a map over heads alone: par_map_heads, whose partition
+    // is exactly one head of one query row.
+    return par_map_heads<Hq, HeadDim>(queries.rows(), [&](size_t row, size_t head) { return attend_head<Hq>(queries.row(row), cache, Position{first_query_position + row}, head, sliding_window, score_scale); });
 }
 
 // Append this batch's K/V, then attend. Splitting append from attend is what
@@ -309,11 +309,12 @@ Matrix<Hq * HeadDim> attend_and_cache(MatrixView<Hq * HeadDim> queries, MatrixVi
     // drop a key that an early query still needs, so the batch shortcut would
     // change the result rather than just its cost. Fall back to advancing the
     // ring one position at a time, which is the definition of the semantics.
-    Matrix<Hq * HeadDim> output(queries.rows());
+    Matrix<Hq * HeadDim> output;
+    output.reserve(queries.rows());
     for (size_t row = 0; row < queries.rows(); ++row) {
         const Position position{first_query_position + row};
         cache.append(position, keys.row(row), values.row(row));
-        output.set_row(row, attend<Hq, Hkv, HeadDim>(queries.row(row), cache, position, sliding_window, score_scale));
+        output.append(attend<Hq, Hkv, HeadDim>(queries.row(row), cache, position, sliding_window, score_scale));
     }
     return output;
 }

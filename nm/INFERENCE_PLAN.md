@@ -44,7 +44,7 @@ Gemma4E4BTextConfig: V=262144 D=2560 L=42 Hq=8 Hkv=2
   KV sharing: layers 24..41 own no K/V; they read layer 22 (local) / 23 (full)
   logit softcap 30.0, tied embeddings, embedding scale = bf16(sqrt(D))
 ```
-Vision (mmproj) is implemented and joins at `EmbeddingSegment<D>`.
+Vision (mmproj) is implemented and joins at `EmbeddedSequence<D>` as soft tokens.
 
 ### Gemma 4 12B Unified — IMPLEMENTED (text)
 Config pinned from `google/gemma-4-12B` `config.json` (`gemma4_unified_text`):

@@ -38,9 +38,13 @@ static int check(const GGUF& gguf, const char* name, const char* prompt, size_t 
     for (int32_t id : ids) std::printf(" %d", id);
     std::printf("\n");
 
-    PrefixCache<Qwen35Model<C>> memo;
+    // One sequence, appended to as tokens are produced: the prefix cache keys
+    // on its identity, so growing it in place is what makes decode incremental.
+    EmbeddedSequence<C::D> sequence;
+    sequence.append(model.tokens(tokens), tokens);
+    PrefixCache<Qwen35Model<C>> memo(model);
     const auto prefill_start = std::chrono::steady_clock::now();
-    auto logits = evaluate(model, tokens, memo);
+    auto logits = memo.evaluate(sequence);
     const double prefill = std::chrono::duration<double>(std::chrono::steady_clock::now() - prefill_start).count();
     std::printf("prefill: %.3fs (%zu tokens, %.2f tok/s)\n", prefill, ids.size(), double(ids.size()) / prefill);
 
@@ -58,8 +62,9 @@ static int check(const GGUF& gguf, const char* name, const char* prompt, size_t 
             ++produced;
             text += tokenizer.decode1(int32_t(token));
             if (tokenizer.is_eog(int32_t(token)) || i + 1 == generate_count) break;
-            tokens.push_back(token);
-            logits = evaluate(model, tokens, memo);
+            const std::span<const TokenId> next(&token, 1);
+            sequence.append(model.tokens(next), next);
+            logits = memo.evaluate(sequence);
         }
         const double decode = std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_start).count();
         std::printf("\ntext: %s\ndecode: %.3fs (%zu tokens, %.2f tok/s)\n", text.c_str(), decode, produced, double(produced) / decode);

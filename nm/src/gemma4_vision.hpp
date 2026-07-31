@@ -1,8 +1,8 @@
 // gemma4_vision.hpp — Gemma 4 E4B image encoder.
 //
 // The encoder owns image-specific policy and returns decoder-width soft
-// tokens.  The text model sees only EmbeddingSegment<D>, which is also the
-// boundary used by a future MoE decoder.
+// tokens — a plain Matrix<OUT>, the same thing the embedding table produces
+// for ids. That is the whole boundary, and a future MoE decoder uses it too.
 #pragma once
 #include "gemma4.hpp"
 
@@ -40,9 +40,10 @@ public:
 
     Matrix<D> grid(size_t width, size_t height) const {
         if (width > Rows || height > Rows) throw std::out_of_range("PositionTable2D: grid exceeds table");
-        Matrix<D> result(width * height);
+        Matrix<D> result;
+        result.reserve(width * height);
         for (size_t y = 0; y < height; ++y)
-            for (size_t x = 0; x < width; ++x) result.set_row(y * width + x, at(x, y));
+            for (size_t x = 0; x < width; ++x) result.append(at(x, y));
         return result;
     }
 
@@ -79,15 +80,14 @@ private:
 template <size_t Heads, size_t HeadDim, size_t Base>
 void apply_vision_rope_2d(Matrix<Heads * HeadDim>& queries, Matrix<Heads * HeadDim>& keys, size_t patches_x, size_t patches_y) {
     if (queries.rows() != patches_x * patches_y || keys.rows() != queries.rows()) throw std::invalid_argument("apply_vision_rope_2d: patch grid mismatch");
-    VisionRope2D<HeadDim, Base> rope;
-    for (size_t token = 0; token < queries.rows(); ++token) {
+    const VisionRope2D<HeadDim, Base> rope;
+    const auto rotate = [&](size_t token, MutVecView<Heads * HeadDim> row) {
         const size_t x = token % patches_x;
         const size_t y = token / patches_x;
-        for (size_t head = 0; head < Heads; ++head) {
-            rope.apply(MutVecView<HeadDim>{queries.data() + token * Heads * HeadDim + head * HeadDim}, x, y);
-            rope.apply(MutVecView<HeadDim>{keys.data() + token * Heads * HeadDim + head * HeadDim}, x, y);
-        }
-    }
+        for (size_t head = 0; head < Heads; ++head) rope.apply(slice_mut<HeadDim>(row, head * HeadDim), x, y);
+    };
+    queries.transform_rows(rotate);
+    keys.transform_rows(rotate);
 }
 
 template <size_t Patch>
@@ -95,11 +95,10 @@ Matrix<Patch * Patch * 3> patchify_rgb(std::span<const uint8_t> pixels, size_t w
     if (width % Patch != 0 || height % Patch != 0 || pixels.size() != width * height * 3) throw std::invalid_argument("patchify_rgb: invalid image shape");
     const size_t patches_x = width / Patch;
     const size_t patches_y = height / Patch;
-    Matrix<Patch * Patch * 3> patches(patches_x * patches_y);
-    par_for(patches.rows(), [&](size_t patch_index) {
+    return par_map_rows<Patch * Patch * 3>(patches_x * patches_y, [&](size_t patch_index) {
         const size_t patch_y = patch_index / patches_x;
         const size_t patch_x = patch_index % patches_x;
-        MutVecView<Patch * Patch * 3> patch = patches.row_mut(patch_index);
+        Vec<Patch * Patch * 3> patch;
         for (size_t channel = 0; channel < 3; ++channel)
             for (size_t y = 0; y < Patch; ++y)
                 for (size_t x = 0; x < Patch; ++x) {
@@ -107,8 +106,8 @@ Matrix<Patch * Patch * 3> patchify_rgb(std::span<const uint8_t> pixels, size_t w
                     const size_t target = x + Patch * (y + Patch * channel);
                     patch[target] = 2.f * (Scalar(pixels[source]) / 255.f) - 1.f;
                 }
+        return patch;
     });
-    return patches;
 }
 
 template <size_t Pool, size_t Channels>
@@ -116,19 +115,18 @@ Matrix<Channels> average_pool_2d(MatrixView<Channels> input, size_t width, size_
     if (input.rows() != width * height || width % Pool != 0 || height % Pool != 0) throw std::invalid_argument("average_pool_2d: invalid input shape");
     const size_t output_width = width / Pool;
     const size_t output_height = height / Pool;
-    Matrix<Channels> output(output_width * output_height);
-    par_for(output.rows(), [&](size_t output_index) {
+    return par_map_rows<Channels>(output_width * output_height, [&](size_t output_index) {
         const size_t output_y = output_index / output_width;
         const size_t output_x = output_index % output_width;
-        MutVecView<Channels> pooled = output.row_mut(output_index);
+        Vec<Channels> pooled;
         for (size_t y = 0; y < Pool; ++y)
             for (size_t x = 0; x < Pool; ++x) {
                 const VecView<Channels> source = input.row((output_y * Pool + y) * width + output_x * Pool + x);
                 const Scalar weight = 1.f / Scalar(Pool * Pool);
                 for (size_t channel = 0; channel < Channels; ++channel) pooled[channel] += weight * source[channel];
             }
+        return pooled;
     });
-    return output;
 }
 
 // One ViT block. Unlike a decoder layer this one CAN run itself: an encoder
@@ -174,7 +172,7 @@ struct GemmaVisionLayer {
 
         Matrix<D> ffn_input = ffn_norm(residual.view());
         Matrix<FF> gate = W_gate(ffn_input.view());
-        gelu_in_place(gate.mutable_view());
+        gelu_in_place(gate);
         Matrix<FF> up = W_up(ffn_input.view());
         Matrix<D> ffn = ffn_post_norm(W_down(hadamard(gate.view(), up.view()).view()));
         return add(residual.view(), ffn.view());
@@ -191,7 +189,8 @@ public:
         if (layers_.size() != C::L) throw std::invalid_argument("Gemma4E4BVisionEncoder: wrong layer count");
     }
 
-    EmbeddingSegment<C::OUT> encode(const RGBImage& image) const {
+    // Soft tokens: decoder-width rows that never came from the vocabulary.
+    Matrix<C::OUT> encode(const RGBImage& image) const {
         const Prepared prepared = prepare(image);
         const size_t px = prepared.width / C::PATCH;
         const size_t py = prepared.height / C::PATCH;
@@ -204,11 +203,10 @@ public:
         const size_t out_x = px / C::POOL, out_y = py / C::POOL;
         if (out_x == 0 || out_y == 0) throw std::invalid_argument("Gemma4E4BVisionEncoder: image produces no pooled tokens");
         Matrix<C::D> pooled = average_pool_2d<C::POOL>(hidden.view(), px, py);
-        scale_in_place(pooled.mutable_view(), std::sqrt(Scalar(C::D)));
+        pooled.scale(std::sqrt(Scalar(C::D)));
         RMSNormNoScale<C::D> pre_projection(C::EPS);
         Matrix<C::D> normalized = pre_projection(pooled.view());
-        Matrix<C::OUT> output = projection_(normalized.view());
-        return EmbeddingSegment<C::OUT>(Modality::Image, std::move(output));
+        return projection_(normalized.view());
     }
 
 private:

@@ -1,15 +1,12 @@
-// multimodal.hpp — modality-neutral input and embedding composition.
+// multimodal.hpp — the decoder's input, however its rows were made.
 //
-// Encoders turn owned prompt inputs into EmbeddingSegment<D> values. The text
-// decoder consumes only EmbeddedSequence<D>; it never knows how pixels or audio
-// became soft tokens. This is the seam shared by dense Gemma 4 E4B and the
-// later Gemma 4 A4B MoE decoder.
+// An encoder produces decoder-width rows: the model's embedding table turns
+// ids into them, a ViT turns pixels into them. Either way they go into the one
+// EmbeddedSequence<D> the decoder consumes, which never knows which was which.
+// This is the seam shared by dense Gemma 4 E4B and the later A4B MoE decoder.
 #pragma once
 #include "core.hpp"
 #include <atomic>
-#include <variant>
-
-enum class Modality : uint8_t { Text, Image, Audio };
 
 class RGBImage {
 public:
@@ -28,214 +25,101 @@ private:
     std::vector<uint8_t> pixels_;  // interleaved RGB, row-major
 };
 
-class TextPrompt {
-public:
-    explicit TextPrompt(std::vector<TokenId> tokens) : tokens_(std::move(tokens)) {
-        if (tokens_.empty()) throw std::invalid_argument("TextPrompt: empty token sequence");
-    }
-    std::span<const TokenId> tokens() const { return tokens_; }
+// A row an encoder invented has no vocabulary id, but E4B's per-layer table is
+// indexed by id and needs one per row, so those rows carry this placeholder.
+inline constexpr TokenId SOFT_TOKEN_ID{0};
 
-private:
-    std::vector<TokenId> tokens_;
-};
-
-using PromptPart = std::variant<TextPrompt, RGBImage>;
-
-class MultimodalPrompt {
-public:
-    explicit MultimodalPrompt(std::vector<PromptPart> parts) : parts_(std::move(parts)) {
-        if (parts_.empty()) throw std::invalid_argument("MultimodalPrompt: no parts");
-    }
-    std::span<const PromptPart> parts() const { return parts_; }
-
-private:
-    std::vector<PromptPart> parts_;
-};
-
-class SequenceSpan {
-public:
-    SequenceSpan(Modality modality, size_t begin, size_t end) : modality_(modality), begin_(begin), end_(end) {
-        if (begin_ >= end_) throw std::invalid_argument("SequenceSpan: empty or reversed span");
-    }
-
-    Modality modality() const { return modality_; }
-    size_t begin() const { return begin_; }
-    size_t end() const { return end_; }
-    bool contains(size_t i) const { return begin_ <= i && i < end_; }
-
-private:
-    Modality modality_;
-    size_t begin_;
-    size_t end_;  // half-open
-};
-
+// What a decoder actually receives: some rows, the ids they came from, and
+// where the first of them sits in the conversation. This is a VIEW — the
+// sequence that owns the rows outlives any call taking one — and it is how a
+// cache hands over the rows it has not computed yet.
 template <size_t D>
-class EmbeddingSegment {
+class EmbeddedRows {
 public:
-    EmbeddingSegment(TokenMatrix<D> embeddings, std::vector<TokenId> token_identities) : modality_(Modality::Text), embeddings_(std::move(embeddings)), token_identities_(std::move(token_identities)) {
-        if (embeddings_.rows() == 0) throw std::invalid_argument("EmbeddingSegment: empty segment");
-        if (token_identities_.size() != embeddings_.rows()) throw std::invalid_argument("EmbeddingSegment: text identity count mismatch");
+    EmbeddedRows(MatrixView<D> rows, std::span<const TokenId> token_ids, size_t first_position) : rows_(rows), token_ids_(token_ids), first_position_(first_position) {
+        if (token_ids_.size() != rows_.rows()) throw std::invalid_argument("EmbeddedRows: one id per row");
     }
 
-    EmbeddingSegment(Modality modality, TokenMatrix<D> embeddings) : modality_(modality), embeddings_(std::move(embeddings)) {
-        if (modality_ == Modality::Text) throw std::invalid_argument("EmbeddingSegment: text requires token identities");
-        if (embeddings_.rows() == 0) throw std::invalid_argument("EmbeddingSegment: empty segment");
+    size_t tokens() const { return rows_.rows(); }
+    MatrixView<D> matrix() const { return rows_; }
+    VecView<D> embedding(size_t i) const { return rows_.row(i); }
+    // Where row i sits in the CONVERSATION, not in this view. Everything
+    // positional downstream counts up from it: RoPE angles, sliding-window
+    // range, and the check that these rows continue the carried state.
+    Position position(size_t i) const {
+        if (i >= tokens()) throw std::out_of_range("EmbeddedRows: token out of range");
+        return Position{first_position_ + i};
     }
-
-    Modality modality() const { return modality_; }
-    const TokenMatrix<D>& embeddings() const { return embeddings_; }
-    std::span<const TokenId> token_identities() const { return token_identities_; }
+    // The vocabulary id each row came from. Rows an encoder invented carry
+    // SOFT_TOKEN_ID; Gemma E4B is the one model that reads any of this, to key
+    // its per-layer embedding table.
+    std::span<const TokenId> token_ids() const { return token_ids_; }
+    TokenId token_id(size_t i) const {
+        if (i >= tokens()) throw std::out_of_range("EmbeddedRows: token out of range");
+        return token_ids_[i];
+    }
 
 private:
-    Modality modality_;
-    TokenMatrix<D> embeddings_;
-    std::vector<TokenId> token_identities_;  // populated only for text
+    MatrixView<D> rows_;
+    std::span<const TokenId> token_ids_;
+    size_t first_position_;
 };
 
+// The decoder's whole input: every row of the conversation so far, and the id
+// each one came from. It starts empty and grows by appending rows, exactly like
+// the Matrix beneath it. Rows arrive from one of two places, and the difference
+// is in the call rather than in a tag stored on the data: append() for rows the
+// vocabulary produced, which bring their ids with them, and append_soft_tokens()
+// for rows an encoder invented, which have none.
+//
+// Row i is at conversation position i. There is nothing to manage: the only
+// thing that ever starts elsewhere is a VIEW of the tail, and it knows where it
+// was cut from.
 template <size_t D>
 class EmbeddedSequence {
 public:
-    EmbeddedSequence(TokenMatrix<D> embeddings, std::vector<SequenceSpan> spans, std::vector<TokenId> ple_token_identities, size_t first_position) : embeddings_(std::move(embeddings)), spans_(std::move(spans)), ple_token_identities_(std::move(ple_token_identities)), first_position_(first_position) {
-        size_t cursor = 0;
-        for (const SequenceSpan& span : spans_) {
-            if (span.begin() != cursor) throw std::invalid_argument("EmbeddedSequence: spans must be contiguous");
-            cursor = span.end();
-        }
-        if (cursor != embeddings_.rows()) throw std::invalid_argument("EmbeddedSequence: spans do not cover embeddings");
-        if (ple_token_identities_.size() != embeddings_.rows()) throw std::invalid_argument("EmbeddedSequence: PLE identity count mismatch");
-    }
+    EmbeddedSequence() = default;
 
     size_t tokens() const { return embeddings_.rows(); }
-    size_t first_position() const { return first_position_; }
     uint64_t sequence_id() const { return sequence_id_; }
-    MatrixView<D> matrix() const { return embeddings_.view(); }
-    VecView<D> embedding(size_t i) const { return embeddings_.row(i); }
-    Position position(size_t i) const {
-        if (i >= tokens()) throw std::out_of_range("EmbeddedSequence: token out of range");
-        return Position{first_position_ + i};
-    }
-    std::span<const SequenceSpan> spans() const { return spans_; }
-    TokenId ple_token_identity(size_t i) const {
-        if (i >= tokens()) throw std::out_of_range("EmbeddedSequence: token out of range");
-        return ple_token_identities_[i];
-    }
-    std::span<const TokenId> ple_token_identities() const { return ple_token_identities_; }
-    Modality modality(size_t i) const {
-        if (i >= tokens()) throw std::out_of_range("EmbeddedSequence: token out of range");
-        for (const SequenceSpan& span : spans_)
-            if (span.contains(i)) return span.modality();
-        throw std::logic_error("EmbeddedSequence: token is outside every span");
+
+    // Every row, and the rows from `first` on. The second is what a cache hands
+    // the model — the rows it has not seen — and it costs nothing, because
+    // neither one copies.
+    EmbeddedRows<D> view() const { return from_row(0); }
+    EmbeddedRows<D> from_row(size_t first) const {
+        if (first > tokens()) throw std::out_of_range("EmbeddedSequence: row out of range");
+        return EmbeddedRows<D>(embeddings_.view().from_row(first), std::span<const TokenId>(token_ids_).subspan(first), first);
     }
 
-    EmbeddedSequence suffix(size_t first_token) const {
-        if (first_token >= tokens()) throw std::out_of_range("EmbeddedSequence: empty suffix");
-
-        Matrix<D> embeddings(tokens() - first_token);
-        std::copy(embeddings_.data() + first_token * D, embeddings_.data() + tokens() * D, embeddings.data());
-
-        std::vector<SequenceSpan> spans;
-        for (const SequenceSpan& span : spans_) {
-            if (span.end() <= first_token) continue;
-            const size_t begin = std::max(span.begin(), first_token) - first_token;
-            const size_t end = span.end() - first_token;
-            spans.emplace_back(span.modality(), begin, end);
-        }
-
-        std::vector<TokenId> identities(ple_token_identities_.begin() + first_token, ple_token_identities_.end());
-        return EmbeddedSequence(std::move(embeddings), std::move(spans), std::move(identities), first_position_ + first_token);
+    // Rows the model made from these ids, which stay with them.
+    void append(Matrix<D> rows, std::span<const TokenId> ids) {
+        if (ids.size() != rows.rows()) throw std::invalid_argument("EmbeddedSequence: one id per row or none at all");
+        append_rows(std::move(rows), ids);
     }
-
-    void append(EmbeddingSegment<D> segment, TokenId non_text_ple_identity = TokenId{0}) {
-        const size_t appended = segment.embeddings().rows();
-        if (appended > std::numeric_limits<size_t>::max() - tokens()) throw std::length_error("EmbeddedSequence: token count overflows");
-
-        const size_t begin = tokens();
-        Matrix<D> combined(begin + appended);
-        std::copy(embeddings_.data(), embeddings_.data() + begin * D, combined.data());
-        std::copy(segment.embeddings().data(), segment.embeddings().data() + appended * D, combined.data() + begin * D);
-        std::vector<SequenceSpan> spans = spans_;
-        spans.emplace_back(segment.modality(), begin, begin + appended);
-        std::vector<TokenId> identities = ple_token_identities_;
-        if (segment.modality() == Modality::Text) {
-            identities.insert(identities.end(), segment.token_identities().begin(), segment.token_identities().end());
-        } else {
-            identities.insert(identities.end(), appended, non_text_ple_identity);
-        }
-
-        embeddings_ = std::move(combined);
-        spans_ = std::move(spans);
-        ple_token_identities_ = std::move(identities);
+    // Rows an encoder invented — image patches, and audio later. They have no
+    // vocabulary identity, so every one of them carries the placeholder.
+    void append_soft_tokens(Matrix<D> rows) {
+        const std::vector<TokenId> borrowed(rows.rows(), SOFT_TOKEN_ID);
+        append_rows(std::move(rows), borrowed);
     }
 
 private:
+    // A growing sequence is literally an append: the new rows go onto the end
+    // of the ones already there, and their ids onto the end of theirs.
+    void append_rows(Matrix<D> rows, std::span<const TokenId> ids) {
+        if (rows.rows() == 0) throw std::invalid_argument("EmbeddedSequence: empty append");
+        if (rows.rows() > std::numeric_limits<size_t>::max() - tokens()) throw std::length_error("EmbeddedSequence: token count overflows");
+        embeddings_.append(rows.view());
+        token_ids_.insert(token_ids_.end(), ids.begin(), ids.end());
+    }
+
     static uint64_t next_sequence_id() {
         static std::atomic<uint64_t> next{1};
         return next.fetch_add(1, std::memory_order_relaxed);
     }
 
-    TokenMatrix<D> embeddings_;
-    std::vector<SequenceSpan> spans_;
-    std::vector<TokenId> ple_token_identities_;
-    size_t first_position_;
+    Matrix<D> embeddings_;
+    std::vector<TokenId> token_ids_;
     uint64_t sequence_id_ = next_sequence_id();
-};
-
-template <size_t D>
-EmbeddedSequence<D> compose_embeddings(std::vector<EmbeddingSegment<D>> segments, size_t first_position = 0, TokenId non_text_ple_identity = TokenId{0}) {
-    size_t total = 0;
-    for (const auto& segment : segments) {
-        if (segment.embeddings().rows() > std::numeric_limits<size_t>::max() - total) throw std::length_error("compose_embeddings: token count overflows");
-        total += segment.embeddings().rows();
-    }
-    if (total == 0) throw std::invalid_argument("compose_embeddings: no segments");
-
-    TokenMatrix<D> combined(total);
-    std::vector<SequenceSpan> spans;
-    std::vector<TokenId> identities;
-    spans.reserve(segments.size());
-    identities.reserve(total);
-    size_t cursor = 0;
-    for (const auto& segment : segments) {
-        const size_t begin = cursor;
-        for (size_t r = 0; r < segment.embeddings().rows(); ++r) {
-            combined.set_row(cursor++, segment.embeddings().row(r));
-            identities.push_back(segment.modality() == Modality::Text ? segment.token_identities()[r] : non_text_ple_identity);
-        }
-        spans.emplace_back(segment.modality(), begin, cursor);
-    }
-    return EmbeddedSequence<D>(std::move(combined), std::move(spans), std::move(identities), first_position);
-}
-
-// Compact visibility policy: causal by default, with optional spans whose
-// members may see each other bidirectionally (Gemma 4 A4B uses this for image
-// soft tokens; E4B can construct the purely causal form).
-class DecoderVisibility {
-public:
-    explicit DecoderVisibility(size_t tokens, std::vector<SequenceSpan> bidirectional = {}) : tokens_(tokens), bidirectional_(std::move(bidirectional)) {
-        for (const auto& span : bidirectional_)
-            if (span.end() > tokens_) throw std::invalid_argument("DecoderVisibility: span exceeds sequence");
-    }
-
-    bool allows(size_t query, size_t key) const {
-        if (query >= tokens_ || key >= tokens_) throw std::out_of_range("DecoderVisibility: token out of range");
-        if (key <= query) return true;
-        for (const auto& span : bidirectional_)
-            if (span.contains(query) && span.contains(key)) return true;
-        return false;
-    }
-
-    // Cache positions are absolute while spans describe the current prefill
-    // batch. Earlier cached tokens remain causally visible; positions in this
-    // batch use the exact span policy.
-    bool allows_absolute(size_t query_position, size_t key_position, size_t first_position) const {
-        if (query_position < first_position || key_position < first_position) return key_position <= query_position;
-        const size_t query = query_position - first_position;
-        const size_t key = key_position - first_position;
-        if (query >= tokens_ || key >= tokens_) return key_position <= query_position;
-        return allows(query, key);
-    }
-
-private:
-    size_t tokens_;
-    std::vector<SequenceSpan> bidirectional_;
 };

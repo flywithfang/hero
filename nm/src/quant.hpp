@@ -462,8 +462,9 @@ public:
     Vec<Out> matvec(VecView<In> x) const;
     Matrix<Out> matmul(MatrixView<In> x) const;
     Matrix<In> gather_rows(std::span<const TokenId> rows) const {
-        Matrix<In> output(rows.size());
-        for (size_t row = 0; row < rows.size(); ++row) output.set_row(row, dequant_row(size_t(rows[row])));
+        Matrix<In> output;
+        output.reserve(rows.size());
+        for (TokenId row : rows) output.append(dequant_row(size_t(row)));
         return output;
     }
 

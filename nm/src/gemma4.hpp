@@ -72,13 +72,6 @@ static_assert(Gemma4E4BTextConfig::position_in_kind(24) == 0 && Gemma4E4BTextCon
 // parameter count); the layer structs themselves just have or lack tensors.
 enum class GemmaKVKind : uint8_t { Owned, Unified, Shared };
 
-template <size_t D>
-constexpr Scalar gemma_embedding_scale() {
-    // The reference stores the scale at the embedding weight dtype. For BF16
-    // checkpoints this deliberately includes BF16 rounding.
-    return bf16_to_fp32(fp32_to_bf16(Scalar(std::sqrt(double(D)))));
-}
-
 inline Scalar gemma_softcap(Scalar value, Scalar cap) { return cap * std::tanh(value / cap); }
 
 template <size_t N>
@@ -104,7 +97,7 @@ public:
     }
     Matrix<D> operator()(MatrixView<D> hidden, MatrixView<P> per_layer_input) const {
         Matrix<P> gated = gate_(hidden);
-        gelu_in_place(gated.mutable_view());
+        gelu_in_place(gated);
         Matrix<D> branch = projection_(hadamard(gated.view(), per_layer_input));
         branch = post_norm_(branch);
         return add(hidden, branch.view());
@@ -128,10 +121,10 @@ public:
 
     Vec<Packed> operator()(VecView<D> input_embedding, TokenId identity) const {
         Vec<Packed> token = token_embeddings_.dequant_row(size_t(identity));
-        scale_in_place(token, token_scale_);
+        token.scale(token_scale_);
 
         Vec<Packed> context = model_projection_(input_embedding);
-        scale_in_place(context, projection_scale_);
+        context.scale(projection_scale_);
         context = projection_norm_(context);
 
         return scaled_sum(VecView<Packed>(context), VecView<Packed>(token), combination_scale_);
@@ -140,10 +133,10 @@ public:
         if (input_embeddings.rows() != identities.size()) throw std::invalid_argument("GemmaPerLayerInputs: embedding/identity row mismatch");
 
         Matrix<Packed> token = token_embeddings_.gather_rows(identities);
-        scale_in_place(token.mutable_view(), token_scale_);
+        token.scale(token_scale_);
 
         Matrix<Packed> context = model_projection_(input_embeddings);
-        scale_in_place(context.mutable_view(), projection_scale_);
+        context.scale(projection_scale_);
         context = projection_norm_(context);
 
         return scaled_sum(context.view(), token.view(), combination_scale_);
@@ -158,27 +151,6 @@ private:
     Scalar combination_scale_;
 };
 
-template <size_t D, size_t V>
-class GemmaTokenIO {
-public:
-    GemmaTokenIO(Weight<D, V> tokens, Scalar input_scale) : tokens_(std::move(tokens)), input_scale_(input_scale) {}
-
-    Vec<D> token(TokenId id) const {
-        Vec<D> value = tokens_.dequant_row(size_t(id));
-        scale_in_place(value, input_scale_);
-        return value;
-    }
-    Matrix<D> tokens(std::span<const TokenId> ids) const {
-        Matrix<D> values = tokens_.gather_rows(ids);
-        scale_in_place(values.mutable_view(), input_scale_);
-        return values;
-    }
-    Logits<V> logits(VecView<D> hidden) const { return Logits<V>(tokens_.matvec(hidden)); }
-
-private:
-    Weight<D, V> tokens_;  // tied input embedding and LM head
-    Scalar input_scale_;
-};
 
 // ---- E4B layers: flat tensor lists, one struct per physical layer shape -----
 //
@@ -241,7 +213,7 @@ struct GemmaE4BLayer {
         H = add(H.view(), F.view());
 
         H = ple(H.view(), per_layer_input);
-        scale_in_place(H.mutable_view(), layer_output_scale);
+        H.scale(layer_output_scale);
         return H;
     }
 };
@@ -289,7 +261,7 @@ struct GemmaE4BSharedLayer {
         H = add(H.view(), F.view());
 
         H = ple(H.view(), per_layer_input);
-        scale_in_place(H.mutable_view(), layer_output_scale);
+        H.scale(layer_output_scale);
         return H;
     }
 };
@@ -334,7 +306,7 @@ private:
 // Gemma 4 E4B: its tensors and its math, one entity. The layer vectors are
 // private and the methods are const, so the weights are immutable once loaded;
 // copying is deleted because a checkpoint is gigabytes and there is never a
-// reason to duplicate one. Call it with evaluate(model, input, cache).
+// reason to duplicate one. Call it with cache.evaluate(model, input).
 class Gemma4E4BModel {
 public:
     using C = Gemma4E4BTextConfig;
@@ -355,7 +327,7 @@ public:
 
     // One vector per layer shape, filled in schedule order, so that
     // C::position_in_kind(i) is layer i's slot.
-    Gemma4E4BModel(GemmaTokenIO<D, V> token_io, GemmaE4BModelData per_layer_inputs, std::vector<SlidingLayer> sliding, std::vector<GlobalLayer> global, std::vector<SlidingSharedLayer> sliding_shared, std::vector<GlobalSharedLayer> global_shared, RMSNorm<D> final_norm) : token_io_(std::move(token_io)), per_layer_inputs_(std::move(per_layer_inputs)), sliding_(std::move(sliding)), global_(std::move(global)), sliding_shared_(std::move(sliding_shared)), global_shared_(std::move(global_shared)), final_norm_(std::move(final_norm)) {
+    Gemma4E4BModel(Weight<D, V> embedding, GemmaE4BModelData per_layer_inputs, std::vector<SlidingLayer> sliding, std::vector<GlobalLayer> global, std::vector<SlidingSharedLayer> sliding_shared, std::vector<GlobalSharedLayer> global_shared, RMSNorm<D> final_norm) : embedding_(std::move(embedding)), per_layer_inputs_(std::move(per_layer_inputs)), sliding_(std::move(sliding)), global_(std::move(global)), sliding_shared_(std::move(sliding_shared)), global_shared_(std::move(global_shared)), final_norm_(std::move(final_norm)) {
         if (sliding_.size() != 20 || global_.size() != 4 || sliding_shared_.size() != 15 || global_shared_.size() != 3) throw std::invalid_argument("Gemma4E4BModel: layer shape counts disagree with the schedule");
     }
 
@@ -364,29 +336,29 @@ public:
     Gemma4E4BModel(Gemma4E4BModel&&) = default;
     Gemma4E4BModel& operator=(Gemma4E4BModel&&) = delete;  // immutable once built
 
-    // One input embedding, for callers that assemble multimodal sequences.
-    Vec<D> token(TokenId id) const { return token_io_.token(id); }
-
-    EmbeddedSequence<D> embed(std::span<const TokenId> tokens, size_t first_position) const {
-        return embed_text_tokens<D>(tokens, first_position, [&](std::span<const TokenId> batch) { return token_io_.tokens(batch); });
+    // Input embeddings, for callers that assemble multimodal sequences.
+    Matrix<D> tokens(std::span<const TokenId> ids) const {
+        Matrix<D> rows = embedding_.gather_rows(ids);
+        rows.scale(std::sqrt(Scalar(D)));  // Gemma scales embeddings on the way in
+        return rows;
     }
 
     // Run `input` (the rows not yet in `state`) all the way to logits. How this
     // model runs is entirely inside here: the PLE table is built once, the 42
     // layers each take their slice of it, and the state advances at the end.
-    Logits<V> forward(PrefixState& state, const EmbeddedSequence<D>& input) const {
+    Logits<V> forward(PrefixState& state, EmbeddedRows<D> input) const {
         if (input.tokens() > CTX - state.tokens()) throw std::length_error("Gemma4E4BModel: context exhausted");
 
         // Once per pass, not once per layer: every layer reads its own P-wide
         // slice of this L*P-wide table.
-        const Matrix<C::PLE * C::L> per_layer = per_layer_inputs_(input.matrix(), input.ple_token_identities());
+        const Matrix<C::PLE * C::L> per_layer = per_layer_inputs_(input.matrix(), input.token_ids());
 
         ResidualStream<D> residual(input);
         for (size_t layer = 0; layer < L; ++layer) forward_layer(state, input, residual, per_layer, layer);
         state.advance(input.tokens());
 
         Vec<D> last = final_norm_(residual.token(residual.tokens() - 1));
-        Logits<V> logits = token_io_.logits(last);
+        Logits<V> logits(embedding_.matvec(last));  // tied head
         gemma_softcap<V>(logits.mutable_view(), C::LOGIT_SOFTCAP);
         return logits;
     }
@@ -399,7 +371,7 @@ private:
     // 24..41 own no K/V: they attend against what layer 22 (sliding) or 23
     // (full) wrote earlier in this same pass, which is why local()/global()
     // redirect rather than those layers holding a cache.
-    void forward_layer(PrefixState& state, const EmbeddedSequence<D>& input, ResidualStream<D>& residual, const Matrix<C::PLE * C::L>& per_layer, size_t layer_index) const {
+    void forward_layer(PrefixState& state, EmbeddedRows<D> input, ResidualStream<D>& residual, const Matrix<C::PLE * C::L>& per_layer, size_t layer_index) const {
         const size_t pos = input.position(0).i;
         const Matrix<C::PLE> ple = slice_columns<C::PLE>(per_layer.view(), layer_index * C::PLE);
         const MatrixView<D> X = residual.matrix();
@@ -416,7 +388,9 @@ private:
         residual.set_matrix(std::move(next));
     }
 
-    GemmaTokenIO<D, V> token_io_;
+    // Tied: the same table is the input embedding and the LM head. Gemma
+    // scales rows by sqrt(D) on the way in and nothing on the way out.
+    Weight<D, V> embedding_;
     GemmaE4BModelData per_layer_inputs_;
     std::vector<SlidingLayer> sliding_;              // 20 layers
     std::vector<GlobalLayer> global_;                //  4 (5, 11, 17, 23)
@@ -424,7 +398,6 @@ private:
     std::vector<GlobalSharedLayer> global_shared_;    //  3 (29, 35, 41)
     RMSNorm<D> final_norm_;
 };
-static_assert(TokenInputOutput<GemmaTokenIO<Gemma4E4BTextConfig::D, Gemma4E4BTextConfig::V>, Gemma4E4BTextConfig::D, Gemma4E4BTextConfig::V>);
 
 // ============================ Gemma 4 12B Unified ============================
 //
@@ -542,7 +515,7 @@ struct Gemma12BSlidingLayer {
         Matrix<D> F = post_ffn_norm(ffn(Z.view()));
         H = add(H.view(), F.view());
 
-        scale_in_place(H.mutable_view(), layer_output_scale);
+        H.scale(layer_output_scale);
         return H;
     }
 };
@@ -594,12 +567,11 @@ struct Gemma12BGlobalLayer {
         Matrix<D> F = post_ffn_norm(ffn(Z.view()));
         H = add(H.view(), F.view());
 
-        scale_in_place(H.mutable_view(), layer_output_scale);
+        H.scale(layer_output_scale);
         return H;
     }
 };
 
-static_assert(TokenInputOutput<GemmaTokenIO<Gemma4_12BTextConfig::D, Gemma4_12BTextConfig::V>, Gemma4_12BTextConfig::D, Gemma4_12BTextConfig::V>);
 
 // Every layer owns its cache; the two kinds differ in head count, head width,
 // and whether they are windowed. Sliding layers keep a ring of SLIDING_WINDOW
@@ -646,7 +618,7 @@ public:
     using LocalRope = RotaryEmbedding<C::LOCAL_HEAD_DIM, C::LOCAL_ROPE_BASE>;
     using GlobalRope = RotaryEmbedding<C::GLOBAL_HEAD_DIM, C::GLOBAL_ROPE_BASE, 1, 4>;
 
-    Gemma4_12BModel(GemmaTokenIO<D, V> token_io, std::vector<Gemma12BSlidingLayer> sliding, std::vector<Gemma12BGlobalLayer> global, RMSNorm<D> final_norm) : token_io_(std::move(token_io)), sliding_(std::move(sliding)), global_(std::move(global)), final_norm_(std::move(final_norm)) {
+    Gemma4_12BModel(Weight<D, V> embedding, std::vector<Gemma12BSlidingLayer> sliding, std::vector<Gemma12BGlobalLayer> global, RMSNorm<D> final_norm) : embedding_(std::move(embedding)), sliding_(std::move(sliding)), global_(std::move(global)), final_norm_(std::move(final_norm)) {
         if (sliding_.size() != 40 || global_.size() != 8) throw std::invalid_argument("Gemma4_12BModel: layer shape counts disagree with the schedule");
     }
 
@@ -655,14 +627,14 @@ public:
     Gemma4_12BModel(Gemma4_12BModel&&) = default;
     Gemma4_12BModel& operator=(Gemma4_12BModel&&) = delete;
 
-    Vec<D> token(TokenId id) const { return token_io_.token(id); }
-
-    EmbeddedSequence<D> embed(std::span<const TokenId> tokens, size_t first_position) const {
-        return embed_text_tokens<D>(tokens, first_position, [&](std::span<const TokenId> batch) { return token_io_.tokens(batch); });
+    Matrix<D> tokens(std::span<const TokenId> ids) const {
+        Matrix<D> rows = embedding_.gather_rows(ids);
+        rows.scale(std::sqrt(Scalar(D)));  // Gemma scales embeddings on the way in
+        return rows;
     }
 
     // The same shape of pass as E4B, with nothing to precompute: 12B has no PLE.
-    Logits<V> forward(PrefixState& state, const EmbeddedSequence<D>& input) const {
+    Logits<V> forward(PrefixState& state, EmbeddedRows<D> input) const {
         if (input.tokens() > CTX - state.tokens()) throw std::length_error("Gemma4_12BModel: context exhausted");
 
         ResidualStream<D> residual(input);
@@ -670,7 +642,7 @@ public:
         state.advance(input.tokens());
 
         Vec<D> last = final_norm_(residual.token(residual.tokens() - 1));
-        Logits<V> logits = token_io_.logits(last);
+        Logits<V> logits(embedding_.matvec(last));  // tied head
         gemma_softcap<V>(logits.mutable_view(), C::LOGIT_SOFTCAP);
         return logits;
     }
@@ -678,7 +650,7 @@ public:
 private:
     // Each concrete 12B layer owns its equation. Unlike E4B's methods these
     // methods have no per-layer-input argument and perform no PLE residual.
-    void forward_layer(PrefixState& state, const EmbeddedSequence<D>& input, ResidualStream<D>& residual, size_t layer_index) const {
+    void forward_layer(PrefixState& state, EmbeddedRows<D> input, ResidualStream<D>& residual, size_t layer_index) const {
         const size_t pos = input.position(0).i;
         const MatrixView<D> X = residual.matrix();
         const size_t n = C::position_in_kind(layer_index);
@@ -687,7 +659,8 @@ private:
         residual.set_matrix(std::move(next));
     }
 
-    GemmaTokenIO<D, V> token_io_;
+    // Tied, and scaled by sqrt(D) on the way in, exactly as in E4B.
+    Weight<D, V> embedding_;
     std::vector<Gemma12BSlidingLayer> sliding_;  // 40 layers
     std::vector<Gemma12BGlobalLayer> global_;    //  8 (every 6th)
     RMSNorm<D> final_norm_;

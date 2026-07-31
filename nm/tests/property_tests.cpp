@@ -54,23 +54,27 @@ public:
     ToyModel& operator=(const ToyModel&) = delete;
     ToyModel(ToyModel&&) = default;
 
-    EmbeddedSequence<D> embed(std::span<const TokenId> ids, size_t first_position) const {
-        return embed_text_tokens<D>(ids, first_position, [&](std::span<const TokenId> batch) {
-            Matrix<D> X(batch.size());
-            for (size_t row = 0; row < batch.size(); ++row) {
-                X.row_mut(row)[0] = scale_ * Scalar(int32_t(batch[row]));
-                X.row_mut(row)[1] = scale_ * Scalar(int32_t(batch[row]) + 1);
-            }
-            return X;
-        });
+    Matrix<D> tokens(std::span<const TokenId> ids) const {
+        Matrix<D> X;
+        X.reserve(ids.size());
+        for (TokenId id : ids) {
+            Vec<D> embedding;
+            embedding[0] = scale_ * Scalar(int32_t(id));
+            embedding[1] = scale_ * Scalar(int32_t(id) + 1);
+            X.append(embedding);
+        }
+        return X;
     }
-    Logits<V> forward(PrefixState& prefix_state, const EmbeddedSequence<D>& input) const {
+    Logits<V> forward(PrefixState& prefix_state, EmbeddedRows<D> input) const {
         ResidualStream<D> residual(input);
         Vec<D> sum = copy(VecView<D>(prefix_state.prefix_sum));
+        Matrix<D> running;
+        running.reserve(residual.tokens());
         for (size_t row = 0; row < residual.tokens(); ++row) {
             sum += residual.token(row);
-            residual.set_token(row, sum);
+            running.append(sum);
         }
+        residual.set_matrix(std::move(running));
         prefix_state.prefix_sum = std::move(sum);
         prefix_state.advance(input.tokens());
 
@@ -87,6 +91,14 @@ private:
 };
 
 static_assert(TransformerModel<ToyModel>);
+
+// Rows plus the ids they came from, which is all "embed this text" ever was.
+template <class Model>
+static EmbeddedSequence<Model::D> sequence_of(const Model& model, std::span<const TokenId> ids) {
+    EmbeddedSequence<Model::D> sequence;
+    sequence.append(model.tokens(ids), ids);
+    return sequence;
+}
 
 int main() {
     std::printf("== RoPE offset identity (half-split pairing) ==\n");
@@ -125,9 +137,12 @@ int main() {
         Vec<4> gamma;
         for (size_t i = 0; i < 4; ++i) gamma[i] = Scalar(i + 1);
         RMSNorm<4> norm(std::move(gamma));
-        Matrix<4> input(2);
-        for (size_t row = 0; row < input.rows(); ++row)
-            for (size_t channel = 0; channel < 4; ++channel) input.row_mut(row)[channel] = Scalar(1 + row * 4 + channel);
+        Matrix<4> input;
+        for (size_t row = 0; row < 2; ++row) {
+            Vec<4> values;
+            for (size_t channel = 0; channel < 4; ++channel) values[channel] = Scalar(1 + row * 4 + channel);
+            input.append(values);
+        }
         Matrix<4> batch = norm(input.view());
         Scalar difference = 0;
         for (size_t row = 0; row < input.rows(); ++row) {
@@ -148,14 +163,16 @@ int main() {
         value0[1] = 0.f;
         value1[0] = 30.f;
         value1[1] = 0.f;
-        Matrix<2> queries(2);
-        queries.row_mut(0)[0] = 1.f;
-        queries.row_mut(1)[1] = 1.f;
-        Matrix<2> keys(2), values(2);
-        keys.set_row(0, key0);
-        keys.set_row(1, key1);
-        values.set_row(0, value0);
-        values.set_row(1, value1);
+        Vec<2> query0, query1;
+        query0[0] = 1.f;
+        query1[1] = 1.f;
+        Matrix<2> queries, keys, values;
+        queries.append(query0);
+        queries.append(query1);
+        keys.append(key0);
+        keys.append(key1);
+        values.append(value0);
+        values.append(value1);
 
         const Scalar scale = 1.f / std::sqrt(2.f);
         Matrix<2> attended = attend_and_cache<1, 1, 2>(queries.view(), keys.view(), values.view(), cache, 0, 0, scale);
@@ -164,8 +181,7 @@ int main() {
         check(attended.row(0)[0] == 10.f && std::fabs(attended.row(1)[0] - expected1) < 1e-5f, "the causal mask and row-wise softmax match the equation");
 
         // The same reduction under a width-1 window sees only the newest key.
-        Vec<2> query1 = copy(queries.row(1));
-        Vec<2> windowed = attend<1, 1, 2>(query1, cache, Position{1}, 1, scale);
+        Vec<2> windowed = attend<1, 1, 2>(queries.row(1), cache, Position{1}, 1, scale);
         check(windowed[0] == 30.f, "a sliding window of one keeps only the current position");
     }
     std::printf("== softmax sums to 1 ==\n");
@@ -188,49 +204,58 @@ int main() {
     std::printf("== PrefixCache changes cost, never the result ==\n");
     {
         const ToyModel model(0.5f);
-        PrefixCache<ToyModel> memo;
-        std::vector<TokenId> X{TokenId{1}, TokenId{2}};
-        const auto from_scratch = [&](std::span<const TokenId> input) {
-            PrefixCache<ToyModel> empty;
-            return evaluate(model, input, empty);
+        PrefixCache<ToyModel> memo(model);
+        const auto from_scratch = [&](std::span<const TokenId> ids) {
+            PrefixCache<ToyModel> empty(model);
+            return empty.evaluate(sequence_of(model, ids));
         };
         const auto embedded_from_scratch = [&](const EmbeddedSequence<2>& input) {
-            PrefixCache<ToyModel> empty;
-            return evaluate(model, input, empty);
+            PrefixCache<ToyModel> empty(model);
+            return empty.evaluate(input);
         };
+        const auto grow = [&](EmbeddedSequence<2>& sequence, TokenId id) { sequence.append(model.tokens(std::span<const TokenId>(&id, 1)), std::span<const TokenId>(&id, 1)); };
+
+        const std::vector<TokenId> X2{TokenId{1}, TokenId{2}};
+        EmbeddedSequence<2> X = sequence_of(model, X2);
         const auto same = [](const Logits<3>& a, const Logits<3>& b) {
             for (size_t i = 0; i < 3; ++i)
                 if (a[i] != b[i]) return false;
             return true;
         };
 
-        const Logits<3> pure_prefix = from_scratch(X);
-        const Logits<3> cached_prefix = evaluate(model, X, memo);
+        const Logits<3> pure_prefix = from_scratch(X2);
+        const Logits<3> cached_prefix = memo.evaluate(X);
         bool equal = same(pure_prefix, cached_prefix);
         equal = equal && memo.reused_tokens() == 0 && memo.computed_tokens() == 2;
 
-        X.push_back(TokenId{3});
-        const Logits<3> pure_extension = from_scratch(X);
-        const Logits<3> cached_extension = evaluate(model, X, memo);
+        grow(X, TokenId{3});
+        const Logits<3> pure_extension = from_scratch(std::vector<TokenId>{TokenId{1}, TokenId{2}, TokenId{3}});
+        const Logits<3> cached_extension = memo.evaluate(X);
         equal = equal && same(pure_extension, cached_extension) && memo.reused_tokens() == 2 && memo.computed_tokens() == 1;
 
-        const Logits<3> repeated = evaluate(model, X, memo);
+        const Logits<3> repeated = memo.evaluate(X);
         equal = equal && same(repeated, pure_extension) && memo.reused_tokens() == 3 && memo.computed_tokens() == 0;
 
+        // A different sequence OBJECT shares no identity with the cached one,
+        // so the memo starts over even though the first row is the same.
         const std::vector<TokenId> divergent{TokenId{1}, TokenId{9}};
         const Logits<3> pure_divergent = from_scratch(divergent);
-        const Logits<3> cached_divergent = evaluate(model, divergent, memo);
+        EmbeddedSequence<2> divergent_input = sequence_of(model, divergent);
+        const Logits<3> cached_divergent = memo.evaluate(divergent_input);
         equal = equal && same(cached_divergent, pure_divergent) && memo.reused_tokens() == 0 && memo.computed_tokens() == 2;
 
-        auto embedded = model.embed(std::span<const TokenId>(divergent), 0);
-        PrefixCache<ToyModel> embedded_memo;
-        const Logits<3> embedded_prefix = evaluate(model, embedded, embedded_memo);
-        Matrix<2> next_embedding(1);
-        next_embedding.row_mut(0)[0] = 2.5f;
-        next_embedding.row_mut(0)[1] = 3.f;
-        embedded.append(EmbeddingSegment<2>(std::move(next_embedding), std::vector<TokenId>{TokenId{5}}));
+        EmbeddedSequence<2> embedded = sequence_of(model, divergent);
+        PrefixCache<ToyModel> embedded_memo(model);
+        const Logits<3> embedded_prefix = embedded_memo.evaluate(embedded);
+        Vec<2> next_row;
+        next_row[0] = 2.5f;
+        next_row[1] = 3.f;
+        Matrix<2> next_embedding;
+        next_embedding.append(next_row);
+        const TokenId next_id{5};
+        embedded.append(std::move(next_embedding), std::span<const TokenId>(&next_id, 1));
         const Logits<3> pure_embedded_extension = embedded_from_scratch(embedded);
-        const Logits<3> cached_embedded_extension = evaluate(model, embedded, embedded_memo);
+        const Logits<3> cached_embedded_extension = embedded_memo.evaluate(embedded);
         equal = equal && same(embedded_prefix, pure_divergent) && same(cached_embedded_extension, pure_embedded_extension) && embedded_memo.reused_tokens() == 2 && embedded_memo.computed_tokens() == 1;
 
         check(equal, "pure, extended, repeated, and divergent evaluations agree");

@@ -19,10 +19,12 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 using Scalar = float;
@@ -110,6 +112,9 @@ struct Vec {
     Scalar* begin() { return p.get(); }
     Scalar* end() { return p.get() + N; }
 
+    void scale(Scalar factor) {
+        for (size_t i = 0; i < N; ++i) p[i] *= factor;
+    }
     void scaled_add(VecView<N> addend, Scalar scale);
 };
 
@@ -130,10 +135,13 @@ void Vec<N>::scaled_add(VecView<N> addend, Scalar scale) {
 
 template <size_t N>
 struct MutVecView {
-    Scalar* p;
+    MutVecView(Vec<N>& v) : p(v.begin()) {}
+    explicit MutVecView(Scalar* raw) : p(raw) {}
     Scalar& operator[](size_t i) const { return p[i]; }
     Scalar* begin() const { return p; }
     Scalar* end() const { return p + N; }
+
+    Scalar* p;
 };
 
 // Runtime rows x compile-time columns. This is the activation tensor carried
@@ -148,7 +156,7 @@ public:
     MatrixView(const Scalar* data, size_t rows) : data_(data), rows_(rows) {
         if (rows_ != 0 && data_ == nullptr) throw std::invalid_argument("MatrixView: null data");
     }
-    MatrixView(const Matrix<C>& matrix) : MatrixView(matrix.data(), matrix.rows()) {}
+    MatrixView(const Matrix<C>& matrix);
 
     size_t rows() const { return rows_; }
     static constexpr size_t cols() { return C; }
@@ -156,7 +164,12 @@ public:
         check_row(i);
         return VecView<C>(data_ + i * C);
     }
-    const Scalar* data() const { return data_; }
+    // The tail of the sequence, still a view. A range of rows is the only
+    // thing callers ever wanted the base pointer for.
+    MatrixView from_row(size_t first) const {
+        if (first > rows_) throw std::out_of_range("MatrixView: row out of range");
+        return MatrixView(data_ + first * C, rows_ - first);
+    }
 
 private:
     void check_row(size_t i) const {
@@ -167,78 +180,93 @@ private:
     size_t rows_;
 };
 
-template <size_t C>
-class MutableMatrixView {
-public:
-    MutableMatrixView(Scalar* data, size_t rows) : data_(data), rows_(rows) {
-        if (rows_ != 0 && data_ == nullptr) throw std::invalid_argument("MutableMatrixView: null data");
-    }
-
-    size_t rows() const { return rows_; }
-    static constexpr size_t cols() { return C; }
-    VecView<C> row(size_t i) const {
-        check_row(i);
-        return VecView<C>(data_ + i * C);
-    }
-    MutVecView<C> row_mut(size_t i) const {
-        check_row(i);
-        return MutVecView<C>{data_ + i * C};
-    }
-    Scalar* data() const { return data_; }
-
-private:
-    void check_row(size_t i) const {
-        if (i >= rows_) throw std::out_of_range("MutableMatrixView: row out of range");
-    }
-
-    Scalar* data_;
-    size_t rows_;
-};
-
+// A matrix is a SEQUENCE OF ROWS, and a row is always a complete vector. There
+// is no "allocate T empty rows and fill them in later": a row arrives whole
+// through append(), or the entire buffer arrives already written through
+// from_row_major(). A Matrix is therefore never observable half-built, and
+// row-major layout is knowledge that lives in this class and nowhere else —
+// nothing outside it ever holds the base pointer.
 template <size_t C>
 class Matrix {
+    static_assert(C != 0, "a row must have at least one column");
+
 public:
-    explicit Matrix(size_t rows) : rows_(rows), data_(element_count(rows), Scalar(0)) {}
+    Matrix() = default;
 
-    size_t rows() const { return rows_; }
+    // Rows written out literally, for fixtures and tests. Still "a row is a
+    // whole vector", just spelled inline.
+    Matrix(std::initializer_list<std::initializer_list<Scalar>> rows) {
+        reserve(rows.size());
+        for (const std::initializer_list<Scalar>& row : rows) {
+            if (row.size() != C) throw std::invalid_argument("Matrix: literal row has the wrong width");
+            values_.insert(values_.end(), row.begin(), row.end());
+        }
+    }
+
+    // ---- building -----------------------------------------------------------
+    void append(VecView<C> row) { values_.insert(values_.end(), row.begin(), row.end()); }
+    void append(const Vec<C>& row) { append(VecView<C>(row)); }
+    void append(MatrixView<C> rows) {
+        reserve(this->rows() + rows.rows());
+        for (size_t i = 0; i < rows.rows(); ++i) append(rows.row(i));
+    }
+    void reserve(size_t rows) { values_.reserve(element_count(rows)); }
+
+    // A complete, already-laid-out buffer. This exists for the kernels that do
+    // not produce whole rows in order — an output-stationary matmul holds one
+    // weight row and sweeps a COLUMN of the result — and it is the only way in
+    // besides append(). Every element is written before the matrix exists, so
+    // the invariant above still holds.
+    static Matrix from_row_major(std::vector<Scalar> values) {
+        if (values.size() % C != 0) throw std::invalid_argument("Matrix: buffer is not a whole number of rows");
+        Matrix matrix;
+        matrix.values_ = std::move(values);
+        return matrix;
+    }
+
+    // ---- reading ------------------------------------------------------------
+    size_t rows() const { return values_.size() / C; }
     static constexpr size_t cols() { return C; }
-    MatrixView<C> view() const { return MatrixView<C>(data_.data(), rows_); }
-    MutableMatrixView<C> mutable_view() { return MutableMatrixView<C>(data_.data(), rows_); }
-
     VecView<C> row(size_t i) const {
         check_row(i);
-        return VecView<C>(data_.data() + i * C);
+        return VecView<C>(values_.data() + i * C);
     }
-    MutVecView<C> row_mut(size_t i) {
-        check_row(i);
-        return MutVecView<C>{data_.data() + i * C};
-    }
-    void set_row(size_t i, VecView<C> value) {
-        MutVecView<C> dst = row_mut(i);
-        std::copy(value.begin(), value.end(), dst.begin());
-    }
-    const Scalar* data() const { return data_.data(); }
-    Scalar* data() { return data_.data(); }
+    MatrixView<C> view() const { return MatrixView<C>(values_.data(), rows()); }
 
-private:
-    static size_t element_count(size_t rows) {
-        if constexpr (C != 0) {
-            if (rows > std::numeric_limits<size_t>::max() / C) throw std::length_error("Matrix: shape overflows size_t");
+    // ---- whole-matrix maps --------------------------------------------------
+    // Rewriting every row is the only way a row changes once it is in, and the
+    // shape cannot change while it happens. Activations, gates and RoPE are
+    // exactly this. The transform receives one whole row, and its index too if
+    // it asks for one.
+    template <class F>
+    void transform_rows(F&& transform) {
+        for (size_t i = 0; i < rows(); ++i) {
+            MutVecView<C> row{values_.data() + i * C};
+            if constexpr (std::is_invocable_v<F&, size_t, MutVecView<C>>)
+                transform(i, row);
+            else
+                transform(row);
         }
+    }
+    void scale(Scalar factor) {
+        for (Scalar& element : values_) element *= factor;
+    }
+
+    static size_t element_count(size_t rows) {
+        if (rows > std::numeric_limits<size_t>::max() / C) throw std::length_error("Matrix: shape overflows size_t");
         return rows * C;
     }
+
+private:
     void check_row(size_t i) const {
-        if (i >= rows_) throw std::out_of_range("Matrix: row out of range");
+        if (i >= rows()) throw std::out_of_range("Matrix: row out of range");
     }
 
-    size_t rows_;
-    std::vector<Scalar> data_;
+    std::vector<Scalar> values_;
 };
 
-// Transitional source compatibility for modality/vision code. New algebra and
-// model code should name the mathematical object directly as Matrix<C>.
 template <size_t C>
-using TokenMatrix = Matrix<C>;
+MatrixView<C>::MatrixView(const Matrix<C>& matrix) : MatrixView(matrix.view()) {}
 
 template <size_t R, size_t C>
 struct Mat {  // concept layout: y = x·W
@@ -301,52 +329,9 @@ Vec<N> hadamard(VecView<N> left, VecView<N> right) {
 }
 
 template <size_t N>
-void scale_in_place(Vec<N>& vector, Scalar scale) {
-    for (size_t i = 0; i < N; ++i) vector[i] *= scale;
-}
-
-template <size_t N>
 Vec<N> scaled_sum(VecView<N> left, VecView<N> right, Scalar scale) {
     Vec<N> output = left + right;
-    scale_in_place(output, scale);
-    return output;
-}
-
-template <size_t N>
-Matrix<N> copy(MatrixView<N> input) {
-    Matrix<N> output(input.rows());
-    std::copy(input.data(), input.data() + input.rows() * N, output.data());
-    return output;
-}
-
-template <size_t N>
-Matrix<N> add(MatrixView<N> left, MatrixView<N> right) {
-    if (left.rows() != right.rows()) throw std::invalid_argument("add: matrix row mismatch");
-    Matrix<N> output(left.rows());
-    const size_t elements = left.rows() * N;
-    for (size_t i = 0; i < elements; ++i) output.data()[i] = left.data()[i] + right.data()[i];
-    return output;
-}
-
-template <size_t N>
-void add_in_place(MutableMatrixView<N> output, MatrixView<N> addend) {
-    if (output.rows() != addend.rows()) throw std::invalid_argument("add_in_place: matrix row mismatch");
-    const size_t elements = output.rows() * N;
-    for (size_t i = 0; i < elements; ++i) output.data()[i] += addend.data()[i];
-}
-
-template <size_t N>
-void add_bias_in_place(MutableMatrixView<N> output, VecView<N> bias) {
-    for (size_t row = 0; row < output.rows(); ++row)
-        for (size_t channel = 0; channel < N; ++channel) output.row_mut(row)[channel] += bias[channel];
-}
-
-template <size_t N>
-Matrix<N> hadamard(MatrixView<N> left, MatrixView<N> right) {
-    if (left.rows() != right.rows()) throw std::invalid_argument("hadamard: matrix row mismatch");
-    Matrix<N> output(left.rows());
-    const size_t elements = left.rows() * N;
-    for (size_t i = 0; i < elements; ++i) output.data()[i] = left.data()[i] * right.data()[i];
+    output.scale(scale);
     return output;
 }
 
@@ -358,59 +343,22 @@ Vec<N> clamp(VecView<N> input, Scalar minimum, Scalar maximum) {
     return output;
 }
 
-template <size_t N>
-Matrix<N> clamp(MatrixView<N> input, Scalar minimum, Scalar maximum) {
-    if (minimum > maximum) throw std::invalid_argument("clamp: reversed interval");
-    Matrix<N> output(input.rows());
-    const size_t elements = input.rows() * N;
-    for (size_t i = 0; i < elements; ++i) output.data()[i] = std::clamp(input.data()[i], minimum, maximum);
-    return output;
+template <size_t W_, size_t N>
+VecView<W_> slice(VecView<N> v, size_t off) {
+    static_assert(W_ <= N);
+    return VecView<W_>(&v[off]);
+}
+template <size_t W_, size_t N>
+MutVecView<W_> slice_mut(MutVecView<N> v, size_t off) {
+    static_assert(W_ <= N);
+    return MutVecView<W_>(&v[off]);
+}
+template <size_t W_, size_t N>
+MutVecView<W_> slice_mut(Vec<N>& v, size_t off) {
+    return slice_mut<W_>(MutVecView<N>(v), off);
 }
 
-template <size_t Width, size_t Total>
-Matrix<Width> slice_columns(MatrixView<Total> input, size_t first_column) {
-    if (first_column > Total || Width > Total - first_column) throw std::out_of_range("slice_columns: column range out of bounds");
-    Matrix<Width> output(input.rows());
-    for (size_t row = 0; row < input.rows(); ++row) std::copy(input.row(row).begin() + first_column, input.row(row).begin() + first_column + Width, output.row_mut(row).begin());
-    return output;
-}
-
-template <size_t Heads, size_t HeadDim, class Transform>
-Vec<Heads * HeadDim> transform_heads(VecView<Heads * HeadDim> input, Transform&& transform) {
-    Vec<Heads * HeadDim> output;
-    for (size_t head = 0; head < Heads; ++head) {
-        Vec<HeadDim> transformed = std::invoke(transform, VecView<HeadDim>(input.begin() + head * HeadDim));
-        std::copy(transformed.begin(), transformed.end(), output.begin() + head * HeadDim);
-    }
-    return output;
-}
-
-template <size_t Heads, size_t HeadDim, class Transform>
-Matrix<Heads * HeadDim> transform_heads(MatrixView<Heads * HeadDim> input, Transform&& transform) {
-    Matrix<Heads * HeadDim> output(input.rows());
-    for (size_t row = 0; row < input.rows(); ++row) {
-        Vec<Heads * HeadDim> transformed = transform_heads<Heads, HeadDim>(input.row(row), transform);
-        output.set_row(row, transformed);
-    }
-    return output;
-}
-
-template <size_t N>
-void scale_in_place(MutableMatrixView<N> matrix, Scalar scale) {
-    const size_t elements = matrix.rows() * N;
-    for (size_t i = 0; i < elements; ++i) matrix.data()[i] *= scale;
-}
-
-template <size_t N>
-Matrix<N> scaled_sum(MatrixView<N> left, MatrixView<N> right, Scalar scale) {
-    Matrix<N> output = add(left, right);
-    scale_in_place(output.mutable_view(), scale);
-    return output;
-}
-
-// RMSNorm is a row operation. Both the vector and matrix APIs delegate to
-// this one kernel so their equations cannot drift; the matrix form merely
-// applies it independently to each row without allocating temporary Vecs.
+// RMSNorm is a row operation.
 template <size_t N, class Scale>
 void rms_norm_row(VecView<N> input, Scalar eps, MutVecView<N> output, Scale&& scale) {
     Scalar mean_square = 0;
@@ -420,44 +368,96 @@ void rms_norm_row(VecView<N> input, Scalar eps, MutVecView<N> output, Scale&& sc
 }
 
 template <size_t N>
-Matrix<N> rms_norm(MatrixView<N> input, VecView<N> gamma, Scalar eps) {
-    Matrix<N> output(input.rows());
-    for (size_t row = 0; row < input.rows(); ++row)
-        rms_norm_row(input.row(row), eps, output.row_mut(row), [&](size_t channel) { return gamma[channel]; });
-    return output;
-}
-
-template <size_t N>
 Vec<N> rms_norm(VecView<N> input, VecView<N> gamma, Scalar eps) {
     Vec<N> output;
-    rms_norm_row(input, eps, MutVecView<N>{output.begin()}, [&](size_t channel) { return gamma[channel]; });
-    return output;
-}
-
-template <size_t N>
-Matrix<N> rms_norm(MatrixView<N> input, Scalar eps) {
-    Matrix<N> output(input.rows());
-    for (size_t row = 0; row < input.rows(); ++row)
-        rms_norm_row(input.row(row), eps, output.row_mut(row), [](size_t) { return 1.f; });
+    rms_norm_row(input, eps, MutVecView<N>(output), [&](size_t channel) { return gamma[channel]; });
     return output;
 }
 
 template <size_t N>
 Vec<N> rms_norm(VecView<N> input, Scalar eps) {
     Vec<N> output;
-    rms_norm_row(input, eps, MutVecView<N>{output.begin()}, [](size_t) { return 1.f; });
+    rms_norm_row(input, eps, MutVecView<N>(output), [](size_t) { return 1.f; });
     return output;
 }
 
-template <size_t W_, size_t N>
-VecView<W_> slice(VecView<N> v, size_t off) {
-    static_assert(W_ <= N);
-    return VecView<W_>(&v[off]);
+// ---- the same algebra over a sequence of rows ------------------------------
+//
+// Every one of these is its row operation applied to each row in turn, and
+// says so in one line. That is why the matrix and vector forms cannot drift
+// apart, and why no kernel here indexes a flat buffer.
+
+template <size_t N>
+Matrix<N> copy(MatrixView<N> input) {
+    Matrix<N> output;
+    output.append(input);
+    return output;
 }
-template <size_t W_, size_t N>
-MutVecView<W_> slice_mut(Vec<N>& v, size_t off) {
-    static_assert(W_ <= N);
-    return MutVecView<W_>{&v[off]};
+
+template <size_t N>
+Matrix<N> add(MatrixView<N> left, MatrixView<N> right) {
+    if (left.rows() != right.rows()) throw std::invalid_argument("add: matrix row mismatch");
+    Matrix<N> output;
+    output.reserve(left.rows());
+    for (size_t row = 0; row < left.rows(); ++row) output.append(left.row(row) + right.row(row));
+    return output;
+}
+
+template <size_t N>
+void add_bias_in_place(Matrix<N>& output, VecView<N> bias) {
+    output.transform_rows([&](MutVecView<N> row) {
+        for (size_t channel = 0; channel < N; ++channel) row[channel] += bias[channel];
+    });
+}
+
+template <size_t N>
+Matrix<N> hadamard(MatrixView<N> left, MatrixView<N> right) {
+    if (left.rows() != right.rows()) throw std::invalid_argument("hadamard: matrix row mismatch");
+    Matrix<N> output;
+    output.reserve(left.rows());
+    for (size_t row = 0; row < left.rows(); ++row) output.append(hadamard(left.row(row), right.row(row)));
+    return output;
+}
+
+template <size_t N>
+Matrix<N> clamp(MatrixView<N> input, Scalar minimum, Scalar maximum) {
+    if (minimum > maximum) throw std::invalid_argument("clamp: reversed interval");
+    Matrix<N> output;
+    output.reserve(input.rows());
+    for (size_t row = 0; row < input.rows(); ++row) output.append(clamp(input.row(row), minimum, maximum));
+    return output;
+}
+
+template <size_t Width, size_t Total>
+Matrix<Width> slice_columns(MatrixView<Total> input, size_t first_column) {
+    if (first_column > Total || Width > Total - first_column) throw std::out_of_range("slice_columns: column range out of bounds");
+    Matrix<Width> output;
+    output.reserve(input.rows());
+    for (size_t row = 0; row < input.rows(); ++row) output.append(slice<Width>(input.row(row), first_column));
+    return output;
+}
+
+template <size_t N>
+Matrix<N> scaled_sum(MatrixView<N> left, MatrixView<N> right, Scalar scale) {
+    Matrix<N> output = add(left, right);
+    output.scale(scale);
+    return output;
+}
+
+template <size_t N>
+Matrix<N> rms_norm(MatrixView<N> input, VecView<N> gamma, Scalar eps) {
+    Matrix<N> output;
+    output.reserve(input.rows());
+    for (size_t row = 0; row < input.rows(); ++row) output.append(rms_norm(input.row(row), gamma, eps));
+    return output;
+}
+
+template <size_t N>
+Matrix<N> rms_norm(MatrixView<N> input, Scalar eps) {
+    Matrix<N> output;
+    output.reserve(input.rows());
+    for (size_t row = 0; row < input.rows(); ++row) output.append(rms_norm(input.row(row), eps));
+    return output;
 }
 
 inline void softmax(std::span<Scalar> s) {
@@ -469,7 +469,7 @@ inline void softmax(std::span<Scalar> s) {
     for (auto& v : s) v /= sum;
 }
 template <size_t N>
-void gelu(Vec<N>& v) {
+void gelu(MutVecView<N> v) {
     for (size_t i = 0; i < N; ++i) {
         Scalar x = v[i];
         v[i] = 0.5f * x * (1.f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
@@ -478,8 +478,18 @@ void gelu(Vec<N>& v) {
 inline Scalar sigmoid(Scalar x) { return 1.f / (1.f + std::exp(-x)); }
 
 template <size_t N>
-void silu(Vec<N>& v) {  // z·sigmoid(z)
+void silu(MutVecView<N> v) {  // z·sigmoid(z)
     for (size_t i = 0; i < N; ++i) v[i] = v[i] / (1.f + std::exp(-v[i]));
+}
+// An owned vector converts to a mutable view, but deduction cannot see that,
+// so both activations get the one-line forwarding overload.
+template <size_t N>
+void gelu(Vec<N>& v) {
+    gelu(MutVecView<N>(v));
+}
+template <size_t N>
+void silu(Vec<N>& v) {
+    silu(MutVecView<N>(v));
 }
 template <size_t N>
 void operator*=(Vec<N>& y, const Vec<N>& x) {
@@ -487,21 +497,13 @@ void operator*=(Vec<N>& y, const Vec<N>& x) {
 }
 
 template <size_t N>
-void gelu_in_place(MutableMatrixView<N> matrix) {
-    const size_t elements = matrix.rows() * N;
-    for (size_t i = 0; i < elements; ++i) {
-        const Scalar x = matrix.data()[i];
-        matrix.data()[i] = 0.5f * x * (1.f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
-    }
+void gelu_in_place(Matrix<N>& matrix) {
+    matrix.transform_rows([](MutVecView<N> row) { gelu(row); });
 }
 
 template <size_t N>
-void silu_in_place(MutableMatrixView<N> matrix) {
-    const size_t elements = matrix.rows() * N;
-    for (size_t i = 0; i < elements; ++i) {
-        const Scalar x = matrix.data()[i];
-        matrix.data()[i] = x / (1.f + std::exp(-x));
-    }
+void silu_in_place(Matrix<N>& matrix) {
+    matrix.transform_rows([](MutVecView<N> row) { silu(row); });
 }
 
 // ---- the parallel seams (M5 replaces the bodies with a thread pool) --------
@@ -520,6 +522,37 @@ Vec<H * Dim> par_map(F&& f) {
     return out;
 }
 
+// The same seam at matrix granularity: f(row) returns that whole row. Use this
+// wherever rows are independent and a plain append loop would serialize them.
+template <size_t C, class F>
+Matrix<C> par_map_rows(size_t rows, F&& f) {
+    std::vector<Scalar> values(Matrix<C>::element_count(rows));
+    par_for(rows, [&](size_t row) {
+        Vec<C> produced = f(row);
+        std::copy(produced.begin(), produced.end(), values.data() + row * C);
+    });
+    return Matrix<C>::from_row_major(std::move(values));
+}
+
+// And over (row, head): f(row, head) returns that head's partition of that
+// row. Rows and heads are independent, so this is ONE flat task space rather
+// than a map over rows containing a map over heads — which matters because a
+// decode step has a single row and all of its parallelism across heads.
+//
+// These two are the only places that place anything into a matrix buffer by
+// index; every other producer in the engine hands over whole rows.
+template <size_t Heads, size_t Dim, class F>
+Matrix<Heads * Dim> par_map_heads(size_t rows, F&& f) {
+    std::vector<Scalar> values(Matrix<Heads * Dim>::element_count(rows));
+    par_for(rows * Heads, [&](size_t task) {
+        const size_t row = task / Heads;
+        const size_t head = task % Heads;
+        Vec<Dim> partition = f(row, head);
+        std::copy(partition.begin(), partition.end(), values.data() + (row * Heads + head) * Dim);
+    });
+    return Matrix<Heads * Dim>::from_row_major(std::move(values));
+}
+
 // Dense multi-head attention:
 //   softmax_rows(scale * Q K^T) V
 // Q/K/V are [tokens, heads * head_dimension]. Some architectures normalize
@@ -530,10 +563,7 @@ template <size_t Heads, size_t QueryKeyDim, size_t ValueDim>
 Matrix<Heads * ValueDim> scaled_dot_product_attention(MatrixView<Heads * QueryKeyDim> queries, MatrixView<Heads * QueryKeyDim> keys, MatrixView<Heads * ValueDim> values, Scalar scale) {
     if (keys.rows() != values.rows()) throw std::invalid_argument("scaled_dot_product_attention: K/V row mismatch");
 
-    Matrix<Heads * ValueDim> output(queries.rows());
-    par_for(queries.rows() * Heads, [&](size_t task) {
-        const size_t query_row = task / Heads;
-        const size_t head = task % Heads;
+    return par_map_heads<Heads, ValueDim>(queries.rows(), [&](size_t query_row, size_t head) {
         const VecView<QueryKeyDim> query = slice<QueryKeyDim>(queries.row(query_row), head * QueryKeyDim);
 
         std::vector<Scalar> scores(keys.rows());
@@ -542,9 +572,8 @@ Matrix<Heads * ValueDim> scaled_dot_product_attention(MatrixView<Heads * QueryKe
 
         Vec<ValueDim> attended;
         for (size_t key_row = 0; key_row < keys.rows(); ++key_row) attended.scaled_add(slice<ValueDim>(values.row(key_row), head * ValueDim), scores[key_row]);
-        std::copy(attended.begin(), attended.end(), output.data() + (query_row * Heads + head) * ValueDim);
+        return attended;
     });
-    return output;
 }
 
 // ---- MatT<In,Out>: the ggml/llama.cpp weight layout (row = output) ---------

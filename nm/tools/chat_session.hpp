@@ -1,7 +1,7 @@
 // chat_session.hpp — model-neutral conversation contract for the CLI.
 #pragma once
-#include "gguf.hpp"
-#include "multimodal.hpp"
+#include "../src/gguf.hpp"
+#include "../src/multimodal.hpp"
 #include <concepts>
 #include <functional>
 #include <optional>
@@ -41,13 +41,17 @@ inline ChatModelIdentity chat_model_identity(const GGUF& gguf) {
     };
 }
 
-struct GemmaChatTurn {
+// What every chat template renders to: the turn's text, split where image rows
+// go. An image is bracketed by control tokens, so even a template that puts the
+// picture ahead of the user's words has text on both sides of it. A template
+// with no image slot fills `before_image` and leaves `after_image` empty.
+struct ChatTurnText {
     std::string before_image;
     std::string after_image;
 };
 
-inline GemmaChatTurn render_gemma_chat_turn(std::string_view user, bool first, std::string_view system, bool has_image) {
-    GemmaChatTurn turn;
+inline ChatTurnText render_gemma_chat_turn(std::string_view user, bool first, std::string_view system, bool has_image) {
+    ChatTurnText turn;
     if (first) {
         turn.before_image = "<|turn>system\n<|think|>\n";
         turn.before_image += system;
@@ -157,6 +161,45 @@ private:
     bool reading_channel_ = false;
 };
 
+// What an OUTPUT FORMATTER is: built once per turn around the terminal's sink,
+// fed every decoded piece, flushed at the end. It is a type and not a callable
+// because it carries state across pieces — a channel tag arrives split over
+// several tokens.
+template <class F>
+concept ChatOutputFormatter = std::constructible_from<F, ChatTokenSink> && requires(F& output, std::string_view piece) {
+    { output.push(piece) } -> std::same_as<void>;
+    { output.flush() } -> std::same_as<void>;
+};
+
+// What a chat PROTOCOL is: how a turn is written going in, how the model's
+// pieces are read coming out, and the token that ends a turn. These three never
+// vary independently — a checkpoint trained on ChatML emits ChatML and closes
+// with <|im_end|> — so they are one type, not three parameters.
+//
+// Stated as a concept for the same reason as TransformerModel and
+// ChatModelInterface, and never as a base class: a protocol has no per-instance
+// state to inherit, and half of what it owes — a compile-time terminator, a
+// formatter TYPE — cannot be spelled as a virtual function at all.
+template <class P>
+concept ChatProtocol = requires(std::string_view user, bool first, std::string_view system, bool has_image) {
+    { P::render(user, first, system, has_image) } -> std::same_as<ChatTurnText>;
+    { P::TURN_END } -> std::convertible_to<std::string_view>;
+    requires ChatOutputFormatter<typename P::Formatter>;
+};
+
+struct GemmaChatProtocol {
+    using Formatter = GemmaChannelFormatter;
+    static constexpr std::string_view TURN_END = "<turn|>";
+    static ChatTurnText render(std::string_view user, bool first, std::string_view system, bool has_image) { return render_gemma_chat_turn(user, first, system, has_image); }
+};
+
+struct ChatMLProtocol {
+    using Formatter = PlainChatOutput;
+    static constexpr std::string_view TURN_END = "<|im_end|>";
+    // ChatML has no image slot, so the whole turn is one piece of text.
+    static ChatTurnText render(std::string_view user, bool first, std::string_view system, bool) { return ChatTurnText{render_chatml_turn(user, first, system), ""}; }
+};
+
 // What a CHAT ADAPTER is. An adapter owns its chat template, prefix
 // memoization, sampling, and any modality encoder; the REPL calls these seven
 // operations by name and knows nothing else about it.
@@ -164,7 +207,7 @@ private:
 // No adapter inherits anything. WHICH adapter runs is decided once, by a switch
 // on the checkpoint's metadata, so the variance is in which instantiation the
 // dispatch picks — not in a vtable consulted on every call. Like
-// TransformerModel and TokenInputOutput, this concept generates no code: it
+// TransformerModel, this concept generates no code: it
 // exists so a mistake in a new adapter reports itself here rather than deep
 // inside the REPL.
 template <class M>

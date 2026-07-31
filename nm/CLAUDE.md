@@ -52,9 +52,11 @@ standing context.
   configuration, the two attention shapes, KV sharing, PLE, logit softcap, the
   decoder layer equation, and the ViT.
 - `src/tokenizer.{hpp,cpp}` — BPE in two dialects (see below).
-- `tools/` — `chat` (model-neutral REPL), `gguf_dump`, `gemma4_*` inspection and
-  parity tools, plus two python helpers: `tokenizer_parity.py` (ids vs
-  `llama-tokenize`) and `gen_unicode_data.py` (regenerates the category tables).
+- `tools/` — the chat application (`chat.cpp` with `chat_session.hpp` and
+  `chat_models.hpp`: app code, not engine, which is why it lives here and not in
+  `src/`), `gguf_dump`, `gemma4_*` inspection and parity tools, plus two python
+  helpers: `tokenizer_parity.py` (ids vs `llama-tokenize`) and
+  `gen_unicode_data.py` (regenerates the category tables).
 
 ## Design rules (do not violate)
 1. Five strata: storage / algebra / components / transformer+specifications /
@@ -63,7 +65,12 @@ standing context.
    `Architecture::PrefixState` is its model-specific inner storage. It can
    change cost, never semantics. Conversation history and sampling live outside
    the transformer. Layout knowledge lives ONLY in storage types
-   (`Mat::operator()`, `KVCache`).
+   (`Matrix`, `Mat::operator()`, `KVCache`). `Matrix<C>` is a SEQUENCE OF ROWS
+   built by `append()`ing whole vectors — never sized-then-poked, and it hands
+   out no base pointer. A kernel whose rows are independent uses
+   `par_map_rows`/`par_map_heads`; the one kernel that produces columns rather
+   than rows (`Weight::matmul`) writes a complete buffer and hands it over with
+   `from_row_major`. Rows change after the fact only through `transform_rows`.
 2. Abstraction is BOTTOM-UP only. Reusable math components take dimensions
    (template params) and have clear definitions. A layer is a concrete struct
    of tensors named after the checkpoint (`WQ`, `q_norm`, `WO`, ...) plus the
@@ -80,9 +87,13 @@ standing context.
    exposes exactly TWO operations — `embed(ids, pos)` and
    `forward(state, input) -> logits` — and nothing else. How it runs (layer
    count, order, what it precomputes once per pass) is private; `transformer.hpp`
-   must never dictate a pipeline. The shared `evaluate(model, input, cache)` is
-   about CACHING, not math, and reaches up to the model rather than the model
-   fitting into it. Token I/O satisfies `TokenInputOutput`. Hyperparameters
+   must never dictate a pipeline. `PrefixCache` is bound to its model at
+   construction and `evaluate(input)` is a MEMBER: it is about CACHING, not
+   math, and reaches up to the model rather than the model fitting into it. It
+   keeps no token count of its own — `PrefixState::tokens()` is the count, and
+   that one function is the whole interface a state owes the outside world. A model's embedding table is its OWN tensor, named and
+   scaled in the model that uses it (Gemma ties it and scales by sqrt(D); Qwen
+   4B ties it, 9B does not) — there is no token-I/O wrapper. Hyperparameters
    compile-time; weights runtime data; T is the only runtime dimension.
    Share lower mathematical components when they are genuinely identical, but
    keep each physical layer's short equation local to its type. E4B methods

@@ -408,47 +408,44 @@ Matrix<N> scaled_sum(MatrixView<N> left, MatrixView<N> right, Scalar scale) {
     return output;
 }
 
+// RMSNorm is a row operation. Both the vector and matrix APIs delegate to
+// this one kernel so their equations cannot drift; the matrix form merely
+// applies it independently to each row without allocating temporary Vecs.
+template <size_t N, class Scale>
+void rms_norm_row(VecView<N> input, Scalar eps, MutVecView<N> output, Scale&& scale) {
+    Scalar mean_square = 0;
+    for (size_t channel = 0; channel < N; ++channel) mean_square += input[channel] * input[channel];
+    const Scalar inverse_rms = 1.f / std::sqrt(mean_square / Scalar(N) + eps);
+    for (size_t channel = 0; channel < N; ++channel) output[channel] = scale(channel) * input[channel] * inverse_rms;
+}
+
 template <size_t N>
 Matrix<N> rms_norm(MatrixView<N> input, VecView<N> gamma, Scalar eps) {
     Matrix<N> output(input.rows());
-    for (size_t row = 0; row < input.rows(); ++row) {
-        Scalar mean_square = 0;
-        for (size_t channel = 0; channel < N; ++channel) mean_square += input.row(row)[channel] * input.row(row)[channel];
-        const Scalar inverse_rms = 1.f / std::sqrt(mean_square / Scalar(N) + eps);
-        for (size_t channel = 0; channel < N; ++channel) output.row_mut(row)[channel] = gamma[channel] * input.row(row)[channel] * inverse_rms;
-    }
+    for (size_t row = 0; row < input.rows(); ++row)
+        rms_norm_row(input.row(row), eps, output.row_mut(row), [&](size_t channel) { return gamma[channel]; });
     return output;
 }
 
 template <size_t N>
 Vec<N> rms_norm(VecView<N> input, VecView<N> gamma, Scalar eps) {
-    Scalar mean_square = 0;
-    for (size_t channel = 0; channel < N; ++channel) mean_square += input[channel] * input[channel];
-    const Scalar inverse_rms = 1.f / std::sqrt(mean_square / Scalar(N) + eps);
     Vec<N> output;
-    for (size_t channel = 0; channel < N; ++channel) output[channel] = gamma[channel] * input[channel] * inverse_rms;
+    rms_norm_row(input, eps, MutVecView<N>{output.begin()}, [&](size_t channel) { return gamma[channel]; });
     return output;
 }
 
 template <size_t N>
 Matrix<N> rms_norm(MatrixView<N> input, Scalar eps) {
     Matrix<N> output(input.rows());
-    for (size_t row = 0; row < input.rows(); ++row) {
-        Scalar mean_square = 0;
-        for (size_t channel = 0; channel < N; ++channel) mean_square += input.row(row)[channel] * input.row(row)[channel];
-        const Scalar inverse_rms = 1.f / std::sqrt(mean_square / Scalar(N) + eps);
-        for (size_t channel = 0; channel < N; ++channel) output.row_mut(row)[channel] = input.row(row)[channel] * inverse_rms;
-    }
+    for (size_t row = 0; row < input.rows(); ++row)
+        rms_norm_row(input.row(row), eps, output.row_mut(row), [](size_t) { return 1.f; });
     return output;
 }
 
 template <size_t N>
 Vec<N> rms_norm(VecView<N> input, Scalar eps) {
-    Scalar mean_square = 0;
-    for (size_t channel = 0; channel < N; ++channel) mean_square += input[channel] * input[channel];
-    const Scalar inverse_rms = 1.f / std::sqrt(mean_square / Scalar(N) + eps);
     Vec<N> output;
-    for (size_t channel = 0; channel < N; ++channel) output[channel] = input[channel] * inverse_rms;
+    rms_norm_row(input, eps, MutVecView<N>{output.begin()}, [](size_t) { return 1.f; });
     return output;
 }
 

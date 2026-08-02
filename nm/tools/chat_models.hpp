@@ -41,6 +41,9 @@ public:
         const auto end = tokenizer_.encode(std::string(Protocol::TURN_END), false, true);
         if (end.size() != 1 || !tokenizer_.is_eog(end.front())) throw std::runtime_error("chat template terminator '" + std::string(Protocol::TURN_END) + "' is not a single end-of-generation token");
         turn_end_ = TokenId{end.front()};
+        // Tokenized once here rather than per turn: ending a thought early is
+        // the model's own closing text, put into the stream on its behalf.
+        thought_end_ = to_tokens(tokenizer_.encode(std::string(Protocol::THOUGHT_END), false, true));
     }
 
     // prefix_memo_ refers to model_, so a ChatModel stays where it was built.
@@ -63,7 +66,7 @@ public:
         first_ = true;
     }
 
-    ChatTurnResult respond(std::string_view user, const RGBImage* image, size_t max_new, const ChatTokenSink& sink) {
+    ChatTurnResult respond(std::string_view user, const RGBImage* image, const TurnBudget& budget, const ChatTokenSink& sink) {
         if (image && !encode_image_) throw std::invalid_argument("this model has no image encoder");
 
         // The turn is text, then optionally image rows, then text. A template
@@ -72,7 +75,7 @@ public:
         // Embed the whole turn before committing any of it: a turn that does
         // not fit must leave the conversation exactly as it was, and only the
         // encoders can say how many rows an image is worth.
-        const ChatTurnText rendered = Protocol::render(user, first_, system_, image != nullptr);
+        const ChatTurnText rendered = Protocol::render(user, first_, system_, image != nullptr, budget.thinks());
         const std::vector<TokenId> before = to_tokens(tokenizer_.encode(rendered.before_image, first_, true));
         Matrix<D> before_rows = model_.tokens(before);
 
@@ -120,7 +123,8 @@ public:
         //
         // Three ways out, and they are not the same event: the model chose to
         // stop, the context filled up, or the caller's --max ran out.
-        for (size_t generated = 0; generated < max_new; ++generated) {
+        size_t thought_tokens = 0;
+        for (size_t generated = 0; generated < budget.max_new; ++generated) {
             const TokenId id = sampler_(logits);
             ++result.delta.generated_tokens;
 
@@ -134,6 +138,7 @@ public:
             }
 
             output.push(tokenizer_.decode1(int32_t(id)));
+            if (output.thinking()) ++thought_tokens;
 
             // The text is already on screen, but there is no room left to
             // record it, so the conversation cannot continue past this token.
@@ -142,12 +147,23 @@ public:
                 return complete();
             }
             logits = extend(id, result.delta);
+
+            // The thought has spent its budget. Closing it is not a display
+            // decision — the closing text goes into the conversation, so from
+            // here the model is answering, and it reads back a turn where it
+            // stopped thinking of its own accord.
+            if (output.thinking() && thought_tokens >= budget.thinking) end_thought(output, logits, result.delta);
         }
 
-        // Out of budget mid-sentence. The model's turn is still open, so close
-        // it here rather than leaving the next turn to continue this one.
+        // Out of budget mid-sentence. The turn is still open — and so is the
+        // thought, if --max ran out inside one. Close both, so the next turn
+        // appends to a transcript in which the model finished what it started
+        // rather than to a channel nobody ever closed.
         result.truncated = true;
-        if (result.delta.generated_tokens > 0) close_truncated_turn(result.delta);
+        if (result.delta.generated_tokens > 0) {
+            if (output.thinking()) end_thought(output, logits, result.delta);
+            close_truncated_turn(result.delta);
+        }
         return complete();
     }
 
@@ -181,6 +197,17 @@ private:
         if (context_used() == CTX) return;
         (void)extend(turn_end_, delta);
     }
+    // End a thought the model has not finished, by writing the text it would
+    // have written itself. The formatter is fed the same pieces, so it moves to
+    // the answer exactly as it would have; `logits` is left predicting the
+    // token after the close, which is the first token of the answer.
+    void end_thought(typename Protocol::Formatter& output, Logits<V>& logits, ChatStats& delta) {
+        for (TokenId id : thought_end_) {
+            if (context_used() == CTX) return;
+            output.push(tokenizer_.decode1(int32_t(id)));
+            logits = extend(id, delta);
+        }
+    }
     void finish(ChatTurnResult& result) {
         stats_.prefill_tokens += result.delta.prefill_tokens;
         stats_.generated_tokens += result.delta.generated_tokens;
@@ -199,6 +226,7 @@ private:
     ImageEncoder encode_image_;
     ChatStats stats_;
     TokenId turn_end_{0};
+    std::vector<TokenId> thought_end_;
     bool first_ = true;
 };
 

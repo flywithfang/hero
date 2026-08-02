@@ -17,22 +17,28 @@ int main(int argc, char** argv) {
     check(!detect_chat_model({"qwen35", 2560, 42}), "a known architecture at an unimplemented depth is rejected");
 
     std::printf("== ChatML rendering ==\n");
-    check(render_chatml_turn("Hi", true, "Be brief.") ==
+    check(render_chatml_turn("Hi", true, "Be brief.", true) ==
               "<|im_start|>system\nBe brief.<|im_end|>\n"
               "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n",
           "first turn renders the system block then opens the assistant turn");
-    check(render_chatml_turn("More", false, "ignored") == "<|im_start|>user\nMore<|im_end|>\n<|im_start|>assistant\n", "later turns do not repeat the system block");
+    check(render_chatml_turn("More", false, "ignored", true) == "<|im_start|>user\nMore<|im_end|>\n<|im_start|>assistant\n", "later turns do not repeat the system block");
+    check(render_chatml_turn("More", false, "", false) == "<|im_start|>user\nMore<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", "thinking off prefills the closed, empty thought the template uses to say so");
 
     std::printf("== Gemma chat rendering ==\n");
     {
-        const ChatTurnText turn = render_gemma_chat_turn("Hello", true, "Be concise.", false);
+        const ChatTurnText turn = render_gemma_chat_turn("Hello", true, "Be concise.", false, true);
         check(turn.before_image == "<|turn>system\n<|think|>\nBe concise.<turn|>\n<|turn>user\n", "first turn renders system and thinking control exactly");
         check(turn.after_image == "Hello<turn|>\n<|turn>model\n", "text-only user and model boundaries are exact");
     }
     {
-        const ChatTurnText turn = render_gemma_chat_turn("Describe it.", false, "ignored", true);
+        const ChatTurnText turn = render_gemma_chat_turn("Describe it.", false, "ignored", true, true);
         check(turn.before_image == "<|turn>user\n<|image>", "later image turn opens an image segment without repeating system");
         check(turn.after_image == "<image|>Describe it.<turn|>\n<|turn>model\n", "image close and user text retain canonical order");
+    }
+    {
+        const ChatTurnText turn = render_gemma_chat_turn("Hello", true, "Be concise.", false, false);
+        check(turn.before_image == "<|turn>system\nBe concise.<turn|>\n<|turn>user\n", "thinking off drops the <|think|> switch but keeps the system prompt");
+        check(render_gemma_chat_turn("Hello", true, "", false, false).before_image == "<|turn>user\n", "a system turn with neither switch nor prompt is not opened at all");
     }
 
     std::printf("== application image boundary ==\n");
@@ -54,17 +60,60 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::printf("== Gemma channel streaming ==\n");
+    std::printf("== channel streaming ==\n");
+    // A formatter's whole job is to say which channel a piece belongs to, so
+    // the fixture records the channel with the text ("R:" reasoning, "A:"
+    // answer) and asserts on both.
+    std::string rendered;
+    const ChatTokenSink record = [&rendered](ChatChannel channel, std::string_view piece) {
+        rendered += channel == ChatChannel::Reasoning ? "R:" : "A:";
+        rendered += piece;
+    };
     {
-        std::string rendered;
-        GemmaChannelFormatter formatter([&](std::string_view piece) { rendered += piece; });
+        GemmaChannelFormatter formatter(record);
         formatter.push("<|channel>");
-        formatter.push("thought");
+        formatter.push("thou");
+        formatter.push("ght");
         formatter.push("\nHere is the reasoning.");
-        formatter.push("<|channel>");
-        formatter.push("final\nThe answer.");
+        formatter.push("\n");
+        formatter.push("<channel|>");
+        formatter.push("\n");
+        formatter.push("The answer.");
         formatter.flush();
-        check(rendered == "\n[thought]\nHere is the reasoning.\n[final]\nThe answer.", "channel protocol becomes readable streaming sections");
+        check(rendered == "R:Here is the reasoning.R:\nA:The answer.", "Gemma's channel splits reasoning from the answer, and both delimiters and the name are consumed");
+    }
+    {
+        rendered.clear();
+        GemmaChannelFormatter formatter(record);
+        formatter.push("Straight to the point.");
+        formatter.flush();
+        check(rendered == "A:Straight to the point.", "a Gemma turn that opens no channel is all answer");
+    }
+    {
+        rendered.clear();
+        ThinkTagFormatter formatter(record);
+        formatter.push("<think>");
+        formatter.push("\n");
+        formatter.push("Work it out.");
+        check(formatter.thinking(), "an open <think> tag is what a thinking budget is spent against");
+        formatter.push("</think>");
+        check(!formatter.thinking(), "the closing tag ends the thought, whoever wrote it");
+        formatter.push("\n\nThe answer.");
+        formatter.flush();
+        check(rendered == "R:Work it out.A:The answer.", "<think> tags split the channels and the protocol's own newlines are dropped");
+    }
+    {
+        // What a zero budget relies on: the thought is already open at the
+        // token that opens it, so it can be closed before any of it is shown.
+        rendered.clear();
+        GemmaChannelFormatter formatter(record);
+        formatter.push("<|channel>");
+        check(formatter.thinking(), "a Gemma thought is open from its opening token, before the name arrives");
+        formatter.push(std::string(GemmaChatProtocol::THOUGHT_END));
+        check(!formatter.thinking(), "the protocol's own closing text ends it");
+        formatter.push("Straight to the answer.");
+        formatter.flush();
+        check(rendered == "A:Straight to the answer.", "a thought closed at once shows nothing at all");
     }
 
     std::printf("\n%s (%d failures)\n", failures ? "CHAT SESSION TESTS FAILED" : "ALL CHAT SESSION TESTS PASSED", failures);

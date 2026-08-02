@@ -88,7 +88,7 @@ public:
 
     Vec<D> operator()(VecView<D> hidden, VecView<P> per_layer_input) const {
         Vec<P> gated = gate_(hidden);
-        gelu(gated);
+        Gelu::apply(gated);
         Vec<P> branch_input = hadamard(VecView<P>(gated), per_layer_input);
         Vec<D> branch = projection_(branch_input);
         branch = post_norm_(branch);
@@ -97,7 +97,7 @@ public:
     }
     Matrix<D> operator()(MatrixView<D> hidden, MatrixView<P> per_layer_input) const {
         Matrix<P> gated = gate_(hidden);
-        gelu_in_place(gated);
+        Gelu::apply(gated);
         Matrix<D> branch = projection_(hadamard(gated.view(), per_layer_input));
         branch = post_norm_(branch);
         return add(hidden, branch.view());
@@ -117,7 +117,7 @@ class GemmaPerLayerInputs {
 public:
     static constexpr size_t Packed = P * L;
 
-    GemmaPerLayerInputs(Weight<Packed, V> token_embeddings, Linear<D, Packed> model_projection, PerHeadNorm<L, P, RMSNorm<P>> projection_norm, Scalar token_scale, Scalar projection_scale, Scalar combination_scale) : token_embeddings_(std::move(token_embeddings)), model_projection_(std::move(model_projection)), projection_norm_(std::move(projection_norm)), token_scale_(token_scale), projection_scale_(projection_scale), combination_scale_(combination_scale) {}
+    GemmaPerLayerInputs(Weight<Packed, V> token_embeddings, Linear<D, Packed> model_projection, PerHeadNorm<RMSNorm<P>> projection_norm, Scalar token_scale, Scalar projection_scale, Scalar combination_scale) : token_embeddings_(std::move(token_embeddings)), model_projection_(std::move(model_projection)), projection_norm_(std::move(projection_norm)), token_scale_(token_scale), projection_scale_(projection_scale), combination_scale_(combination_scale) {}
 
     Vec<Packed> operator()(VecView<D> input_embedding, TokenId identity) const {
         Vec<Packed> token = token_embeddings_.dequant_row(size_t(identity));
@@ -125,7 +125,7 @@ public:
 
         Vec<Packed> context = model_projection_(input_embedding);
         context.scale(projection_scale_);
-        context = projection_norm_(context);
+        projection_norm_.apply(context);  // partitions are layers here
 
         return scaled_sum(VecView<Packed>(context), VecView<Packed>(token), combination_scale_);
     }
@@ -137,7 +137,7 @@ public:
 
         Matrix<Packed> context = model_projection_(input_embeddings);
         context.scale(projection_scale_);
-        context = projection_norm_(context);
+        projection_norm_.apply(context);
 
         return scaled_sum(context.view(), token.view(), combination_scale_);
     }
@@ -145,7 +145,7 @@ public:
 private:
     Weight<Packed, V> token_embeddings_;
     Linear<D, Packed> model_projection_;
-    PerHeadNorm<L, P, RMSNorm<P>> projection_norm_;
+    PerHeadNorm<RMSNorm<P>> projection_norm_;
     Scalar token_scale_;
     Scalar projection_scale_;
     Scalar combination_scale_;
@@ -174,11 +174,11 @@ struct GemmaE4BLayer {
 
     RMSNorm<D> attn_norm;
     Linear<D, Hq * Dh> WQ;
-    PerHeadNorm<Hq, Dh, RMSNorm<Dh>> q_norm;
+    PerHeadNorm<RMSNorm<Dh>> q_norm;
     Linear<D, Hkv * Dh> WK;
-    PerHeadNorm<Hkv, Dh, RMSNorm<Dh>> k_norm;
+    PerHeadNorm<RMSNorm<Dh>> k_norm;
     Linear<D, Hkv * Dh> WV;
-    PerHeadNorm<Hkv, Dh, RMSNormNoScale<Dh>> v_norm;  // V's norm has no learned scale
+    PerHeadNorm<RMSNormNoScale<Dh>> v_norm;  // V's norm has no learned scale
     Linear<Hq * Dh, D> WO;
     RMSNorm<D> post_attn_norm;
     RMSNorm<D> ffn_norm;
@@ -188,24 +188,27 @@ struct GemmaE4BLayer {
     Scalar layer_output_scale;
 
     // This layer owns K and V: project, normalize and append both to its cache.
-    template <class Rope>
+    template <HeadRotation<Dh> Rope>
     Matrix<D> attention(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) const {
-        Matrix<Hq * Dh> Q = q_norm(WQ(X));
+        Matrix<Hq * Dh> Q = WQ(X);
+        q_norm.apply(Q);
         rotate_heads<Hq, Dh>(Q, rope, first_position);
 
-        Matrix<Hkv * Dh> K = k_norm(WK(X));
+        Matrix<Hkv * Dh> K = WK(X);
+        k_norm.apply(K);
         rotate_heads<Hkv, Dh>(K, rope, first_position);
-        Matrix<Hkv * Dh> V = v_norm(WV(X));
+
+        Matrix<Hkv * Dh> V = WV(X);
+        v_norm.apply(V);
 
         Matrix<Hq * Dh> A = attend_and_cache<Hq, Hkv, Dh>(Q.view(), K.view(), V.view(), cache, first_position, window);
         return WO(A.view());
     }
 
-    template <class Rope>
+    template <HeadRotation<Dh> Rope>
     Matrix<D> forward(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window, MatrixView<Gemma4E4BTextConfig::PLE> per_layer_input) const {
-        Matrix<D> U = attn_norm(X);
-        Matrix<D> A = attention(U.view(), cache, rope, first_position, window);
-        A = post_attn_norm(A);
+        const Matrix<D> U = attn_norm(X);
+        const Matrix<D> A = post_attn_norm(attention(U.view(), cache, rope, first_position, window));
         Matrix<D> H = add(X, A.view());
 
         Matrix<D> Z = ffn_norm(H.view());
@@ -230,7 +233,7 @@ struct GemmaE4BSharedLayer {
 
     RMSNorm<D> attn_norm;
     Linear<D, Hq * Dh> WQ;
-    PerHeadNorm<Hq, Dh, RMSNorm<Dh>> q_norm;
+    PerHeadNorm<RMSNorm<Dh>> q_norm;
     Linear<Hq * Dh, D> WO;
     RMSNorm<D> post_attn_norm;
     RMSNorm<D> ffn_norm;
@@ -241,15 +244,16 @@ struct GemmaE4BSharedLayer {
 
     // This layer owns no K/V. It only forms Q and attends to an earlier
     // owning layer's cache; in particular, it never appends cache rows.
-    template <class Rope>
+    template <HeadRotation<Dh> Rope>
     Matrix<D> attention(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) const {
-        Matrix<Hq * Dh> Q = q_norm(WQ(X));
+        Matrix<Hq * Dh> Q = WQ(X);
+        q_norm.apply(Q);
         rotate_heads<Hq, Dh>(Q, rope, first_position);
         Matrix<Hq * Dh> A = attend<Hq, Hkv, Dh>(Q.view(), cache, first_position, window);
         return WO(A.view());
     }
 
-    template <class Rope>
+    template <HeadRotation<Dh> Rope>
     Matrix<D> forward(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window, MatrixView<Gemma4E4BTextConfig::PLE> per_layer_input) const {
         Matrix<D> U = attn_norm(X);
         Matrix<D> A = attention(U.view(), cache, rope, first_position, window);
@@ -373,7 +377,7 @@ private:
     // redirect rather than those layers holding a cache.
     void forward_layer(PrefixState& state, EmbeddedRows<D> input, ResidualStream<D>& residual, const Matrix<C::PLE * C::L>& per_layer, size_t layer_index) const {
         const size_t pos = input.position(0).i;
-        const Matrix<C::PLE> ple = slice_columns<C::PLE>(per_layer.view(), layer_index * C::PLE);
+        const Matrix<C::PLE> ple = slice_columns<C::PLE>(per_layer.view(), layer_index);
         const MatrixView<D> X = residual.matrix();
         const size_t n = C::position_in_kind(layer_index);
         const bool full = C::attention_kind(layer_index) == GemmaAttentionKind::Full;
@@ -477,11 +481,11 @@ struct Gemma12BSlidingLayer {
 
     RMSNorm<D> attn_norm;
     Linear<D, Hq * Dh> WQ;
-    PerHeadNorm<Hq, Dh, RMSNorm<Dh>> q_norm;
+    PerHeadNorm<RMSNorm<Dh>> q_norm;
     Linear<D, Hkv * Dh> WK;
-    PerHeadNorm<Hkv, Dh, RMSNorm<Dh>> k_norm;
+    PerHeadNorm<RMSNorm<Dh>> k_norm;
     Linear<D, Hkv * Dh> WV;
-    PerHeadNorm<Hkv, Dh, RMSNormNoScale<Dh>> v_norm;
+    PerHeadNorm<RMSNormNoScale<Dh>> v_norm;
     Linear<Hq * Dh, D> WO;
     RMSNorm<D> post_attn_norm;
     RMSNorm<D> ffn_norm;
@@ -491,20 +495,24 @@ struct Gemma12BSlidingLayer {
 
     // Sliding attention owns separate K and V projections and appends them to
     // its bounded cache.
-    template <class Rope>
+    template <HeadRotation<Dh> Rope>
     Matrix<D> attention(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) const {
-        Matrix<Hq * Dh> Q = q_norm(WQ(X));
+        Matrix<Hq * Dh> Q = WQ(X);
+        q_norm.apply(Q);
         rotate_heads<Hq, Dh>(Q, rope, first_position);
 
-        Matrix<Hkv * Dh> K = k_norm(WK(X));
+        Matrix<Hkv * Dh> K = WK(X);
+        k_norm.apply(K);
         rotate_heads<Hkv, Dh>(K, rope, first_position);
-        Matrix<Hkv * Dh> V = v_norm(WV(X));
+
+        Matrix<Hkv * Dh> V = WV(X);
+        v_norm.apply(V);
 
         Matrix<Hq * Dh> A = attend_and_cache<Hq, Hkv, Dh>(Q.view(), K.view(), V.view(), cache, first_position, window);
         return WO(A.view());
     }
 
-    template <class Rope>
+    template <HeadRotation<Dh> Rope>
     Matrix<D> forward(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) const {
         Matrix<D> U = attn_norm(X);
         Matrix<D> A = attention(U.view(), cache, rope, first_position, window);
@@ -529,10 +537,10 @@ struct Gemma12BGlobalLayer {
 
     RMSNorm<D> attn_norm;
     Linear<D, Hq * Dh> WQ;
-    PerHeadNorm<Hq, Dh, RMSNorm<Dh>> q_norm;
-    Linear<D, Hkv * Dh> WK;                         // one projection...
-    PerHeadNorm<Hkv, Dh, RMSNorm<Dh>> k_norm;       // ...the key's learned norm
-    PerHeadNorm<Hkv, Dh, RMSNormNoScale<Dh>> v_norm;  // ...and the value's scale-free one
+    PerHeadNorm<RMSNorm<Dh>> q_norm;
+    Linear<D, Hkv * Dh> WK;                 // one projection...
+    PerHeadNorm<RMSNorm<Dh>> k_norm;        // ...the key's learned norm
+    PerHeadNorm<RMSNormNoScale<Dh>> v_norm;  // ...and the value's scale-free one
     Linear<Hq * Dh, D> WO;
     RMSNorm<D> post_attn_norm;
     RMSNorm<D> ffn_norm;
@@ -541,22 +549,26 @@ struct Gemma12BGlobalLayer {
     Scalar layer_output_scale;
 
     // Unified K/V: project once. K gets its learned norm and RoPE; V gets the
-    // scale-free norm directly from the same unrotated projection.
-    template <class Rope>
+    // scale-free norm directly from the same unrotated projection — which is
+    // why this is the one attention that must copy: two different norms read
+    // the same projected rows, so neither can consume them.
+    template <HeadRotation<Dh> Rope>
     Matrix<D> attention(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) const {
-        Matrix<Hq * Dh> Q = q_norm(WQ(X));
+        Matrix<Hq * Dh> Q = WQ(X);
+        q_norm.apply(Q);
         rotate_heads<Hq, Dh>(Q, rope, first_position);
 
-        Matrix<Hkv * Dh> projected = WK(X);
-        Matrix<Hkv * Dh> K = k_norm(projected.view());
+        Matrix<Hkv * Dh> V = WK(X);
+        Matrix<Hkv * Dh> K = copy(V.view());
+        k_norm.apply(K);
         rotate_heads<Hkv, Dh>(K, rope, first_position);
-        Matrix<Hkv * Dh> V = v_norm(projected.view());
+        v_norm.apply(V);
 
         Matrix<Hq * Dh> A = attend_and_cache<Hq, Hkv, Dh>(Q.view(), K.view(), V.view(), cache, first_position, window);
         return WO(A.view());
     }
 
-    template <class Rope>
+    template <HeadRotation<Dh> Rope>
     Matrix<D> forward(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) const {
         Matrix<D> U = attn_norm(X);
         Matrix<D> A = attention(U.view(), cache, rope, first_position, window);

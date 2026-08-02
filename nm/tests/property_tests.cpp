@@ -188,7 +188,7 @@ int main() {
     {
         std::vector<Scalar> s(50);
         fill(s.data(), 50, 3.f);
-        softmax(std::span<Scalar>(s.data(), 50));
+        Softmax::apply(std::span<Scalar>(s.data(), 50));
         Scalar sum = 0;
         for (Scalar v : s) sum += v;
         check(std::fabs(sum - 1.f) < 1e-5f, "sum == 1");
@@ -197,7 +197,7 @@ int main() {
     {
         Vec<1> z;
         z[0] = 2.f;
-        silu(z);
+        Silu::apply(z);
         check(std::fabs(z[0] - 1.7616f) < 1e-3f, "silu(2)=1.7616");
     }
 

@@ -62,13 +62,83 @@ private:
     Scalar input_min_, input_max_, output_min_, output_max_;
 };
 
+// ---- activations ------------------------------------------------------------
+//
+// An activation carries no weights, so it has no state — but it is still an
+// operation with a name, applied to a whole vector or a whole sequence of rows,
+// and it belongs to a type rather than floating in the global namespace. That
+// type is also what lets one GatedMLP serve both SwiGLU and Gemma's GELU gate.
+struct Gelu {  // gelu_pytorch_tanh
+    template <size_t N>
+    static void apply(MutVecView<N> x) {
+        for (size_t i = 0; i < N; ++i) {
+            const Scalar v = x[i];
+            x[i] = 0.5f * v * (1.f + std::tanh(0.7978845608f * (v + 0.044715f * v * v * v)));
+        }
+    }
+    template <size_t N>
+    static void apply(Vec<N>& x) { apply(MutVecView<N>(x)); }
+    template <size_t C>
+    static void apply(Matrix<C>& x) { x.transform_rows([](MutVecView<C> row) { apply(row); }); }
+};
+
+struct Silu {  // z * sigmoid(z)
+    template <size_t N>
+    static void apply(MutVecView<N> x) {
+        for (size_t i = 0; i < N; ++i) x[i] = x[i] / (1.f + std::exp(-x[i]));  // not x*sigmoid(x): fp32 rounds them differently
+    }
+    template <size_t N>
+    static void apply(Vec<N>& x) { apply(MutVecView<N>(x)); }
+    template <size_t C>
+    static void apply(Matrix<C>& x) { x.transform_rows([](MutVecView<C> row) { apply(row); }); }
+};
+
+// Softmax is the one activation over a RUNTIME-length axis: attention scores
+// over however many keys are visible. Hence the span form.
+struct Softmax {
+    static void apply(std::span<Scalar> values) {
+        const Scalar largest = *std::max_element(values.begin(), values.end());
+        Scalar total = 0;
+        for (Scalar& value : values) {
+            value = std::exp(value - largest);
+            total += value;
+        }
+        for (Scalar& value : values) value /= total;
+    }
+    template <size_t N>
+    static void apply(Vec<N>& x) { apply(std::span<Scalar>(x.begin(), N)); }
+};
+
+// ---- normalization ----------------------------------------------------------
+//
+// The norm owns gamma AND the equation that uses it. Nothing outside needs a
+// loose rms_norm(x, gamma, eps): a caller that has the weights has the type.
 template <size_t N>
 class RMSNorm {
 public:
+    static constexpr size_t WIDTH = N;
+
     explicit RMSNorm(Vec<N> gamma, Scalar eps = 1e-5f) : gamma_(std::move(gamma)), eps_(eps) {}
 
-    Vec<N> operator()(VecView<N> x) const { return rms_norm(x, VecView<N>(gamma_), eps_); }
-    Matrix<N> operator()(MatrixView<N> x) const { return rms_norm(x, VecView<N>(gamma_), eps_); }
+    // The reduction completes before any element is written, so `x` may be
+    // both the input and the output.
+    void apply(MutVecView<N> x) const {
+        const VecView<N> input = x;  // deduction cannot see the conversion; name it once
+        const Scalar inverse_rms = 1.f / std::sqrt(dot(input, input) / Scalar(N) + eps_);
+        for (size_t channel = 0; channel < N; ++channel) x[channel] = gamma_[channel] * x[channel] * inverse_rms;
+    }
+    void apply(Matrix<N>& x) const { x.transform_rows([&](MutVecView<N> row) { apply(row); }); }
+
+    Vec<N> operator()(VecView<N> x) const {
+        Vec<N> normalized = copy(x);
+        apply(MutVecView<N>(normalized));
+        return normalized;
+    }
+    Matrix<N> operator()(MatrixView<N> x) const {
+        Matrix<N> normalized = copy(x);
+        apply(normalized);
+        return normalized;
+    }
 
 private:
     Vec<N> gamma_;
@@ -81,33 +151,88 @@ private:
 template <size_t N>
 class RMSNormNoScale {
 public:
+    static constexpr size_t WIDTH = N;
+
     explicit RMSNormNoScale(Scalar eps = 1e-6f) : eps_(eps) {}
 
-    Vec<N> operator()(VecView<N> x) const { return rms_norm(x, eps_); }
-    Matrix<N> operator()(MatrixView<N> x) const { return rms_norm(x, eps_); }
+    void apply(MutVecView<N> x) const {
+        const VecView<N> input = x;  // deduction cannot see the conversion; name it once
+        const Scalar inverse_rms = 1.f / std::sqrt(dot(input, input) / Scalar(N) + eps_);
+        for (size_t channel = 0; channel < N; ++channel) x[channel] *= inverse_rms;
+    }
+    void apply(Matrix<N>& x) const { x.transform_rows([&](MutVecView<N> row) { apply(row); }); }
+
+    Vec<N> operator()(VecView<N> x) const {
+        Vec<N> normalized = copy(x);
+        apply(MutVecView<N>(normalized));
+        return normalized;
+    }
+    Matrix<N> operator()(MatrixView<N> x) const {
+        Matrix<N> normalized = copy(x);
+        apply(normalized);
+        return normalized;
+    }
 
 private:
     Scalar eps_;
 };
 
+// What it takes to be normalized per partition: a fixed WIDTH, and the ability
+// to rewrite one WIDTH-wide vector in place.
+template <class N>
+concept PartitionNorm = requires(const N& norm, MutVecView<N::WIDTH> partition) { norm.apply(partition); };
+
+// ---- the same narrow norm, applied to every head -----------------------------
+//
+// The checkpoint's Q/K norm is ONE head-wide scale vector (`attn_q_norm` is 256
+// floats) and the tensor it normalizes is Heads times wider. So the head COUNT
+// is not part of this type — it follows from whatever it is applied to, and the
+// only width the type names is the one the checkpoint actually has.
+//
+// Gemma's PLE projection is the same operation with layers in the role of
+// heads: one 256-wide scale across 42 consecutive partitions.
+template <PartitionNorm Norm>
+class PerHeadNorm {
+public:
+    static constexpr size_t HEAD_DIM = Norm::WIDTH;
+
+    explicit PerHeadNorm(Norm norm) : norm_(std::move(norm)) {}
+
+    template <size_t Total>
+    void apply(MutVecView<Total> value) const {
+        static_assert(Total % HEAD_DIM == 0, "PerHeadNorm: the tensor is not a whole number of heads");
+        for (size_t head = 0; head < Total / HEAD_DIM; ++head) norm_.apply(slice_mut<HEAD_DIM>(value, head));
+    }
+    template <size_t Total>
+    void apply(Vec<Total>& value) const { apply(MutVecView<Total>(value)); }
+    template <size_t Total>
+    void apply(Matrix<Total>& values) const { values.transform_rows([&](MutVecView<Total> value) { apply(value); }); }
+
+private:
+    Norm norm_;
+};
+
 // ---- channel mixers ---------------------------------------------------------
 //
-// SwiGLU: silu(gate) ⊙ up, then down. The Qwen-family channel mixer.
-template <size_t D, size_t FF>
+// activation(gate) ⊙ up, then down. The two dense mixers in modern decoders
+// differ in exactly one symbol — Qwen's SwiGLU uses silu, Gemma 4 uses
+// gelu_pytorch_tanh — so the activation is the parameter and the equation is
+// written once.
+template <size_t D, size_t FF, class Activation = Silu>
 class GatedMLP {
 public:
     GatedMLP(Linear<D, FF> gate, Linear<D, FF> up, Linear<FF, D> down) : gate_(std::move(gate)), up_(std::move(up)), down_(std::move(down)) {}
 
     Vec<D> operator()(VecView<D> x) const {
         Vec<FF> g = gate_(x);
-        silu(g);
+        Activation::apply(g);
         Vec<FF> u = up_(x);
         g *= u;
         return down_(g);
     }
     Matrix<D> operator()(MatrixView<D> x) const {
         Matrix<FF> gate = gate_(x);
-        silu_in_place(gate);
+        Activation::apply(gate);
         Matrix<FF> up = up_(x);
         return down_(hadamard(gate.view(), up.view()));
     }
@@ -117,30 +242,8 @@ private:
     Linear<FF, D> down_;
 };
 
-// Gemma 4 uses gelu_pytorch_tanh(gate) * up rather than SwiGLU.
 template <size_t D, size_t FF>
-class GeluGatedMLP {
-public:
-    GeluGatedMLP(Linear<D, FF> gate, Linear<D, FF> up, Linear<FF, D> down) : gate_(std::move(gate)), up_(std::move(up)), down_(std::move(down)) {}
-
-    Vec<D> operator()(VecView<D> x) const {
-        Vec<FF> g = gate_(x);
-        gelu(g);
-        Vec<FF> u = up_(x);
-        g *= u;
-        return down_(g);
-    }
-    Matrix<D> operator()(MatrixView<D> x) const {
-        Matrix<FF> gate = gate_(x);
-        gelu_in_place(gate);
-        Matrix<FF> up = up_(x);
-        return down_(hadamard(gate.view(), up.view()));
-    }
-
-private:
-    Linear<D, FF> gate_, up_;
-    Linear<FF, D> down_;
-};
+using GeluGatedMLP = GatedMLP<D, FF, Gelu>;
 
 // Sparse channel mixer: route each token to TOPK of NE experts, plus SHARED
 // always-on experts. The expert body is a parameter because a family's sparse
@@ -155,7 +258,7 @@ public:
 
     Vec<D> operator()(VecView<D> x) const {
         Vec<NE> s = router_(x);
-        softmax(std::span<Scalar>(s.begin(), NE));
+        Softmax::apply(s);
         std::array<size_t, NE> idx;
         std::iota(idx.begin(), idx.end(), 0u);
         std::partial_sort(idx.begin(), idx.begin() + TOPK, idx.end(), [&](size_t a, size_t b) { return s[a] > s[b]; });

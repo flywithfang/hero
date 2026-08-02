@@ -140,6 +140,9 @@ struct MutVecView {
     Scalar& operator[](size_t i) const { return p[i]; }
     Scalar* begin() const { return p; }
     Scalar* end() const { return p + N; }
+    // Writable implies readable, so an in-place kernel can name its own input
+    // without reconstructing a view from a raw pointer.
+    operator VecView<N>() const { return VecView<N>(p); }
 
     Scalar* p;
 };
@@ -343,42 +346,32 @@ Vec<N> clamp(VecView<N> input, Scalar minimum, Scalar maximum) {
     return output;
 }
 
-template <size_t W_, size_t N>
-VecView<W_> slice(VecView<N> v, size_t off) {
-    static_assert(W_ <= N);
-    return VecView<W_>(&v[off]);
+// ---- a wide vector read as a sequence of Width-wide partitions --------------
+//
+// Heads inside a projection, layers inside the packed PLE table, one head
+// inside one region of a packed [q|k|v] stream. The runtime argument is a
+// PARTITION INDEX, never an element offset: `slice<HeadDim>(q, head)`, not
+// `head * HeadDim`. Multiplying is this function's job, so a caller cannot get
+// the stride wrong.
+//
+// Base is where the partitioning starts, and it is a compile-time constant
+// because it is always a region boundary in a fixed packed layout — the only
+// place an element offset is legitimate, and it is checked at compile time.
+template <size_t Width, size_t Base = 0, size_t N>
+VecView<Width> slice(VecView<N> v, size_t index) {
+    static_assert(Base + Width <= N, "slice: the first partition does not fit");
+    if (index >= (N - Base) / Width) throw std::out_of_range("slice: partition index out of range");
+    return VecView<Width>(&v[Base + index * Width]);
 }
-template <size_t W_, size_t N>
-MutVecView<W_> slice_mut(MutVecView<N> v, size_t off) {
-    static_assert(W_ <= N);
-    return MutVecView<W_>(&v[off]);
+template <size_t Width, size_t Base = 0, size_t N>
+MutVecView<Width> slice_mut(MutVecView<N> v, size_t index) {
+    static_assert(Base + Width <= N, "slice_mut: the first partition does not fit");
+    if (index >= (N - Base) / Width) throw std::out_of_range("slice_mut: partition index out of range");
+    return MutVecView<Width>(&v[Base + index * Width]);
 }
-template <size_t W_, size_t N>
-MutVecView<W_> slice_mut(Vec<N>& v, size_t off) {
-    return slice_mut<W_>(MutVecView<N>(v), off);
-}
-
-// RMSNorm is a row operation.
-template <size_t N, class Scale>
-void rms_norm_row(VecView<N> input, Scalar eps, MutVecView<N> output, Scale&& scale) {
-    Scalar mean_square = 0;
-    for (size_t channel = 0; channel < N; ++channel) mean_square += input[channel] * input[channel];
-    const Scalar inverse_rms = 1.f / std::sqrt(mean_square / Scalar(N) + eps);
-    for (size_t channel = 0; channel < N; ++channel) output[channel] = scale(channel) * input[channel] * inverse_rms;
-}
-
-template <size_t N>
-Vec<N> rms_norm(VecView<N> input, VecView<N> gamma, Scalar eps) {
-    Vec<N> output;
-    rms_norm_row(input, eps, MutVecView<N>(output), [&](size_t channel) { return gamma[channel]; });
-    return output;
-}
-
-template <size_t N>
-Vec<N> rms_norm(VecView<N> input, Scalar eps) {
-    Vec<N> output;
-    rms_norm_row(input, eps, MutVecView<N>(output), [](size_t) { return 1.f; });
-    return output;
+template <size_t Width, size_t Base = 0, size_t N>
+MutVecView<Width> slice_mut(Vec<N>& v, size_t index) {
+    return slice_mut<Width, Base>(MutVecView<N>(v), index);
 }
 
 // ---- the same algebra over a sequence of rows ------------------------------
@@ -428,12 +421,13 @@ Matrix<N> clamp(MatrixView<N> input, Scalar minimum, Scalar maximum) {
     return output;
 }
 
+// The same partitioning applied to every row: `index` is a partition index, as
+// it is for slice().
 template <size_t Width, size_t Total>
-Matrix<Width> slice_columns(MatrixView<Total> input, size_t first_column) {
-    if (first_column > Total || Width > Total - first_column) throw std::out_of_range("slice_columns: column range out of bounds");
+Matrix<Width> slice_columns(MatrixView<Total> input, size_t index) {
     Matrix<Width> output;
     output.reserve(input.rows());
-    for (size_t row = 0; row < input.rows(); ++row) output.append(slice<Width>(input.row(row), first_column));
+    for (size_t row = 0; row < input.rows(); ++row) output.append(slice<Width>(input.row(row), index));
     return output;
 }
 
@@ -444,66 +438,13 @@ Matrix<N> scaled_sum(MatrixView<N> left, MatrixView<N> right, Scalar scale) {
     return output;
 }
 
-template <size_t N>
-Matrix<N> rms_norm(MatrixView<N> input, VecView<N> gamma, Scalar eps) {
-    Matrix<N> output;
-    output.reserve(input.rows());
-    for (size_t row = 0; row < input.rows(); ++row) output.append(rms_norm(input.row(row), gamma, eps));
-    return output;
-}
-
-template <size_t N>
-Matrix<N> rms_norm(MatrixView<N> input, Scalar eps) {
-    Matrix<N> output;
-    output.reserve(input.rows());
-    for (size_t row = 0; row < input.rows(); ++row) output.append(rms_norm(input.row(row), eps));
-    return output;
-}
-
-inline void softmax(std::span<Scalar> s) {
-    Scalar mx = *std::max_element(s.begin(), s.end()), sum = 0;
-    for (auto& v : s) {
-        v = std::exp(v - mx);
-        sum += v;
-    }
-    for (auto& v : s) v /= sum;
-}
-template <size_t N>
-void gelu(MutVecView<N> v) {
-    for (size_t i = 0; i < N; ++i) {
-        Scalar x = v[i];
-        v[i] = 0.5f * x * (1.f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
-    }
-}
+// sigmoid is a scalar function of a scalar, like std::exp: no storage to be a
+// method of, no state to be a type. Gelu/Silu/Softmax live in components.hpp.
 inline Scalar sigmoid(Scalar x) { return 1.f / (1.f + std::exp(-x)); }
 
 template <size_t N>
-void silu(MutVecView<N> v) {  // z·sigmoid(z)
-    for (size_t i = 0; i < N; ++i) v[i] = v[i] / (1.f + std::exp(-v[i]));
-}
-// An owned vector converts to a mutable view, but deduction cannot see that,
-// so both activations get the one-line forwarding overload.
-template <size_t N>
-void gelu(Vec<N>& v) {
-    gelu(MutVecView<N>(v));
-}
-template <size_t N>
-void silu(Vec<N>& v) {
-    silu(MutVecView<N>(v));
-}
-template <size_t N>
 void operator*=(Vec<N>& y, const Vec<N>& x) {
     for (size_t i = 0; i < N; ++i) y[i] *= x[i];  // Hadamard
-}
-
-template <size_t N>
-void gelu_in_place(Matrix<N>& matrix) {
-    matrix.transform_rows([](MutVecView<N> row) { gelu(row); });
-}
-
-template <size_t N>
-void silu_in_place(Matrix<N>& matrix) {
-    matrix.transform_rows([](MutVecView<N> row) { silu(row); });
 }
 
 // ---- the parallel seams (M5 replaces the bodies with a thread pool) --------
@@ -551,29 +492,6 @@ Matrix<Heads * Dim> par_map_heads(size_t rows, F&& f) {
         std::copy(partition.begin(), partition.end(), values.data() + (row * Heads + head) * Dim);
     });
     return Matrix<Heads * Dim>::from_row_major(std::move(values));
-}
-
-// Dense multi-head attention:
-//   softmax_rows(scale * Q K^T) V
-// Q/K/V are [tokens, heads * head_dimension]. Some architectures normalize
-// Q/K and use a scale of one (Gemma vision); conventional attention passes
-// 1/sqrt(head_dimension). This reference kernel preserves the mathematical
-// interface while a backend may fuse and tile the operation.
-template <size_t Heads, size_t QueryKeyDim, size_t ValueDim>
-Matrix<Heads * ValueDim> scaled_dot_product_attention(MatrixView<Heads * QueryKeyDim> queries, MatrixView<Heads * QueryKeyDim> keys, MatrixView<Heads * ValueDim> values, Scalar scale) {
-    if (keys.rows() != values.rows()) throw std::invalid_argument("scaled_dot_product_attention: K/V row mismatch");
-
-    return par_map_heads<Heads, ValueDim>(queries.rows(), [&](size_t query_row, size_t head) {
-        const VecView<QueryKeyDim> query = slice<QueryKeyDim>(queries.row(query_row), head * QueryKeyDim);
-
-        std::vector<Scalar> scores(keys.rows());
-        for (size_t key_row = 0; key_row < keys.rows(); ++key_row) scores[key_row] = scale * dot(query, slice<QueryKeyDim>(keys.row(key_row), head * QueryKeyDim));
-        softmax(scores);
-
-        Vec<ValueDim> attended;
-        for (size_t key_row = 0; key_row < keys.rows(); ++key_row) attended.scaled_add(slice<ValueDim>(values.row(key_row), head * ValueDim), scores[key_row]);
-        return attended;
-    });
 }
 
 // ---- MatT<In,Out>: the ggml/llama.cpp weight layout (row = output) ---------

@@ -16,35 +16,10 @@
 #include <stdexcept>
 #include <vector>
 
-// ---- per-head normalization -------------------------------------------------
-//
-// Q/K normalization is applied inside each head, over HeadDim, with one scale
-// vector shared by every head. Modern families (Gemma 4, Qwen 3.x) all do this;
-// it is what lets a model fold the 1/sqrt(HeadDim) score scale into a learned
-// weight instead of a constant.
-template <size_t Heads, size_t HeadDim, class Norm>
-class PerHeadNorm {
-public:
-    explicit PerHeadNorm(Norm norm) : norm_(std::move(norm)) {}
-
-    Vec<Heads * HeadDim> operator()(VecView<Heads * HeadDim> x) const {
-        Vec<Heads * HeadDim> output;
-        for (size_t head = 0; head < Heads; ++head) {
-            Vec<HeadDim> normalized = norm_(VecView<HeadDim>(x.begin() + head * HeadDim));
-            std::copy(normalized.begin(), normalized.end(), output.begin() + head * HeadDim);
-        }
-        return output;
-    }
-    Matrix<Heads * HeadDim> operator()(MatrixView<Heads * HeadDim> x) const {
-        Matrix<Heads * HeadDim> output;
-        output.reserve(x.rows());
-        for (size_t row = 0; row < x.rows(); ++row) output.append((*this)(x.row(row)));
-        return output;
-    }
-
-private:
-    Norm norm_;
-};
+// Q/K normalization is `PerHeadNorm` from components.hpp: one HeadDim-wide
+// scale vector walked across the heads. Modern families (Gemma 4, Qwen 3.x) all
+// do this; it is what lets a model fold the 1/sqrt(HeadDim) score scale into a
+// learned weight instead of a constant.
 
 // ---- gated attention --------------------------------------------------------
 //
@@ -117,16 +92,46 @@ private:
     std::array<Scalar, Planes> inv_freq_{};
 };
 
-template <size_t Heads, size_t HeadDim, class Rope>
+// A rotation is, to rotate_heads, exactly what a norm is to PerHeadNorm: an
+// in-place rewrite of one head-wide partition, here parameterized by position.
+// Any table with that operation works — the two Gemma widths, the two bases,
+// full or partial rotation — and nothing else does.
+template <class R, size_t HeadDim>
+concept HeadRotation = requires(const R& rope, MutVecView<HeadDim> head, size_t position) { rope.apply(head, position); };
+
+template <size_t Heads, size_t HeadDim, HeadRotation<HeadDim> Rope>
 void rotate_heads(MutVecView<Heads * HeadDim> value, const Rope& rope, size_t position) {
     for (size_t h = 0; h < Heads; ++h) {
-        rope.apply(slice_mut<HeadDim>(value, h * HeadDim), position);
+        rope.apply(slice_mut<HeadDim>(value, h), position);
     }
 }
 
-template <size_t Heads, size_t HeadDim, class Rope>
+template <size_t Heads, size_t HeadDim, HeadRotation<HeadDim> Rope>
 void rotate_heads(Matrix<Heads * HeadDim>& values, const Rope& rope, size_t first_position) {
     values.transform_rows([&](size_t row, MutVecView<Heads * HeadDim> value) { rotate_heads<Heads, HeadDim>(value, rope, first_position + row); });
+}
+
+// Dense multi-head attention:
+//   softmax_rows(scale * Q K^T) V
+// Q/K/V are [tokens, heads * head_dimension]. Some architectures normalize
+// Q/K and use a scale of one (Gemma vision); conventional attention passes
+// 1/sqrt(head_dimension). This reference kernel preserves the mathematical
+// interface while a backend may fuse and tile the operation.
+template <size_t Heads, size_t QueryKeyDim, size_t ValueDim>
+Matrix<Heads * ValueDim> scaled_dot_product_attention(MatrixView<Heads * QueryKeyDim> queries, MatrixView<Heads * QueryKeyDim> keys, MatrixView<Heads * ValueDim> values, Scalar scale) {
+    if (keys.rows() != values.rows()) throw std::invalid_argument("scaled_dot_product_attention: K/V row mismatch");
+
+    return par_map_heads<Heads, ValueDim>(queries.rows(), [&](size_t query_row, size_t head) {
+        const VecView<QueryKeyDim> query = slice<QueryKeyDim>(queries.row(query_row), head);
+
+        std::vector<Scalar> scores(keys.rows());
+        for (size_t key_row = 0; key_row < keys.rows(); ++key_row) scores[key_row] = scale * dot(query, slice<QueryKeyDim>(keys.row(key_row), head));
+        Softmax::apply(scores);
+
+        Vec<ValueDim> attended;
+        for (size_t key_row = 0; key_row < keys.rows(); ++key_row) attended.scaled_add(slice<ValueDim>(values.row(key_row), head), scores[key_row]);
+        return attended;
+    });
 }
 
 // ---- the K/V cache ----------------------------------------------------------
@@ -241,16 +246,23 @@ void require_visible_key(const KVCache<Hkv, HeadDim>& cache, Position query_posi
 // attention passes 1/sqrt(HeadDim), while a family that normalizes Q per head
 // (Gemma 4) has already folded that constant into a learned weight and passes 1.
 //
-// GQA: the Hq query heads are partitioned into Hkv groups of Hq/Hkv, and every
-// head of a group reads the same cached k/v rows. Only visible rows are
-// gathered, so the score matrix is never materialized and masked-out entries
-// cost nothing. [COMPUTE][GROWS-T]
-template <size_t Hq, size_t Hkv, size_t HeadDim>
-Vec<HeadDim> attend_head(VecView<Hq * HeadDim> query, const KVCache<Hkv, HeadDim>& cache, Position query_position, size_t query_head, size_t sliding_window, Scalar score_scale) {
+// GQA's head mapping, in exactly one place: the Hq query heads partition into
+// Hkv groups of Hq/Hkv, and every head of a group reads the same cached k/v
+// rows. This is the only construction of a KvHead in the engine. (Qwen 3.5's
+// delta net TILES instead — key head h % Hk — and says so in its own file,
+// because that is a different mapping and not a variant of this one.)
+template <size_t Hq, size_t Hkv>
+constexpr KvHead kv_head_of(size_t query_head) {
     static_assert(Hq % Hkv == 0, "GQA groups must divide evenly");
-    const KvHead group{query_head / (Hq / Hkv)};
-    const VecView<HeadDim> q = slice<HeadDim>(query, query_head * HeadDim);
+    return KvHead{query_head / (Hq / Hkv)};
+}
 
+// One head's reduction, and nothing about the packed layout it came from: the
+// caller has already selected this head's query and its k/v group. Only visible
+// rows are gathered, so the score matrix is never materialized and masked-out
+// entries cost nothing. [COMPUTE][GROWS-T]
+template <size_t Hkv, size_t HeadDim>
+Vec<HeadDim> attend_head(VecView<HeadDim> query, const KVCache<Hkv, HeadDim>& cache, KvHead group, Position query_position, size_t sliding_window, Scalar score_scale) {
     std::vector<size_t> J;      // the visible cache rows
     std::vector<Scalar> alpha;  // scores s_j, then softmax weights
     J.reserve(cache.size());
@@ -258,12 +270,11 @@ Vec<HeadDim> attend_head(VecView<Hq * HeadDim> query, const KVCache<Hkv, HeadDim
     for (size_t j = 0; j < cache.size(); ++j) {
         if (!key_is_visible(cache.position(j), query_position, sliding_window)) continue;
         J.push_back(j);
-        alpha.push_back(score_scale * dot(q, cache.key(j, group)));
+        alpha.push_back(score_scale * dot(query, cache.key(j, group)));
     }
-    softmax(alpha);
+    Softmax::apply(alpha);
 
     Vec<HeadDim> attended;  // zero-initialized; this is the sum
-    ///score*V
     for (size_t n = 0; n < J.size(); ++n) attended.scaled_add(cache.value(J[n], group), alpha[n]);
     return attended;
 }
@@ -278,7 +289,7 @@ Vec<HeadDim> attend_head(VecView<Hq * HeadDim> query, const KVCache<Hkv, HeadDim
 template <size_t Hq, size_t Hkv, size_t HeadDim>
 Vec<Hq * HeadDim> attend(VecView<Hq * HeadDim> query, const KVCache<Hkv, HeadDim>& cache, Position query_position, size_t sliding_window = 0, Scalar score_scale = 1.f) {
     require_visible_key(cache, query_position, sliding_window);
-    return par_map<Hq, HeadDim>([&](size_t head) { return attend_head<Hq>(query, cache, query_position, head, sliding_window, score_scale); });
+    return par_map<Hq, HeadDim>([&](size_t head) { return attend_head(slice<HeadDim>(query, head), cache, kv_head_of<Hq, Hkv>(head), query_position, sliding_window, score_scale); });
 }
 
 template <size_t Hq, size_t Hkv, size_t HeadDim>
@@ -288,7 +299,7 @@ Matrix<Hq * HeadDim> attend(MatrixView<Hq * HeadDim> queries, const KVCache<Hkv,
     // Rows x heads are mutually independent, so the batch is one flat task
     // space rather than a map over heads alone: par_map_heads, whose partition
     // is exactly one head of one query row.
-    return par_map_heads<Hq, HeadDim>(queries.rows(), [&](size_t row, size_t head) { return attend_head<Hq>(queries.row(row), cache, Position{first_query_position + row}, head, sliding_window, score_scale); });
+    return par_map_heads<Hq, HeadDim>(queries.rows(), [&](size_t row, size_t head) { return attend_head(slice<HeadDim>(queries.row(row), head), cache, kv_head_of<Hq, Hkv>(head), Position{first_query_position + row}, sliding_window, score_scale); });
 }
 
 // Append this batch's K/V, then attend. Splitting append from attend is what

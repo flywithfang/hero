@@ -73,9 +73,9 @@ Linear<In, Out> load_linear(const GGUF& gguf, size_t layer, const char* suffix) 
     return Linear<In, Out>(tensor_loader::load_weight<In, Out>(gguf, block(layer, suffix)));
 }
 
-template <size_t Heads, size_t HeadDim>
-PerHeadNorm<Heads, HeadDim, RMSNorm<HeadDim>> load_head_norm(const GGUF& gguf, size_t layer, const char* suffix, Scalar eps) {
-    return PerHeadNorm<Heads, HeadDim, RMSNorm<HeadDim>>(RMSNorm<HeadDim>(tensor_loader::load_vector<HeadDim>(gguf, block(layer, suffix)), eps));
+template <size_t HeadDim>
+PerHeadNorm<RMSNorm<HeadDim>> load_head_norm(const GGUF& gguf, size_t layer, const char* suffix, Scalar eps) {
+    return PerHeadNorm<RMSNorm<HeadDim>>(RMSNorm<HeadDim>(tensor_loader::load_vector<HeadDim>(gguf, block(layer, suffix)), eps));
 }
 
 template <size_t D, size_t FF>
@@ -90,7 +90,7 @@ inline GemmaPerLayerResidual<C::D, C::PLE> load_ple_residual(const GGUF& gguf, s
 template <size_t Dh>
 GemmaE4BLayer<Dh> load_e4b_layer(const GGUF& gguf, size_t layer) {
     using Layer = GemmaE4BLayer<Dh>;
-    return Layer{.attn_norm = load_norm<C::D>(gguf, layer, "attn_norm.weight", C::RMS_EPS), .WQ = load_linear<C::D, Layer::Hq * Dh>(gguf, layer, "attn_q.weight"), .q_norm = load_head_norm<Layer::Hq, Dh>(gguf, layer, "attn_q_norm.weight", C::RMS_EPS), .WK = load_linear<C::D, Layer::Hkv * Dh>(gguf, layer, "attn_k.weight"), .k_norm = load_head_norm<Layer::Hkv, Dh>(gguf, layer, "attn_k_norm.weight", C::RMS_EPS), .WV = load_linear<C::D, Layer::Hkv * Dh>(gguf, layer, "attn_v.weight"), .v_norm = PerHeadNorm<Layer::Hkv, Dh, RMSNormNoScale<Dh>>(RMSNormNoScale<Dh>(C::RMS_EPS)), .WO = load_linear<Layer::Hq * Dh, C::D>(gguf, layer, "attn_output.weight"), .post_attn_norm = load_norm<C::D>(gguf, layer, "post_attention_norm.weight", C::RMS_EPS), .ffn_norm = load_norm<C::D>(gguf, layer, "ffn_norm.weight", C::RMS_EPS), .ffn = load_gelu_mlp<C::D, C::FF>(gguf, layer), .post_ffn_norm = load_norm<C::D>(gguf, layer, "post_ffw_norm.weight", C::RMS_EPS), .ple = load_ple_residual(gguf, layer), .layer_output_scale = optional_scalar(gguf, block(layer, "layer_output_scale.weight"), 1.f)};
+    return Layer{.attn_norm = load_norm<C::D>(gguf, layer, "attn_norm.weight", C::RMS_EPS), .WQ = load_linear<C::D, Layer::Hq * Dh>(gguf, layer, "attn_q.weight"), .q_norm = load_head_norm<Dh>(gguf, layer, "attn_q_norm.weight", C::RMS_EPS), .WK = load_linear<C::D, Layer::Hkv * Dh>(gguf, layer, "attn_k.weight"), .k_norm = load_head_norm<Dh>(gguf, layer, "attn_k_norm.weight", C::RMS_EPS), .WV = load_linear<C::D, Layer::Hkv * Dh>(gguf, layer, "attn_v.weight"), .v_norm = PerHeadNorm<RMSNormNoScale<Dh>>(RMSNormNoScale<Dh>(C::RMS_EPS)), .WO = load_linear<Layer::Hq * Dh, C::D>(gguf, layer, "attn_output.weight"), .post_attn_norm = load_norm<C::D>(gguf, layer, "post_attention_norm.weight", C::RMS_EPS), .ffn_norm = load_norm<C::D>(gguf, layer, "ffn_norm.weight", C::RMS_EPS), .ffn = load_gelu_mlp<C::D, C::FF>(gguf, layer), .post_ffn_norm = load_norm<C::D>(gguf, layer, "post_ffw_norm.weight", C::RMS_EPS), .ple = load_ple_residual(gguf, layer), .layer_output_scale = optional_scalar(gguf, block(layer, "layer_output_scale.weight"), 1.f)};
 }
 
 // Shared-KV layers load only Q/O. (The GGUF may still carry attn_k/attn_v
@@ -99,7 +99,7 @@ GemmaE4BLayer<Dh> load_e4b_layer(const GGUF& gguf, size_t layer) {
 template <size_t Dh>
 GemmaE4BSharedLayer<Dh> load_e4b_shared_layer(const GGUF& gguf, size_t layer) {
     using Layer = GemmaE4BSharedLayer<Dh>;
-    return Layer{.attn_norm = load_norm<C::D>(gguf, layer, "attn_norm.weight", C::RMS_EPS), .WQ = load_linear<C::D, Layer::Hq * Dh>(gguf, layer, "attn_q.weight"), .q_norm = load_head_norm<Layer::Hq, Dh>(gguf, layer, "attn_q_norm.weight", C::RMS_EPS), .WO = load_linear<Layer::Hq * Dh, C::D>(gguf, layer, "attn_output.weight"), .post_attn_norm = load_norm<C::D>(gguf, layer, "post_attention_norm.weight", C::RMS_EPS), .ffn_norm = load_norm<C::D>(gguf, layer, "ffn_norm.weight", C::RMS_EPS), .ffn = load_gelu_mlp<C::D, C::FF>(gguf, layer), .post_ffn_norm = load_norm<C::D>(gguf, layer, "post_ffw_norm.weight", C::RMS_EPS), .ple = load_ple_residual(gguf, layer), .layer_output_scale = optional_scalar(gguf, block(layer, "layer_output_scale.weight"), 1.f)};
+    return Layer{.attn_norm = load_norm<C::D>(gguf, layer, "attn_norm.weight", C::RMS_EPS), .WQ = load_linear<C::D, Layer::Hq * Dh>(gguf, layer, "attn_q.weight"), .q_norm = load_head_norm<Dh>(gguf, layer, "attn_q_norm.weight", C::RMS_EPS), .WO = load_linear<Layer::Hq * Dh, C::D>(gguf, layer, "attn_output.weight"), .post_attn_norm = load_norm<C::D>(gguf, layer, "post_attention_norm.weight", C::RMS_EPS), .ffn_norm = load_norm<C::D>(gguf, layer, "ffn_norm.weight", C::RMS_EPS), .ffn = load_gelu_mlp<C::D, C::FF>(gguf, layer), .post_ffn_norm = load_norm<C::D>(gguf, layer, "post_ffw_norm.weight", C::RMS_EPS), .ple = load_ple_residual(gguf, layer), .layer_output_scale = optional_scalar(gguf, block(layer, "layer_output_scale.weight"), 1.f)};
 }
 
 inline Gemma4E4BModel load_e4b_text(const GGUF& gguf) {
@@ -108,7 +108,7 @@ inline Gemma4E4BModel load_e4b_text(const GGUF& gguf) {
     auto embedding = tensor_loader::load_weight<C::D, C::V>(gguf, "token_embd.weight");
 
     constexpr size_t PackedPLE = C::PLE * C::L;
-    GemmaPerLayerInputs<C::D, C::PLE, C::L, C::V> ple(tensor_loader::load_weight<PackedPLE, C::V>(gguf, "per_layer_token_embd.weight"), Linear<C::D, PackedPLE>(tensor_loader::load_weight<C::D, PackedPLE>(gguf, "per_layer_model_proj.weight")), PerHeadNorm<C::L, C::PLE, RMSNorm<C::PLE>>(RMSNorm<C::PLE>(tensor_loader::load_vector<C::PLE>(gguf, "per_layer_proj_norm.weight"), C::RMS_EPS)), std::sqrt(Scalar(C::PLE)), 1.f / std::sqrt(Scalar(C::D)), 1.f / std::sqrt(2.f));
+    GemmaPerLayerInputs<C::D, C::PLE, C::L, C::V> ple(tensor_loader::load_weight<PackedPLE, C::V>(gguf, "per_layer_token_embd.weight"), Linear<C::D, PackedPLE>(tensor_loader::load_weight<C::D, PackedPLE>(gguf, "per_layer_model_proj.weight")), PerHeadNorm<RMSNorm<C::PLE>>(RMSNorm<C::PLE>(tensor_loader::load_vector<C::PLE>(gguf, "per_layer_proj_norm.weight"), C::RMS_EPS)), std::sqrt(Scalar(C::PLE)), 1.f / std::sqrt(Scalar(C::D)), 1.f / std::sqrt(2.f));
 
     // One vector per layer shape, filled in schedule order so that
     // C::position_in_kind(i) is each layer's slot. The model's constructor
@@ -175,7 +175,7 @@ inline void validate_12b_text_metadata(const GGUF& gguf) {
 inline Gemma12BSlidingLayer load_12b_sliding_layer(const GGUF& gguf, size_t layer) {
     using Layer = Gemma12BSlidingLayer;
     constexpr size_t Dh = Layer::HEAD_DIM;
-    return Layer{.attn_norm = load_norm<C12::D>(gguf, layer, "attn_norm.weight", C12::RMS_EPS), .WQ = load_linear<C12::D, Layer::Hq * Dh>(gguf, layer, "attn_q.weight"), .q_norm = load_head_norm<Layer::Hq, Dh>(gguf, layer, "attn_q_norm.weight", C12::RMS_EPS), .WK = load_linear<C12::D, Layer::Hkv * Dh>(gguf, layer, "attn_k.weight"), .k_norm = load_head_norm<Layer::Hkv, Dh>(gguf, layer, "attn_k_norm.weight", C12::RMS_EPS), .WV = load_linear<C12::D, Layer::Hkv * Dh>(gguf, layer, "attn_v.weight"), .v_norm = PerHeadNorm<Layer::Hkv, Dh, RMSNormNoScale<Dh>>(RMSNormNoScale<Dh>(C12::RMS_EPS)), .WO = load_linear<Layer::Hq * Dh, C12::D>(gguf, layer, "attn_output.weight"), .post_attn_norm = load_norm<C12::D>(gguf, layer, "post_attention_norm.weight", C12::RMS_EPS), .ffn_norm = load_norm<C12::D>(gguf, layer, "ffn_norm.weight", C12::RMS_EPS), .ffn = load_gelu_mlp<C12::D, C12::FF>(gguf, layer), .post_ffn_norm = load_norm<C12::D>(gguf, layer, "post_ffw_norm.weight", C12::RMS_EPS), .layer_output_scale = optional_scalar(gguf, block(layer, "layer_output_scale.weight"), 1.f)};
+    return Layer{.attn_norm = load_norm<C12::D>(gguf, layer, "attn_norm.weight", C12::RMS_EPS), .WQ = load_linear<C12::D, Layer::Hq * Dh>(gguf, layer, "attn_q.weight"), .q_norm = load_head_norm<Dh>(gguf, layer, "attn_q_norm.weight", C12::RMS_EPS), .WK = load_linear<C12::D, Layer::Hkv * Dh>(gguf, layer, "attn_k.weight"), .k_norm = load_head_norm<Dh>(gguf, layer, "attn_k_norm.weight", C12::RMS_EPS), .WV = load_linear<C12::D, Layer::Hkv * Dh>(gguf, layer, "attn_v.weight"), .v_norm = PerHeadNorm<RMSNormNoScale<Dh>>(RMSNormNoScale<Dh>(C12::RMS_EPS)), .WO = load_linear<Layer::Hq * Dh, C12::D>(gguf, layer, "attn_output.weight"), .post_attn_norm = load_norm<C12::D>(gguf, layer, "post_attention_norm.weight", C12::RMS_EPS), .ffn_norm = load_norm<C12::D>(gguf, layer, "ffn_norm.weight", C12::RMS_EPS), .ffn = load_gelu_mlp<C12::D, C12::FF>(gguf, layer), .post_ffn_norm = load_norm<C12::D>(gguf, layer, "post_ffw_norm.weight", C12::RMS_EPS), .layer_output_scale = optional_scalar(gguf, block(layer, "layer_output_scale.weight"), 1.f)};
 }
 
 // Unified K/V: the checkpoint has no attn_v at all on this layer.
@@ -183,7 +183,7 @@ inline Gemma12BGlobalLayer load_12b_global_layer(const GGUF& gguf, size_t layer)
     using Layer = Gemma12BGlobalLayer;
     constexpr size_t Dh = Layer::HEAD_DIM;
     expect(gguf.find(block(layer, "attn_v.weight")) == nullptr, block(layer, "attn_v.weight") + " is present, but this layer is configured for unified K/V");
-    return Layer{.attn_norm = load_norm<C12::D>(gguf, layer, "attn_norm.weight", C12::RMS_EPS), .WQ = load_linear<C12::D, Layer::Hq * Dh>(gguf, layer, "attn_q.weight"), .q_norm = load_head_norm<Layer::Hq, Dh>(gguf, layer, "attn_q_norm.weight", C12::RMS_EPS), .WK = load_linear<C12::D, Layer::Hkv * Dh>(gguf, layer, "attn_k.weight"), .k_norm = load_head_norm<Layer::Hkv, Dh>(gguf, layer, "attn_k_norm.weight", C12::RMS_EPS), .v_norm = PerHeadNorm<Layer::Hkv, Dh, RMSNormNoScale<Dh>>(RMSNormNoScale<Dh>(C12::RMS_EPS)), .WO = load_linear<Layer::Hq * Dh, C12::D>(gguf, layer, "attn_output.weight"), .post_attn_norm = load_norm<C12::D>(gguf, layer, "post_attention_norm.weight", C12::RMS_EPS), .ffn_norm = load_norm<C12::D>(gguf, layer, "ffn_norm.weight", C12::RMS_EPS), .ffn = load_gelu_mlp<C12::D, C12::FF>(gguf, layer), .post_ffn_norm = load_norm<C12::D>(gguf, layer, "post_ffw_norm.weight", C12::RMS_EPS), .layer_output_scale = optional_scalar(gguf, block(layer, "layer_output_scale.weight"), 1.f)};
+    return Layer{.attn_norm = load_norm<C12::D>(gguf, layer, "attn_norm.weight", C12::RMS_EPS), .WQ = load_linear<C12::D, Layer::Hq * Dh>(gguf, layer, "attn_q.weight"), .q_norm = load_head_norm<Dh>(gguf, layer, "attn_q_norm.weight", C12::RMS_EPS), .WK = load_linear<C12::D, Layer::Hkv * Dh>(gguf, layer, "attn_k.weight"), .k_norm = load_head_norm<Dh>(gguf, layer, "attn_k_norm.weight", C12::RMS_EPS), .v_norm = PerHeadNorm<RMSNormNoScale<Dh>>(RMSNormNoScale<Dh>(C12::RMS_EPS)), .WO = load_linear<Layer::Hq * Dh, C12::D>(gguf, layer, "attn_output.weight"), .post_attn_norm = load_norm<C12::D>(gguf, layer, "post_attention_norm.weight", C12::RMS_EPS), .ffn_norm = load_norm<C12::D>(gguf, layer, "ffn_norm.weight", C12::RMS_EPS), .ffn = load_gelu_mlp<C12::D, C12::FF>(gguf, layer), .post_ffn_norm = load_norm<C12::D>(gguf, layer, "post_ffw_norm.weight", C12::RMS_EPS), .layer_output_scale = optional_scalar(gguf, block(layer, "layer_output_scale.weight"), 1.f)};
 }
 
 inline Gemma4_12BModel load_12b_text(const GGUF& gguf) {

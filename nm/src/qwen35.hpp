@@ -132,9 +132,9 @@ struct QwenGatedAttention {
     static constexpr size_t GATED_QW = 2 * QW;
 
     Linear<D, GATED_QW> WQG;  // query and gate together, head-major pairs
-    PerHeadNorm<Hq, HeadDim, RMSNorm<HeadDim>> q_norm;
+    PerHeadNorm<RMSNorm<HeadDim>> q_norm;
     Linear<D, KW> WK;
-    PerHeadNorm<Hkv, HeadDim, RMSNorm<HeadDim>> k_norm;
+    PerHeadNorm<RMSNorm<HeadDim>> k_norm;
     Linear<D, KW> WV;  // never normalized, never rotated
     Linear<QW, D> WO;
 };
@@ -158,7 +158,7 @@ struct QwenGatedDeltaNet {
     Linear<D, Hv> Walpha;
     Vec<Hv> dt_bias;
     Vec<Hv> decay_scale;  // -exp(A_log), so <= 0; the loader checks it
-    PerHeadNorm<Hv, Dv, RMSNorm<Dv>> head_norm;
+    PerHeadNorm<RMSNorm<Dv>> head_norm;
     Linear<VALUE_WIDTH, D> WO;
 
     // The one head-mapping decision, in one place. ggml TILES the key heads
@@ -349,10 +349,12 @@ private:
         // One projection emits Q and G interleaved per head, so the split is
         // pure layout; .first is the query, .second the raw gate.
         HeadPair<C::Hq, Dh> query_gate = split_head_pairs<C::Hq, Dh>(attention.WQG(X).view());
-        Matrix<QW> Q = attention.q_norm(query_gate.first.view());
+        Matrix<QW> Q = std::move(query_gate.first);
+        attention.q_norm.apply(Q);
         rotate_heads<C::Hq, Dh>(Q, Rope{}, first_position);
 
-        Matrix<C::Hkv * Dh> K = attention.k_norm(attention.WK(X).view());
+        Matrix<C::Hkv * Dh> K = attention.WK(X);
+        attention.k_norm.apply(K);
         rotate_heads<C::Hkv, Dh>(K, Rope{}, first_position);
         Matrix<C::Hkv * Dh> V = attention.WV(X);
 
@@ -408,31 +410,31 @@ private:
 
         for (size_t t = 0; t < X.rows(); ++t) {
             Vec<Mixer::CONV_CHANNELS> stream = entry.conv.step(qkv.row(t), mixer.conv);
-            silu(stream);
+            Silu::apply(stream);
 
             // q and k are shared by every value head in a key head's group, so
             // normalize them once per token rather than once per value head.
             std::array<Vec<Dk>, Hk> query, key;
             for (size_t hk = 0; hk < Hk; ++hk) {
-                query[hk] = l2_normalize<Dk>(slice<Dk>(VecView<Mixer::CONV_CHANNELS>(stream), hk * Dk));
-                key[hk] = l2_normalize<Dk>(slice<Dk>(VecView<Mixer::CONV_CHANNELS>(stream), Mixer::KEY_WIDTH + hk * Dk));
+                query[hk] = l2_normalize<Dk>(slice<Dk>(VecView<Mixer::CONV_CHANNELS>(stream), hk));
+                key[hk] = l2_normalize<Dk>(slice<Dk, Mixer::KEY_WIDTH>(VecView<Mixer::CONV_CHANNELS>(stream), hk));
                 for (size_t i = 0; i < Dk; ++i) query[hk][i] *= query_scale;
             }
 
             Vec<Mixer::VALUE_WIDTH> row;
             for (size_t h = 0; h < Hv; ++h) {
                 const size_t hk = Mixer::key_head_of(h);
-                Vec<Dv> attended = gated_delta_step<Dk, Dv>(entry.delta.head(h), VecView<Dk>(query[hk]), VecView<Dk>(key[hk]), slice<Dv>(VecView<Mixer::CONV_CHANNELS>(stream), 2 * Mixer::KEY_WIDTH + h * Dv), gate.row(t)[h], beta.row(t)[h]);
-                MutVecView<Dv> partition = slice_mut<Dv>(row, h * Dv);
+                Vec<Dv> attended = gated_delta_step<Dk, Dv>(entry.delta.head(h), VecView<Dk>(query[hk]), VecView<Dk>(key[hk]), slice<Dv, 2 * Mixer::KEY_WIDTH>(VecView<Mixer::CONV_CHANNELS>(stream), h), gate.row(t)[h], beta.row(t)[h]);
+                MutVecView<Dv> partition = slice_mut<Dv>(row, h);
                 for (size_t i = 0; i < Dv; ++i) partition[i] = attended[i];
             }
             mixed.append(row);
         }
 
         // Gated output norm: rmsnorm per head, then the SiLU'd z gate.
-        Matrix<Mixer::VALUE_WIDTH> normalized = mixer.head_norm(mixed.view());
+        mixer.head_norm.apply(mixed);
         Matrix<Mixer::VALUE_WIDTH> z = mixer.WZ(X);
-        silu_in_place(z);
-        return mixer.WO(hadamard(normalized.view(), z.view()).view());
+        Silu::apply(z);
+        return mixer.WO(hadamard(mixed.view(), z.view()).view());
     }
 };

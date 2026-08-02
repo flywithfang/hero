@@ -89,14 +89,14 @@ static Qwen35Block<ToyQwen, QwenRecurrentMixer<ToyQwen>> make_recurrent_layer() 
     // decay_scale must be <= 0: the checkpoint stores -exp(A_log), which is
     // what makes exp(gate) a contraction. A positive value here makes the
     // state grow every token; the loader rejects that.
-    Mixer mixer{.WQKV = linear_from<C::D, Mixer::CONV_CHANNELS>(small), .WZ = linear_from<C::D, Mixer::VALUE_WIDTH>(small), .conv = std::move(conv), .Wbeta = linear_from<C::D, C::VALUE_HEADS>(small), .Walpha = linear_from<C::D, C::VALUE_HEADS>(small), .dt_bias = Vec<C::VALUE_HEADS>{}, .decay_scale = filled<C::VALUE_HEADS>(-1.f), .head_norm = PerHeadNorm<C::VALUE_HEADS, C::VALUE_HEAD_DIM, RMSNorm<C::VALUE_HEAD_DIM>>(unit_norm<C::VALUE_HEAD_DIM>()), .WO = linear_from<Mixer::VALUE_WIDTH, C::D>(small)};
+    Mixer mixer{.WQKV = linear_from<C::D, Mixer::CONV_CHANNELS>(small), .WZ = linear_from<C::D, Mixer::VALUE_WIDTH>(small), .conv = std::move(conv), .Wbeta = linear_from<C::D, C::VALUE_HEADS>(small), .Walpha = linear_from<C::D, C::VALUE_HEADS>(small), .dt_bias = Vec<C::VALUE_HEADS>{}, .decay_scale = filled<C::VALUE_HEADS>(-1.f), .head_norm = PerHeadNorm<RMSNorm<C::VALUE_HEAD_DIM>>(unit_norm<C::VALUE_HEAD_DIM>()), .WO = linear_from<Mixer::VALUE_WIDTH, C::D>(small)};
     return Qwen35Block<C, Mixer>{unit_norm<C::D>(), std::move(mixer), unit_norm<C::D>(), make_toy_mlp()};
 }
 
 static Qwen35Block<ToyQwen, QwenAttentionMixer<ToyQwen>> make_attention_layer() {
     using C = ToyQwen;
     using Mixer = QwenAttentionMixer<C>;
-    Mixer mixer{.WQG = linear_from<C::D, Mixer::GATED_QW>(small), .q_norm = PerHeadNorm<C::Hq, C::HEAD_DIM, RMSNorm<C::HEAD_DIM>>(unit_norm<C::HEAD_DIM>()), .WK = linear_from<C::D, Mixer::KW>(small), .k_norm = PerHeadNorm<C::Hkv, C::HEAD_DIM, RMSNorm<C::HEAD_DIM>>(unit_norm<C::HEAD_DIM>()), .WV = linear_from<C::D, Mixer::KW>(small), .WO = linear_from<Mixer::QW, C::D>(small)};
+    Mixer mixer{.WQG = linear_from<C::D, Mixer::GATED_QW>(small), .q_norm = PerHeadNorm<RMSNorm<C::HEAD_DIM>>(unit_norm<C::HEAD_DIM>()), .WK = linear_from<C::D, Mixer::KW>(small), .k_norm = PerHeadNorm<RMSNorm<C::HEAD_DIM>>(unit_norm<C::HEAD_DIM>()), .WV = linear_from<C::D, Mixer::KW>(small), .WO = linear_from<Mixer::QW, C::D>(small)};
     return Qwen35Block<C, Mixer>{unit_norm<C::D>(), std::move(mixer), unit_norm<C::D>(), make_toy_mlp()};
 }
 

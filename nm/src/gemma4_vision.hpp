@@ -84,7 +84,7 @@ void apply_vision_rope_2d(Matrix<Heads * HeadDim>& queries, Matrix<Heads * HeadD
     const auto rotate = [&](size_t token, MutVecView<Heads * HeadDim> row) {
         const size_t x = token % patches_x;
         const size_t y = token / patches_x;
-        for (size_t head = 0; head < Heads; ++head) rope.apply(slice_mut<HeadDim>(row, head * HeadDim), x, y);
+        for (size_t head = 0; head < Heads; ++head) rope.apply(slice_mut<HeadDim>(row, head), x, y);
     };
     queries.transform_rows(rotate);
     keys.transform_rows(rotate);
@@ -140,11 +140,11 @@ struct GemmaVisionLayer {
 
     RMSNorm<D> input_norm;
     DLinear WQ;
-    PerHeadNorm<H, HeadDim, RMSNorm<HeadDim>> q_norm;
+    PerHeadNorm<RMSNorm<HeadDim>> q_norm;
     DLinear WK;
-    PerHeadNorm<H, HeadDim, RMSNorm<HeadDim>> k_norm;
+    PerHeadNorm<RMSNorm<HeadDim>> k_norm;
     DLinear WV;
-    PerHeadNorm<H, HeadDim, RMSNormNoScale<HeadDim>> v_norm;  // no learned scale
+    PerHeadNorm<RMSNormNoScale<HeadDim>> v_norm;  // no learned scale
     DLinear WO;
     RMSNorm<D> attention_post_norm;
     RMSNorm<D> ffn_norm;
@@ -160,9 +160,12 @@ struct GemmaVisionLayer {
     Matrix<D> operator()(MatrixView<D> input, size_t patches_x, size_t patches_y) const {
         if (input.rows() != patches_x * patches_y) throw std::invalid_argument("GemmaVisionLayer: patch grid mismatch");
         Matrix<D> U = input_norm(input);
-        Matrix<D> Q = q_norm(WQ(U.view()));
-        Matrix<D> K = k_norm(WK(U.view()));
-        Matrix<D> V = v_norm(WV(U.view()));
+        Matrix<D> Q = WQ(U.view());
+        q_norm.apply(Q);
+        Matrix<D> K = WK(U.view());
+        k_norm.apply(K);
+        Matrix<D> V = WV(U.view());
+        v_norm.apply(V);
 
         apply_vision_rope_2d<H, HeadDim, 100>(Q, K, patches_x, patches_y);
         Matrix<D> A = scaled_dot_product_attention<H, HeadDim, HeadDim>(Q.view(), K.view(), V.view(), 1.f);
@@ -172,7 +175,7 @@ struct GemmaVisionLayer {
 
         Matrix<D> ffn_input = ffn_norm(residual.view());
         Matrix<FF> gate = W_gate(ffn_input.view());
-        gelu_in_place(gate);
+        Gelu::apply(gate);
         Matrix<FF> up = W_up(ffn_input.view());
         Matrix<D> ffn = ffn_post_norm(W_down(hadamard(gate.view(), up.view()).view()));
         return add(residual.view(), ffn.view());

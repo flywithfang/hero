@@ -31,21 +31,23 @@ static Linear<N, N> identity_linear() {
 struct ToyUnifiedLayer {
     static constexpr size_t D = 2, Hq = 1, Hkv = 1, Dh = 2;
     Linear<2, 2> WQ;
-    PerHeadNorm<1, 2, RMSNorm<2>> q_norm;
+    PerHeadNorm<RMSNorm<2>> q_norm;
     Linear<2, 2> WK;
-    PerHeadNorm<1, 2, RMSNorm<2>> k_norm;
-    PerHeadNorm<1, 2, RMSNormNoScale<2>> v_norm;
+    PerHeadNorm<RMSNorm<2>> k_norm;
+    PerHeadNorm<RMSNormNoScale<2>> v_norm;
     Linear<2, 2> WO;
 
     template <class Rope>
     Matrix<D> attention(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) const {
-        Matrix<Hq * Dh> Q = q_norm(WQ(X));
+        Matrix<Hq * Dh> Q = WQ(X);
+        q_norm.apply(Q);
         rotate_heads<Hq, Dh>(Q, rope, first_position);
 
-        Matrix<Hkv * Dh> projected = WK(X);
-        Matrix<Hkv * Dh> K = k_norm(projected.view());
+        Matrix<Hkv * Dh> V = WK(X);
+        Matrix<Hkv * Dh> K = copy(V.view());
+        k_norm.apply(K);
         rotate_heads<Hkv, Dh>(K, rope, first_position);
-        Matrix<Hkv * Dh> V = v_norm(projected.view());
+        v_norm.apply(V);
 
         Matrix<Hq * Dh> A = attend_and_cache<Hq, Hkv, Dh>(Q.view(), K.view(), V.view(), cache, first_position, window);
         return WO(A.view());
@@ -207,7 +209,7 @@ int main() {
         Vec<2> gamma;
         gamma[0] = 3.f;
         gamma[1] = 3.f;
-        ToyUnifiedLayer layer{identity_linear<2>(), PerHeadNorm<1, 2, RMSNorm<2>>(unit_norm<2>()), Linear<2, 2>(Weight<2, 2>(std::move(w))), PerHeadNorm<1, 2, RMSNorm<2>>(RMSNorm<2>(std::move(gamma), 1e-6f)), PerHeadNorm<1, 2, RMSNormNoScale<2>>(RMSNormNoScale<2>(1e-6f)), identity_linear<2>()};
+        ToyUnifiedLayer layer{identity_linear<2>(), PerHeadNorm<RMSNorm<2>>(unit_norm<2>()), Linear<2, 2>(Weight<2, 2>(std::move(w))), PerHeadNorm<RMSNorm<2>>(RMSNorm<2>(std::move(gamma), 1e-6f)), PerHeadNorm<RMSNormNoScale<2>>(RMSNormNoScale<2>(1e-6f)), identity_linear<2>()};
 
         Vec<2> token;
         token[0] = 3.f;
@@ -224,7 +226,8 @@ int main() {
         // rms([3,4]) = sqrt(12.5); normalized = [0.8485, 1.1314]
         const Scalar inv = 1.f / std::sqrt(12.5f);
         check(std::fabs(out.row(0)[0] - 3.f * inv) < 1e-5f && std::fabs(out.row(0)[1] - 4.f * inv) < 1e-5f, "the value is the raw projection with the scale-free norm");
-        Matrix<2> K = layer.k_norm(layer.WK(x.view()));
+        Matrix<2> K = layer.WK(x.view());
+        layer.k_norm.apply(K);
         check(std::fabs(K.row(0)[0] - 3.f * 3.f * inv) < 1e-5f, "the key is the same projection with the learned scale");
         check(cache.size() == 1, "the unified K/V row was cached like any owned one");
     }

@@ -15,7 +15,9 @@ static_assert(!std::is_default_constructible_v<RMSNorm<4>>);
 static_assert(!std::is_default_constructible_v<Linear<2, 2>>);
 static_assert(!std::is_default_constructible_v<GeluGatedMLP<2, 2>>);
 static_assert(std::is_default_constructible_v<RotaryEmbedding<8, 10000>>);
-static_assert(std::is_default_constructible_v<KVCache<1, 2>>);
+static_assert(std::is_default_constructible_v<MultiHeadAttention<1, 1, 2>>);
+static_assert(!std::is_convertible_v<Position, size_t>);
+static_assert(!std::is_convertible_v<size_t, Position>);
 
 static int g_fail = 0;
 static void check(bool ok, const char* msg) {
@@ -108,13 +110,13 @@ int main() {
         Vec<8> q0, k0;
         fill(q0.begin(), 8);
         fill(k0.begin(), 8);
-        auto score = [&](size_t p, size_t m) {
+        auto score = [&](Position p, Position m) {
             Vec<8> q = copy(VecView<8>(q0)), k = copy(VecView<8>(k0));
             r.apply(slice_mut<8>(q, 0), p);
             r.apply(slice_mut<8>(k, 0), m);
             return dot(VecView<8>(q), VecView<8>(k));
         };
-        Scalar a = score(3, 1), b = score(10, 8), c = score(60, 58);
+        Scalar a = score(Position{3}, Position{1}), b = score(Position{10}, Position{8}), c = score(Position{60}, Position{58});
         check(std::fabs(a - b) < 1e-4 && std::fabs(b - c) < 1e-4, "same offset => same score at 3 abs positions");
     }
     std::printf("== RMSNorm scale invariance ==\n");
@@ -155,7 +157,7 @@ int main() {
     {
         // One KV head, two query rows at positions 0 and 1. Row 0 may see only
         // key 0; row 1 sees both. Scores use the conventional 1/sqrt(HeadDim).
-        KVCache<1, 2> cache;
+        MultiHeadAttention<1, 1, 2> cache;
         Vec<2> key0, key1, value0, value1;
         key0[0] = 1.f;
         key1[1] = 1.f;
@@ -175,14 +177,15 @@ int main() {
         values.append(value1);
 
         const Scalar scale = 1.f / std::sqrt(2.f);
-        Matrix<2> attended = attend_and_cache<1, 1, 2>(queries.view(), keys.view(), values.view(), cache, 0, 0, scale);
+        Matrix<2> attended = cache.append_and_attend(queries.view(), keys.view(), values.view(), Position{0}, CausalWindow::full(), scale);
         const Scalar weight1 = std::exp(scale) / (1.f + std::exp(scale));
         const Scalar expected1 = (1.f - weight1) * 10.f + weight1 * 30.f;
         check(attended.row(0)[0] == 10.f && std::fabs(attended.row(1)[0] - expected1) < 1e-5f, "the causal mask and row-wise softmax match the equation");
 
         // The same reduction under a width-1 window sees only the newest key.
-        Vec<2> windowed = attend<1, 1, 2>(queries.row(1), cache, Position{1}, 1, scale);
-        check(windowed[0] == 30.f, "a sliding window of one keeps only the current position");
+        const MatrixView<2> second_query(queries.row(1).begin(), 1);
+        Matrix<2> windowed = cache.attend(second_query, Position{1}, CausalWindow{1}, scale);
+        check(windowed.row(0)[0] == 30.f, "a sliding window of one keeps only the current position");
     }
     std::printf("== softmax sums to 1 ==\n");
     {
@@ -263,17 +266,19 @@ int main() {
 
     std::printf("== a query with no visible key is an error, never zero ==\n");
     {
-        KVCache<1, 2> cache;
+        MultiHeadAttention<1, 1, 2> cache;
         Vec<2> key0, value0;
         key0[0] = 1.f;
         value0[0] = 5.f;
         cache.append(Position{0}, key0, value0);
         Vec<2> query;
         query[0] = 1.f;
+        Matrix<2> queries;
+        queries.append(query);
         bool threw = false;
         try {
             // Position 9 with a window of 2 can see nothing at position 0.
-            (void)attend<1, 1, 2>(query, cache, Position{9}, 2);
+            (void)cache.attend(queries.view(), Position{9}, CausalWindow{2});
         } catch (const std::runtime_error&) {
             threw = true;
         }

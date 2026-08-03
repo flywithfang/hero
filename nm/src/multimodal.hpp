@@ -36,7 +36,7 @@ inline constexpr TokenId SOFT_TOKEN_ID{0};
 template <size_t D>
 class EmbeddedRows {
 public:
-    EmbeddedRows(MatrixView<D> rows, std::span<const TokenId> token_ids, size_t first_position) : rows_(rows), token_ids_(token_ids), first_position_(first_position) {
+    EmbeddedRows(MatrixView<D> rows, std::span<const TokenId> token_ids, Position first_position) : rows_(rows), token_ids_(token_ids), first_position_(first_position) {
         if (token_ids_.size() != rows_.rows()) throw std::invalid_argument("EmbeddedRows: one id per row");
     }
 
@@ -48,7 +48,7 @@ public:
     // range, and the check that these rows continue the carried state.
     Position position(size_t i) const {
         if (i >= tokens()) throw std::out_of_range("EmbeddedRows: token out of range");
-        return Position{first_position_ + i};
+        return first_position_ + i;
     }
     // The vocabulary id each row came from. Rows an encoder invented carry
     // SOFT_TOKEN_ID; Gemma E4B is the one model that reads any of this, to key
@@ -62,7 +62,7 @@ public:
 private:
     MatrixView<D> rows_;
     std::span<const TokenId> token_ids_;
-    size_t first_position_;
+    Position first_position_;
 };
 
 // The decoder's whole input: every row of the conversation so far, and the id
@@ -89,7 +89,7 @@ public:
     EmbeddedRows<D> view() const { return from_row(0); }
     EmbeddedRows<D> from_row(size_t first) const {
         if (first > tokens()) throw std::out_of_range("EmbeddedSequence: row out of range");
-        return EmbeddedRows<D>(embeddings_.view().from_row(first), std::span<const TokenId>(token_ids_).subspan(first), first);
+        return EmbeddedRows<D>(embeddings_.view().from_row(first), std::span<const TokenId>(token_ids_).subspan(first), Position{first});
     }
 
     // Rows the model made from these ids, which stay with them.

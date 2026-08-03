@@ -9,6 +9,8 @@
 #include "attention.hpp"
 #include "components.hpp"
 #include "transformer.hpp"
+#include <array>
+#include <variant>
 
 enum class GemmaAttentionKind : uint8_t { Sliding, Full };
 
@@ -189,7 +191,7 @@ struct GemmaE4BLayer {
 
     // This layer owns K and V: project, normalize and append both to its cache.
     template <HeadRotation<Dh> Rope>
-    Matrix<D> attention(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) const {
+    Matrix<D> attention(MatrixView<D> X, MultiHeadAttention<Hq, Hkv, Dh>& cache, const Rope& rope, Position first_position, size_t window) const {
         Matrix<Hq * Dh> Q = WQ(X);
         q_norm.apply(Q);
         rotate_heads<Hq, Dh>(Q, rope, first_position);
@@ -201,12 +203,12 @@ struct GemmaE4BLayer {
         Matrix<Hkv * Dh> V = WV(X);
         v_norm.apply(V);
 
-        Matrix<Hq * Dh> A = attend_and_cache<Hq, Hkv, Dh>(Q.view(), K.view(), V.view(), cache, first_position, window);
+        Matrix<Hq * Dh> A = cache.append_and_attend(Q.view(), K.view(), V.view(), first_position, CausalWindow{window});
         return WO(A.view());
     }
 
     template <HeadRotation<Dh> Rope>
-    Matrix<D> forward(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window, MatrixView<Gemma4E4BTextConfig::PLE> per_layer_input) const {
+    Matrix<D> forward(MatrixView<D> X, MultiHeadAttention<Hq, Hkv, Dh>& cache, const Rope& rope, Position first_position, size_t window, MatrixView<Gemma4E4BTextConfig::PLE> per_layer_input) const {
         const Matrix<D> U = attn_norm(X);
         const Matrix<D> A = post_attn_norm(attention(U.view(), cache, rope, first_position, window));
         Matrix<D> H = add(X, A.view());
@@ -245,16 +247,16 @@ struct GemmaE4BSharedLayer {
     // This layer owns no K/V. It only forms Q and attends to an earlier
     // owning layer's cache; in particular, it never appends cache rows.
     template <HeadRotation<Dh> Rope>
-    Matrix<D> attention(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) const {
+    Matrix<D> attention(MatrixView<D> X, MultiHeadAttention<Hq, Hkv, Dh>& cache, const Rope& rope, Position first_position, size_t window) const {
         Matrix<Hq * Dh> Q = WQ(X);
         q_norm.apply(Q);
         rotate_heads<Hq, Dh>(Q, rope, first_position);
-        Matrix<Hq * Dh> A = attend<Hq, Hkv, Dh>(Q.view(), cache, first_position, window);
+        Matrix<Hq * Dh> A = cache.attend(Q.view(), first_position, CausalWindow{window});
         return WO(A.view());
     }
 
     template <HeadRotation<Dh> Rope>
-    Matrix<D> forward(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window, MatrixView<Gemma4E4BTextConfig::PLE> per_layer_input) const {
+    Matrix<D> forward(MatrixView<D> X, MultiHeadAttention<Hq, Hkv, Dh>& cache, const Rope& rope, Position first_position, size_t window, MatrixView<Gemma4E4BTextConfig::PLE> per_layer_input) const {
         Matrix<D> U = attn_norm(X);
         Matrix<D> A = attention(U.view(), cache, rope, first_position, window);
         A = post_attn_norm(A);
@@ -274,8 +276,8 @@ using GemmaE4BModelData = GemmaPerLayerInputs<Gemma4E4BTextConfig::D, Gemma4E4BT
 
 class Gemma4E4BCache {
     using C = Gemma4E4BTextConfig;
-    using Local = KVCache<C::Hkv, C::LOCAL_HEAD_DIM>;
-    using Global = KVCache<C::Hkv, C::GLOBAL_HEAD_DIM>;
+    using Local = MultiHeadAttention<C::Hq, C::Hkv, C::LOCAL_HEAD_DIM>;
+    using Global = MultiHeadAttention<C::Hq, C::Hkv, C::GLOBAL_HEAD_DIM>;
     using Entry = std::variant<std::monostate, Local, Global>;
 
 public:
@@ -376,7 +378,7 @@ private:
     // (full) wrote earlier in this same pass, which is why local()/global()
     // redirect rather than those layers holding a cache.
     void forward_layer(PrefixState& state, EmbeddedRows<D> input, ResidualStream<D>& residual, const Matrix<C::PLE * C::L>& per_layer, size_t layer_index) const {
-        const size_t pos = input.position(0).i;
+        const Position pos = input.position(0);
         const Matrix<C::PLE> ple = slice_columns<C::PLE>(per_layer.view(), layer_index);
         const MatrixView<D> X = residual.matrix();
         const size_t n = C::position_in_kind(layer_index);
@@ -496,7 +498,7 @@ struct Gemma12BSlidingLayer {
     // Sliding attention owns separate K and V projections and appends them to
     // its bounded cache.
     template <HeadRotation<Dh> Rope>
-    Matrix<D> attention(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) const {
+    Matrix<D> attention(MatrixView<D> X, MultiHeadAttention<Hq, Hkv, Dh>& cache, const Rope& rope, Position first_position, size_t window) const {
         Matrix<Hq * Dh> Q = WQ(X);
         q_norm.apply(Q);
         rotate_heads<Hq, Dh>(Q, rope, first_position);
@@ -508,12 +510,12 @@ struct Gemma12BSlidingLayer {
         Matrix<Hkv * Dh> V = WV(X);
         v_norm.apply(V);
 
-        Matrix<Hq * Dh> A = attend_and_cache<Hq, Hkv, Dh>(Q.view(), K.view(), V.view(), cache, first_position, window);
+        Matrix<Hq * Dh> A = cache.append_and_attend(Q.view(), K.view(), V.view(), first_position, CausalWindow{window});
         return WO(A.view());
     }
 
     template <HeadRotation<Dh> Rope>
-    Matrix<D> forward(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) const {
+    Matrix<D> forward(MatrixView<D> X, MultiHeadAttention<Hq, Hkv, Dh>& cache, const Rope& rope, Position first_position, size_t window) const {
         Matrix<D> U = attn_norm(X);
         Matrix<D> A = attention(U.view(), cache, rope, first_position, window);
         A = post_attn_norm(A);
@@ -553,7 +555,7 @@ struct Gemma12BGlobalLayer {
     // why this is the one attention that must copy: two different norms read
     // the same projected rows, so neither can consume them.
     template <HeadRotation<Dh> Rope>
-    Matrix<D> attention(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) const {
+    Matrix<D> attention(MatrixView<D> X, MultiHeadAttention<Hq, Hkv, Dh>& cache, const Rope& rope, Position first_position, size_t window) const {
         Matrix<Hq * Dh> Q = WQ(X);
         q_norm.apply(Q);
         rotate_heads<Hq, Dh>(Q, rope, first_position);
@@ -564,12 +566,12 @@ struct Gemma12BGlobalLayer {
         rotate_heads<Hkv, Dh>(K, rope, first_position);
         v_norm.apply(V);
 
-        Matrix<Hq * Dh> A = attend_and_cache<Hq, Hkv, Dh>(Q.view(), K.view(), V.view(), cache, first_position, window);
+        Matrix<Hq * Dh> A = cache.append_and_attend(Q.view(), K.view(), V.view(), first_position, CausalWindow{window});
         return WO(A.view());
     }
 
     template <HeadRotation<Dh> Rope>
-    Matrix<D> forward(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) const {
+    Matrix<D> forward(MatrixView<D> X, MultiHeadAttention<Hq, Hkv, Dh>& cache, const Rope& rope, Position first_position, size_t window) const {
         Matrix<D> U = attn_norm(X);
         Matrix<D> A = attention(U.view(), cache, rope, first_position, window);
         A = post_attn_norm(A);
@@ -590,8 +592,8 @@ struct Gemma12BGlobalLayer {
 // rows, so their cost stops growing with T.
 class Gemma4_12BCache {
     using C = Gemma4_12BTextConfig;
-    using Local = KVCache<C::LOCAL_HKV, C::LOCAL_HEAD_DIM>;
-    using Global = KVCache<C::GLOBAL_HKV, C::GLOBAL_HEAD_DIM>;
+    using Local = MultiHeadAttention<C::Hq, C::LOCAL_HKV, C::LOCAL_HEAD_DIM>;
+    using Global = MultiHeadAttention<C::Hq, C::GLOBAL_HKV, C::GLOBAL_HEAD_DIM>;
     using Entry = std::variant<Local, Global>;
 
 public:
@@ -663,7 +665,7 @@ private:
     // Each concrete 12B layer owns its equation. Unlike E4B's methods these
     // methods have no per-layer-input argument and perform no PLE residual.
     void forward_layer(PrefixState& state, EmbeddedRows<D> input, ResidualStream<D>& residual, size_t layer_index) const {
-        const size_t pos = input.position(0).i;
+        const Position pos = input.position(0);
         const MatrixView<D> X = residual.matrix();
         const size_t n = C::position_in_kind(layer_index);
 

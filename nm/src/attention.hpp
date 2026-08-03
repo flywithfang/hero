@@ -76,9 +76,9 @@ public:
         }
     }
 
-    void apply(MutVecView<HeadDim> value, size_t position) const {
+    void apply(MutVecView<HeadDim> value, Position position) const {
         for (size_t i = 0; i < Planes; ++i) {
-            const Scalar angle = Scalar(position) * inv_freq_[i];
+            const Scalar angle = position * inv_freq_[i];
             const Scalar c = std::cos(angle), s = std::sin(angle);
             const Scalar x = value[i], y = value[i + Planes];
             value[i] = x * c - y * s;
@@ -97,17 +97,17 @@ private:
 // Any table with that operation works — the two Gemma widths, the two bases,
 // full or partial rotation — and nothing else does.
 template <class R, size_t HeadDim>
-concept HeadRotation = requires(const R& rope, MutVecView<HeadDim> head, size_t position) { rope.apply(head, position); };
+concept HeadRotation = requires(const R& rope, MutVecView<HeadDim> head, Position position) { rope.apply(head, position); };
 
 template <size_t Heads, size_t HeadDim, HeadRotation<HeadDim> Rope>
-void rotate_heads(MutVecView<Heads * HeadDim> value, const Rope& rope, size_t position) {
+void rotate_heads(MutVecView<Heads * HeadDim> value, const Rope& rope, Position position) {
     for (size_t h = 0; h < Heads; ++h) {
         rope.apply(slice_mut<HeadDim>(value, h), position);
     }
 }
 
 template <size_t Heads, size_t HeadDim, HeadRotation<HeadDim> Rope>
-void rotate_heads(Matrix<Heads * HeadDim>& values, const Rope& rope, size_t first_position) {
+void rotate_heads(Matrix<Heads * HeadDim>& values, const Rope& rope, Position first_position) {
     values.transform_rows([&](size_t row, MutVecView<Heads * HeadDim> value) { rotate_heads<Heads, HeadDim>(value, rope, first_position + row); });
 }
 
@@ -134,198 +134,176 @@ Matrix<Heads * ValueDim> scaled_dot_product_attention(MatrixView<Heads * QueryKe
     });
 }
 
-// ---- the K/V cache ----------------------------------------------------------
+// A causal attention mask, optionally restricted to a sliding window. Width
+// zero is full attention. Position arithmetic stays inside this domain type.
+class CausalWindow {
+public:
+    explicit constexpr CausalWindow(size_t width) : width_(width) {}
+    static constexpr CausalWindow full() { return CausalWindow{0}; }
+
+    constexpr bool contains(Position key, Position query) const {
+        if (key > query) return false;
+        return width_ == 0 || query - key < width_;
+    }
+
+private:
+    size_t width_;
+};
+
+// ---- multi-head attention and its K/V state --------------------------------
 //
-// Position-aware K/V rows with either full retention (capacity == 0) or a ring
-// of fixed width. Logical row zero is always the oldest retained position, so a
-// sliding layer and a global layer are read through the same interface and only
-// the storage cost differs. [BANDWIDTH][GROWS-T]
-template <size_t Hkv, size_t HeadDim>
-class KVCache {
+// The cache owns both the typed row storage and the complete multi-head
+// reduction. Callers provide packed Q heads and, for an owning layer, packed K/V
+// heads. No scalar buffer, cache-row index, visibility check, or one-head helper
+// escapes this type. Rows x query heads form one flat parallel task space.
+template <size_t Hq, size_t Hkv, size_t HeadDim>
+class MultiHeadAttention {
+    static_assert(Hkv != 0);
+    static_assert(Hq % Hkv == 0, "GQA groups must divide evenly");
     static constexpr size_t Width = Hkv * HeadDim;
 
+    struct VisibleRows {
+        size_t first;
+        size_t end;
+    };
+    struct KVHead {
+        size_t index;
+    };
+
 public:
-    explicit KVCache(size_t capacity = 0) : capacity_(capacity) {}
+    explicit MultiHeadAttention(size_t capacity = 0) : capacity_(capacity) {}
 
     size_t size() const { return size_; }
-    bool can_append_without_eviction(size_t rows) const { return capacity_ == 0 || rows <= capacity_ - size_; }
     size_t capacity() const { return capacity_; }
+    Position position(size_t logical) const { return positions_[physical(logical)]; }
 
+    // Append one complete packed K/V row. This remains public for cache fixtures;
+    // model code normally appends a batch through append_and_attend().
     void append(Position position, VecView<Width> key, VecView<Width> value) {
-        if (size_ != 0 && position.i <= this->position(size_ - 1).i) throw std::invalid_argument("KVCache: positions must increase");
+        if (size_ != 0 && position <= this->position(size_ - 1)) throw std::invalid_argument("MultiHeadAttention: positions must increase");
 
         if (capacity_ == 0) {
-            positions_.push_back(position.i);
-            keys_.insert(keys_.end(), key.begin(), key.end());
-            values_.insert(values_.end(), value.begin(), value.end());
+            positions_.push_back(position);
+            keys_.append(key);
+            values_.append(value);
             ++size_;
             return;
         }
 
         ensure_bounded_storage();
-
-        size_t physical;
+        size_t destination;
         if (size_ < capacity_) {
-            physical = (start_ + size_) % capacity_;
+            destination = (start_ + size_) % capacity_;
             ++size_;
         } else {
-            physical = start_;
+            destination = start_;
             start_ = (start_ + 1) % capacity_;
         }
-        positions_[physical] = position.i;
-        std::copy(key.begin(), key.end(), keys_.begin() + physical * Width);
-        std::copy(value.begin(), value.end(), values_.begin() + physical * Width);
+        positions_[destination] = position;
+        keys_.replace(destination, key);
+        values_.replace(destination, value);
     }
 
-    Position position(size_t logical) const { return Position{positions_[physical(logical)]}; }
-    VecView<HeadDim> key(size_t logical, KvHead head) const {
-        if (head.i >= Hkv) throw std::out_of_range("KVCache: KV head out of range");
-        return VecView<HeadDim>(keys_.data() + physical(logical) * Width + head.i * HeadDim);
+    // Multi-head attention against K/V already in this cache. For every query
+    // row and query head in parallel:
+    //   score_j = scale * dot(q_head, k_j,group)
+    //   alpha   = softmax(score)
+    //   output  = sum_j alpha_j * v_j,group
+    // GQA is explicit here: adjacent groups of Hq/Hkv query heads share one
+    // cached K/V head.
+    Matrix<Hq * HeadDim> attend(MatrixView<Hq * HeadDim> queries, Position first_query_position, CausalWindow window, Scalar score_scale = 1.f) const {
+        std::vector<VisibleRows> visible;
+        visible.reserve(queries.rows());
+        for (size_t row = 0; row < queries.rows(); ++row) visible.push_back(visible_rows(first_query_position + row, window));
+
+        Matrix<Hq * HeadDim> result = Matrix<Hq * HeadDim>::zero_rows(queries.rows());
+        par_for(queries.rows() * Hq, [&](size_t task) {
+            const size_t row = task / Hq;
+            const size_t head = task % Hq;
+            const VecView<HeadDim> query = slice<HeadDim>(queries.row(row), head);
+            const KVHead group{head / (Hq / Hkv)};
+            const VisibleRows rows = visible[row];
+
+            std::vector<Scalar> alpha;
+            alpha.reserve(rows.end - rows.first);
+            for (size_t j = rows.first; j < rows.end; ++j) alpha.push_back(score_scale * dot(query, key(j, group)));
+            Softmax::apply(alpha);
+
+            Vec<HeadDim> output;
+            for (size_t n = 0; n < alpha.size(); ++n) output.scaled_add(value(rows.first + n, group), alpha[n]);
+            result.template replace_partition<HeadDim>(row, head, output);
+        });
+        return result;
     }
-    VecView<HeadDim> value(size_t logical, KvHead head) const {
-        if (head.i >= Hkv) throw std::out_of_range("KVCache: KV head out of range");
-        return VecView<HeadDim>(values_.data() + physical(logical) * Width + head.i * HeadDim);
+
+    // Append this batch's K/V and perform the complete multi-head reduction.
+    // Prefill appends the batch once and attends in parallel. A bounded ring
+    // that would evict during the batch advances row by row so early queries do
+    // not lose keys they are still allowed to see.
+    Matrix<Hq * HeadDim> append_and_attend(MatrixView<Hq * HeadDim> queries, MatrixView<Width> keys, MatrixView<Width> values, Position first_query_position, CausalWindow window, Scalar score_scale = 1.f) {
+        if (queries.rows() != keys.rows() || keys.rows() != values.rows()) throw std::invalid_argument("MultiHeadAttention::append_and_attend: Q/K/V row mismatch");
+
+        if (can_append_without_eviction(queries.rows())) {
+            for (size_t row = 0; row < queries.rows(); ++row) append(first_query_position + row, keys.row(row), values.row(row));
+            return attend(queries, first_query_position, window, score_scale);
+        }
+
+        Matrix<Hq * HeadDim> output;
+        output.reserve(queries.rows());
+        for (size_t row = 0; row < queries.rows(); ++row) {
+            const Position position = first_query_position + row;
+            append(position, keys.row(row), values.row(row));
+            const MatrixView<Hq * HeadDim> one_query(queries.row(row).begin(), 1);
+            output.append(attend(one_query, position, window, score_scale).row(0));
+        }
+        return output;
     }
 
 private:
+    bool can_append_without_eviction(size_t rows) const { return capacity_ == 0 || rows <= capacity_ - size_; }
+
+    VisibleRows visible_rows(Position query, CausalWindow window) const {
+        size_t first = size_;
+        size_t end = size_;
+        for (size_t row = 0; row < size_; ++row) {
+            if (!window.contains(position(row), query)) continue;
+            if (first == size_) first = row;
+            end = row + 1;
+        }
+        if (first == size_) throw std::runtime_error("MultiHeadAttention::attend: query has no visible keys");
+        return VisibleRows{first, end};
+    }
+
+    VecView<HeadDim> key(size_t logical, KVHead head) const {
+        if (head.index >= Hkv) throw std::out_of_range("MultiHeadAttention: K/V head out of range");
+        return slice<HeadDim>(keys_.row(physical(logical)), head.index);
+    }
+    VecView<HeadDim> value(size_t logical, KVHead head) const {
+        if (head.index >= Hkv) throw std::out_of_range("MultiHeadAttention: K/V head out of range");
+        return slice<HeadDim>(values_.row(physical(logical)), head.index);
+    }
+
     void ensure_bounded_storage() {
         if (!positions_.empty()) return;
-        positions_.resize(capacity_);
-        keys_.resize(capacity_ * Width);
-        values_.resize(capacity_ * Width);
+        positions_.assign(capacity_, Position{0});
+        keys_.reserve(capacity_);
+        values_.reserve(capacity_);
+        const Vec<Width> empty;
+        for (size_t row = 0; row < capacity_; ++row) {
+            keys_.append(empty);
+            values_.append(empty);
+        }
     }
 
     size_t physical(size_t logical) const {
-        if (logical >= size_) throw std::out_of_range("KVCache: row out of range");
+        if (logical >= size_) throw std::out_of_range("MultiHeadAttention: row out of range");
         return capacity_ == 0 ? logical : (start_ + logical) % capacity_;
     }
 
     size_t capacity_;
     size_t start_ = 0;
     size_t size_ = 0;
-    std::vector<size_t> positions_;
-    std::vector<Scalar> keys_;
-    std::vector<Scalar> values_;
+    std::vector<Position> positions_;
+    Matrix<Width> keys_;
+    Matrix<Width> values_;
 };
-
-// ---- the attention mask, defined exactly once -------------------------------
-//
-// A cached key at position k is visible to a query at position q when it is
-// causally in the past and, on a sliding layer of width W, still inside the
-// window:
-//
-//     visible(q, k)  <=>  k <= q  and  (W == 0  or  q - k < W)
-//
-// W == 0 means "no window", i.e. a full/global layer. Writing `k + W > q`
-// rather than `q - k < W` keeps the unsigned arithmetic safe for k > q.
-inline bool key_is_visible(Position key, Position query, size_t sliding_window) {
-    if (key.i > query.i) return false;
-    return sliding_window == 0 || key.i + sliding_window > query.i;
-}
-
-// softmax over an empty set is undefined, so a query that can see nothing is a
-// bug in the caller (a ring that evicted too early, or a stale cache), never a
-// silently-zero output.
-template <size_t Hkv, size_t HeadDim>
-void require_visible_key(const KVCache<Hkv, HeadDim>& cache, Position query_position, size_t sliding_window) {
-    for (size_t j = 0; j < cache.size(); ++j)
-        if (key_is_visible(cache.position(j), query_position, sliding_window)) return;
-    throw std::runtime_error("attend: query has no visible keys");
-}
-
-// ---- one head of attention --------------------------------------------------
-//
-// For query head h at position q, over the cache rows j:
-//
-//     J     = { j : visible(q, position(j)) }
-//     s_j   = Scale * (q_h . k_j)   for j in J
-//     alpha = softmax(s)             over J only
-//     out   = sum_{j in J} alpha_j * v_j
-//
-// Scale is a template parameter because it is model anatomy: conventional
-// attention passes 1/sqrt(HeadDim), while a family that normalizes Q per head
-// (Gemma 4) has already folded that constant into a learned weight and passes 1.
-//
-// GQA's head mapping, in exactly one place: the Hq query heads partition into
-// Hkv groups of Hq/Hkv, and every head of a group reads the same cached k/v
-// rows. This is the only construction of a KvHead in the engine. (Qwen 3.5's
-// delta net TILES instead — key head h % Hk — and says so in its own file,
-// because that is a different mapping and not a variant of this one.)
-template <size_t Hq, size_t Hkv>
-constexpr KvHead kv_head_of(size_t query_head) {
-    static_assert(Hq % Hkv == 0, "GQA groups must divide evenly");
-    return KvHead{query_head / (Hq / Hkv)};
-}
-
-// One head's reduction, and nothing about the packed layout it came from: the
-// caller has already selected this head's query and its k/v group. Only visible
-// rows are gathered, so the score matrix is never materialized and masked-out
-// entries cost nothing. [COMPUTE][GROWS-T]
-template <size_t Hkv, size_t HeadDim>
-Vec<HeadDim> attend_head(VecView<HeadDim> query, const KVCache<Hkv, HeadDim>& cache, KvHead group, Position query_position, size_t sliding_window, Scalar score_scale) {
-    std::vector<size_t> J;      // the visible cache rows
-    std::vector<Scalar> alpha;  // scores s_j, then softmax weights
-    J.reserve(cache.size());
-    alpha.reserve(cache.size());
-    for (size_t j = 0; j < cache.size(); ++j) {
-        if (!key_is_visible(cache.position(j), query_position, sliding_window)) continue;
-        J.push_back(j);
-        alpha.push_back(score_scale * dot(query, cache.key(j, group)));
-    }
-    Softmax::apply(alpha);
-
-    Vec<HeadDim> attended;  // zero-initialized; this is the sum
-    for (size_t n = 0; n < J.size(); ++n) attended.scaled_add(cache.value(J[n], group), alpha[n]);
-    return attended;
-}
-
-// ---- attention over a whole cache, for one query and for a batch ------------
-//
-// Both forms are the same reduction; they differ only in how the independent
-// (row, head) tasks are laid out for the parallel seam. Neither writes to the
-// cache: Q is already normalized and rotated, and any K/V for these queries
-// must already be present.
-
-template <size_t Hq, size_t Hkv, size_t HeadDim>
-Vec<Hq * HeadDim> attend(VecView<Hq * HeadDim> query, const KVCache<Hkv, HeadDim>& cache, Position query_position, size_t sliding_window = 0, Scalar score_scale = 1.f) {
-    require_visible_key(cache, query_position, sliding_window);
-    return par_map<Hq, HeadDim>([&](size_t head) { return attend_head(slice<HeadDim>(query, head), cache, kv_head_of<Hq, Hkv>(head), query_position, sliding_window, score_scale); });
-}
-
-template <size_t Hq, size_t Hkv, size_t HeadDim>
-Matrix<Hq * HeadDim> attend(MatrixView<Hq * HeadDim> queries, const KVCache<Hkv, HeadDim>& cache, size_t first_query_position, size_t sliding_window = 0, Scalar score_scale = 1.f) {
-    for (size_t row = 0; row < queries.rows(); ++row) require_visible_key(cache, Position{first_query_position + row}, sliding_window);
-
-    // Rows x heads are mutually independent, so the batch is one flat task
-    // space rather than a map over heads alone: par_map_heads, whose partition
-    // is exactly one head of one query row.
-    return par_map_heads<Hq, HeadDim>(queries.rows(), [&](size_t row, size_t head) { return attend_head(slice<HeadDim>(queries.row(row), head), cache, kv_head_of<Hq, Hkv>(head), Position{first_query_position + row}, sliding_window, score_scale); });
-}
-
-// Append this batch's K/V, then attend. Splitting append from attend is what
-// makes prefill cheap: every query in the batch sees the whole batch's keys
-// (masked back to causal), so the cache is written once and read once.
-template <size_t Hq, size_t Hkv, size_t HeadDim>
-Matrix<Hq * HeadDim> attend_and_cache(MatrixView<Hq * HeadDim> queries, MatrixView<Hkv * HeadDim> keys, MatrixView<Hkv * HeadDim> values, KVCache<Hkv, HeadDim>& cache, size_t first_query_position, size_t sliding_window = 0, Scalar score_scale = 1.f) {
-    if (queries.rows() != keys.rows() || keys.rows() != values.rows()) throw std::invalid_argument("attend_and_cache: Q/K/V row mismatch");
-
-    if (cache.can_append_without_eviction(queries.rows())) {
-        for (size_t row = 0; row < queries.rows(); ++row) {
-            cache.append(Position{first_query_position + row}, keys.row(row), values.row(row));
-        }
-        return attend<Hq, Hkv, HeadDim>(queries, cache, first_query_position, sliding_window, score_scale);
-    }
-
-    // Eviction case only: a bounded sliding ring smaller than this batch would
-    // drop a key that an early query still needs, so the batch shortcut would
-    // change the result rather than just its cost. Fall back to advancing the
-    // ring one position at a time, which is the definition of the semantics.
-    Matrix<Hq * HeadDim> output;
-    output.reserve(queries.rows());
-    for (size_t row = 0; row < queries.rows(); ++row) {
-        const Position position{first_query_position + row};
-        cache.append(position, keys.row(row), values.row(row));
-        output.append(attend<Hq, Hkv, HeadDim>(queries.row(row), cache, position, sliding_window, score_scale));
-    }
-    return output;
-}

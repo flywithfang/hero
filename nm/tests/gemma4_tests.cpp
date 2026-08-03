@@ -38,7 +38,7 @@ struct ToyUnifiedLayer {
     Linear<2, 2> WO;
 
     template <class Rope>
-    Matrix<D> attention(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, size_t first_position, size_t window) const {
+    Matrix<D> attention(MatrixView<D> X, MultiHeadAttention<Hq, Hkv, Dh>& cache, const Rope& rope, Position first_position, size_t window) const {
         Matrix<Hq * Dh> Q = WQ(X);
         q_norm.apply(Q);
         rotate_heads<Hq, Dh>(Q, rope, first_position);
@@ -49,7 +49,7 @@ struct ToyUnifiedLayer {
         rotate_heads<Hkv, Dh>(K, rope, first_position);
         v_norm.apply(V);
 
-        Matrix<Hq * Dh> A = attend_and_cache<Hq, Hkv, Dh>(Q.view(), K.view(), V.view(), cache, first_position, window);
+        Matrix<Hq * Dh> A = cache.append_and_attend(Q.view(), K.view(), V.view(), first_position, CausalWindow{window});
         return WO(A.view());
     }
 };
@@ -87,14 +87,14 @@ int main() {
         Vec<8> value;
         for (size_t i = 0; i < 8; ++i) value[i] = Scalar(i + 1);
         Vec<8> original = copy(VecView<8>(value));
-        rope.apply(slice_mut<8>(value, 0), 7);
+        rope.apply(slice_mut<8>(value, 0), Position{7});
         check(value[2] == original[2] && value[3] == original[3] && value[6] == original[6] && value[7] == original[7], "non-RoPE planes are exactly unchanged");
         check(value[0] != original[0] && value[4] != original[4], "the configured rotary prefix rotates");
     }
 
     std::printf("== heterogeneous K/V cache and Gemma attention ==\n");
     {
-        KVCache<1, 2> full;
+        MultiHeadAttention<2, 1, 2> full;
         Vec<2> k0, v0, k1, v1;
         k0[0] = 1;
         k0[1] = 0;
@@ -111,13 +111,15 @@ int main() {
         q[1] = 0;
         q[2] = 1;
         q[3] = 0;
-        Vec<4> global = attend<2, 1, 2>(q, full, Position{1});
+        Matrix<4> queries;
+        queries.append(q);
+        Matrix<4> global = full.attend(queries.view(), Position{1}, CausalWindow::full());
         const Scalar p0 = std::exp(1.f) / (std::exp(1.f) + 1.f);
-        check(std::fabs(global[0] - (p0 * 10 + (1 - p0) * 30)) < 1e-5f && global[0] == global[2], "GQA heads share KV and attention uses scale 1.0");
-        Vec<4> local = attend<2, 1, 2>(q, full, Position{1}, 1);
-        check(local[0] == 30 && local[1] == 40, "sliding attention excludes positions outside its window");
+        check(std::fabs(global.row(0)[0] - (p0 * 10 + (1 - p0) * 30)) < 1e-5f && global.row(0)[0] == global.row(0)[2], "GQA heads share KV and attention uses scale 1.0");
+        Matrix<4> local = full.attend(queries.view(), Position{1}, CausalWindow{1});
+        check(local.row(0)[0] == 30 && local.row(0)[1] == 40, "sliding attention excludes positions outside its window");
 
-        KVCache<1, 2> ring(2);
+        MultiHeadAttention<2, 1, 2> ring(2);
         Vec<2> k2, v2;
         k2[0] = 2;
         k2[1] = 2;
@@ -126,7 +128,7 @@ int main() {
         ring.append(Position{0}, k0, v0);
         ring.append(Position{1}, k1, v1);
         ring.append(Position{2}, k2, v2);
-        check(ring.size() == 2 && ring.position(0).i == 1 && ring.position(1).i == 2, "bounded cache is an ordered sliding ring");
+        check(ring.size() == 2 && ring.position(0) == Position{1} && ring.position(1) == Position{2}, "bounded cache is an ordered sliding ring");
     }
 
     std::printf("== E4B cache topology ==\n");
@@ -220,8 +222,8 @@ int main() {
         // One token, one visible key: the softmax weight is 1 regardless of K,
         // and WO is identity, so attention() returns V itself — which for
         // unified K/V must be the raw W_k output under the scale-free norm.
-        KVCache<1, 2> cache;
-        Matrix<2> out = layer.attention(x.view(), cache, RotaryEmbedding<2, 10000>{}, /*first_position=*/0, /*window=*/0);
+        MultiHeadAttention<1, 1, 2> cache;
+        Matrix<2> out = layer.attention(x.view(), cache, RotaryEmbedding<2, 10000>{}, Position{0}, /*window=*/0);
 
         // rms([3,4]) = sqrt(12.5); normalized = [0.8485, 1.1314]
         const Scalar inv = 1.f / std::sqrt(12.5f);

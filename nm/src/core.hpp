@@ -16,6 +16,7 @@
 #pragma once
 #include <algorithm>
 #include <cmath>
+#include <compare>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -115,6 +116,12 @@ struct Vec {
     void scale(Scalar factor) {
         for (size_t i = 0; i < N; ++i) p[i] *= factor;
     }
+    template <size_t Width>
+    void replace_partition(size_t partition, VecView<Width> value) {
+        static_assert(N % Width == 0);
+        if (partition >= N / Width) throw std::out_of_range("Vec: partition out of range");
+        for (size_t i = 0; i < Width; ++i) p[partition * Width + i] = value[i];
+    }
     void scaled_add(VecView<N> addend, Scalar scale);
 };
 
@@ -213,6 +220,12 @@ public:
         reserve(this->rows() + rows.rows());
         for (size_t i = 0; i < rows.rows(); ++i) append(rows.row(i));
     }
+    // Replace one complete row without exposing the scalar buffer. Shape does
+    // not change, and no partially-written row is ever observable.
+    void replace(size_t i, VecView<C> row) {
+        check_row(i);
+        for (size_t column = 0; column < C; ++column) values_[i * C + column] = row[column];
+    }
     void reserve(size_t rows) { values_.reserve(element_count(rows)); }
 
     // A complete, already-laid-out buffer. This exists for the kernels that do
@@ -224,6 +237,11 @@ public:
         if (values.size() % C != 0) throw std::invalid_argument("Matrix: buffer is not a whole number of rows");
         Matrix matrix;
         matrix.values_ = std::move(values);
+        return matrix;
+    }
+    static Matrix zero_rows(size_t rows) {
+        Matrix matrix;
+        matrix.values_.resize(element_count(rows));
         return matrix;
     }
 
@@ -254,6 +272,14 @@ public:
     void scale(Scalar factor) {
         for (Scalar& element : values_) element *= factor;
     }
+    void fill(Scalar value) { std::fill(values_.begin(), values_.end(), value); }
+    template <size_t Width>
+    void replace_partition(size_t row, size_t partition, VecView<Width> value) {
+        static_assert(C % Width == 0);
+        check_row(row);
+        if (partition >= C / Width) throw std::out_of_range("Matrix: partition out of range");
+        for (size_t i = 0; i < Width; ++i) values_[row * C + partition * Width + i] = value[i];
+    }
 
     static size_t element_count(size_t rows) {
         if (rows > std::numeric_limits<size_t>::max() / C) throw std::length_error("Matrix: shape overflows size_t");
@@ -282,18 +308,30 @@ struct Mat {  // concept layout: y = x·W
 };
 
 enum class TokenId : int32_t {};
-struct Position {
-    size_t i;
-};
 
-// Two head-index types that must never be confused (GQA). A KvHead is only
-// ever constructed by dividing a query-head index by the group size, which
-// attention.hpp does in exactly one place.
-struct QHead {
-    size_t i;
-};
-struct KvHead {
-    size_t i;
+// A coordinate in the decoder sequence. It may be ordered, advanced by a row
+// count, subtracted from a later position to obtain a distance, and scaled by a
+// RoPE frequency. The representation is deliberately not part of its API.
+class Position {
+public:
+    explicit constexpr Position(size_t value) : value_(value) {}
+
+    friend constexpr auto operator<=>(Position, Position) = default;
+
+    friend constexpr Position operator+(Position position, size_t offset) {
+        if (offset > std::numeric_limits<size_t>::max() - position.value_) throw std::length_error("Position: advance overflows");
+        return Position{position.value_ + offset};
+    }
+
+    friend constexpr size_t operator-(Position later, Position earlier) {
+        if (later < earlier) throw std::invalid_argument("Position: negative distance");
+        return later.value_ - earlier.value_;
+    }
+
+    friend constexpr Scalar operator*(Position position, Scalar scale) { return Scalar(position.value_) * scale; }
+
+private:
+    size_t value_;
 };
 
 // ================= stratum 1: algebra ======================================
@@ -456,10 +494,7 @@ size_t nm_num_threads();                                       // core.cpp
 template <size_t H, size_t Dim, class F>
 Vec<H * Dim> par_map(F&& f) {
     Vec<H * Dim> out;
-    par_for(H, [&](size_t h) {
-        Vec<Dim> r = f(h);
-        std::copy(r.begin(), r.end(), &out[h * Dim]);
-    });
+    par_for(H, [&](size_t h) { out.template replace_partition<Dim>(h, f(h)); });
     return out;
 }
 
@@ -467,12 +502,9 @@ Vec<H * Dim> par_map(F&& f) {
 // wherever rows are independent and a plain append loop would serialize them.
 template <size_t C, class F>
 Matrix<C> par_map_rows(size_t rows, F&& f) {
-    std::vector<Scalar> values(Matrix<C>::element_count(rows));
-    par_for(rows, [&](size_t row) {
-        Vec<C> produced = f(row);
-        std::copy(produced.begin(), produced.end(), values.data() + row * C);
-    });
-    return Matrix<C>::from_row_major(std::move(values));
+    Matrix<C> output = Matrix<C>::zero_rows(rows);
+    par_for(rows, [&](size_t row) { output.replace(row, f(row)); });
+    return output;
 }
 
 // And over (row, head): f(row, head) returns that head's partition of that
@@ -484,14 +516,13 @@ Matrix<C> par_map_rows(size_t rows, F&& f) {
 // index; every other producer in the engine hands over whole rows.
 template <size_t Heads, size_t Dim, class F>
 Matrix<Heads * Dim> par_map_heads(size_t rows, F&& f) {
-    std::vector<Scalar> values(Matrix<Heads * Dim>::element_count(rows));
+    Matrix<Heads * Dim> output = Matrix<Heads * Dim>::zero_rows(rows);
     par_for(rows * Heads, [&](size_t task) {
         const size_t row = task / Heads;
         const size_t head = task % Heads;
-        Vec<Dim> partition = f(row, head);
-        std::copy(partition.begin(), partition.end(), values.data() + (row * Heads + head) * Dim);
+        output.template replace_partition<Dim>(row, head, f(row, head));
     });
-    return Matrix<Heads * Dim>::from_row_major(std::move(values));
+    return output;
 }
 
 // ---- MatT<In,Out>: the ggml/llama.cpp weight layout (row = output) ---------

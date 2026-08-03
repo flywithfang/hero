@@ -67,7 +67,10 @@ class CausalConv1dState {
     static constexpr size_t History = Width - 1;
 
 public:
-    CausalConv1dState() : history_(History * Channels, 0.f) {}
+    CausalConv1dState() {
+        const Vec<Channels> empty;
+        for (size_t row = 0; row < History; ++row) history_.append(empty);
+    }
 
     Vec<Channels> step(VecView<Channels> input, const Matrix<Width>& weights) {
         if (weights.rows() != Channels) throw std::invalid_argument("CausalConv1dState: wrong channel count");
@@ -75,8 +78,9 @@ public:
         Vec<Channels> output;
         for (size_t c = 0; c < Channels; ++c) {
             const VecView<Width> taps = weights.row(c);
-            Scalar sum = taps[History] * input[c];                                       // the current sample
-            for (size_t tap = 0; tap < History; ++tap) sum += taps[tap] * past(tap)[c];  // tap 0 is the oldest
+            Scalar sum = taps[History] * input[c];  // the current sample
+            if constexpr (History != 0)
+                for (size_t tap = 0; tap < History; ++tap) sum += taps[tap] * past(tap)[c];  // tap 0 is the oldest
             output[c] = sum;
         }
         advance(input);
@@ -84,24 +88,24 @@ public:
     }
 
     void clear() {
-        std::fill(history_.begin(), history_.end(), 0.f);
+        history_.fill(0.f);
         start_ = 0;
     }
 
 private:
     // Logical tap t (0 = oldest) maps into a ring of the last History samples.
     // Slots that no token has written yet are zero, which is the causal pad.
-    const Scalar* past(size_t tap) const { return history_.data() + ((start_ + tap) % History) * Channels; }
+    VecView<Channels> past(size_t tap) const { return history_.row((start_ + tap) % History); }
 
     void advance(VecView<Channels> input) {
         if constexpr (History != 0) {
-            // The newest sample overwrites the oldest slot, which start_ names.
-            std::copy(input.begin(), input.end(), history_.begin() + start_ * Channels);
+            // The newest sample replaces the oldest complete row.
+            history_.replace(start_, input);
             start_ = (start_ + 1) % History;
         }
     }
 
-    std::vector<Scalar> history_;
+    Matrix<Channels> history_;
     size_t start_ = 0;
 };
 

@@ -206,7 +206,7 @@ using QwenRecurrentMixer = QwenGatedDeltaNet<C::D, C::KEY_HEAD_DIM, C::VALUE_HEA
 template <class C>
 class Qwen35State {
 public:
-    using AttentionEntry = KVCache<C::Hkv, C::HEAD_DIM>;
+    using AttentionEntry = MultiHeadAttention<C::Hq, C::Hkv, C::HEAD_DIM>;
     struct RecurrentEntry {
         CausalConv1dState<QwenRecurrentMixer<C>::CONV_CHANNELS, C::CONV_WIDTH> conv;
         DeltaNetState<C::VALUE_HEADS, C::KEY_HEAD_DIM, C::VALUE_HEAD_DIM> delta;
@@ -303,7 +303,7 @@ public:
 
 private:
     void forward_layer(PrefixState& state, EmbeddedRows<D> input, ResidualStream<D>& residual, size_t layer_index) const {
-        const size_t pos = input.position(0).i;
+        const Position pos = input.position(0);
         const MatrixView<D> X = residual.matrix();
         const size_t n = position_in_kind(layer_index);
         Matrix<D> next = C::is_recurrent(layer_index) ? run_layer(recurrent_.at(n), X, state, layer_index, pos) : run_layer(attention_.at(n), X, state, layer_index, pos);
@@ -316,7 +316,7 @@ private:
     // layers, the gated delta net for the rest — and that overload is the only
     // difference between a recurrent layer and an attention layer in the stack.
     template <class Layer>
-    static Matrix<D> run_layer(const Layer& layer, MatrixView<D> X, PrefixState& state, size_t layer_index, size_t first_position) {
+    static Matrix<D> run_layer(const Layer& layer, MatrixView<D> X, PrefixState& state, size_t layer_index, Position first_position) {
         // h = x + mix( norm(x) )
         Matrix<D> U = layer.mixer_norm(X);
         Matrix<D> M = mix_tokens(layer.mixer, U.view(), state, layer_index, first_position);
@@ -342,7 +342,7 @@ private:
     //     V =                     X W_v
     //     A = attend(Q, cache <- K,V) * sigmoid(G)
     //     out = A W_o
-    static Matrix<D> mix_tokens(const QwenAttentionMixer<C>& attention, MatrixView<D> X, PrefixState& state, size_t layer, size_t first_position) {
+    static Matrix<D> mix_tokens(const QwenAttentionMixer<C>& attention, MatrixView<D> X, PrefixState& state, size_t layer, Position first_position) {
         constexpr size_t Dh = C::HEAD_DIM;
         constexpr size_t QW = C::Hq * Dh;
 
@@ -358,8 +358,8 @@ private:
         rotate_heads<C::Hkv, Dh>(K, Rope{}, first_position);
         Matrix<C::Hkv * Dh> V = attention.WV(X);
 
-        Matrix<QW> A = attend_and_cache<C::Hq, C::Hkv, Dh>(Q.view(), K.view(), V.view(), state.attention(layer), first_position, /*sliding_window=*/0,
-                                                           /*score_scale=*/1.f / std::sqrt(Scalar(Dh)));
+        Matrix<QW> A = state.attention(layer).append_and_attend(Q.view(), K.view(), V.view(), first_position, CausalWindow::full(),
+                                                                                /*score_scale=*/1.f / std::sqrt(Scalar(Dh)));
 
         // The gate is applied to the attended value, before W_o.
         A.transform_rows([&](size_t row, MutVecView<QW> attended) {
@@ -392,7 +392,7 @@ private:
     // Gated delta network. The projections are batched matmuls; only the
     // recurrence itself is sequential in T, because the state at token t is
     // by definition a function of the state at t-1.
-    static Matrix<D> mix_tokens(const QwenRecurrentMixer<C>& mixer, MatrixView<D> X, PrefixState& state, size_t layer, size_t /*first_position*/) {
+    static Matrix<D> mix_tokens(const QwenRecurrentMixer<C>& mixer, MatrixView<D> X, PrefixState& state, size_t layer, Position /*first_position*/) {
         using Mixer = QwenRecurrentMixer<C>;
         constexpr size_t Dk = C::KEY_HEAD_DIM;
         constexpr size_t Dv = C::VALUE_HEAD_DIM;

@@ -2,9 +2,11 @@
 //
 // This file supplies Gemma-specific policies to the uniform transformer core:
 // two attention shapes, partial RoPE, KV sharing, PLE, and logit soft-capping.
-// The token-mixing math itself (cache, mask, GQA reduction, rotary tables,
-// per-head norm) is model-neutral and lives in attention.hpp. Vision and audio
-// encoders connect at EmbeddedSequence<D> and do not enter these components.
+// The model-neutral pieces (K/V storage, the mask, rotary tables, per-head norm)
+// live in attention.hpp. The softmax reduction over cached keys does NOT: each
+// layer kind writes its own, because that equation is where families diverge.
+// Vision and audio encoders connect at EmbeddedSequence<D> and do not enter
+// these components.
 #pragma once
 #include "attention.hpp"
 #include "components.hpp"
@@ -102,7 +104,7 @@ public:
         Gelu::apply(gated);
         Matrix<D> branch = projection_(hadamard(gated.view(), per_layer_input));
         branch = post_norm_(branch);
-        return add(hidden, branch.view());
+        return hidden + branch;
     }
 
 private:
@@ -189,33 +191,78 @@ struct GemmaE4BLayer {
     GemmaPerLayerResidual<D, Gemma4E4BTextConfig::PLE> ple;
     Scalar layer_output_scale;
 
-    // This layer owns K and V: project, normalize and append both to its cache.
+    // This layer owns K and V: project them, append them, and reduce over the
+    // rows the window leaves visible. Gemma folds 1/sqrt(Dh) into the learned Q
+    // norm, so there is no score scale in the dot product here:
+    //   score_j = dot(q_head, k_j,group)
+    //   alpha   = softmax(score)
+    //   out     = sum_j alpha_j * v_j,group
+    // GQA is explicit: adjacent groups of Hq/Hkv query heads share one cached
+    // K/V head. Rows x query heads are one flat parallel task space.
     template <HeadRotation<Dh> Rope>
-    Matrix<D> attention(MatrixView<D> X, MultiHeadAttention<Hq, Hkv, Dh>& cache, const Rope& rope, Position first_position, size_t window) const {
+    Matrix<D> attention(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, Position conversation_position, size_t window) const {
         Matrix<Hq * Dh> Q = WQ(X);
         q_norm.apply(Q);
-        rotate_heads<Hq, Dh>(Q, rope, first_position);
+        rotate_heads<Hq, Dh>(Q, rope, conversation_position);
 
         Matrix<Hkv * Dh> K = WK(X);
         k_norm.apply(K);
-        rotate_heads<Hkv, Dh>(K, rope, first_position);
+        rotate_heads<Hkv, Dh>(K, rope, conversation_position);
 
         Matrix<Hkv * Dh> V = WV(X);
         v_norm.apply(V);
 
-        Matrix<Hq * Dh> A = cache.append_and_attend(Q.view(), K.view(), V.view(), first_position, CausalWindow{window});
+        const auto reduce = [&](MatrixView<Hq * Dh> queries, Position at) {
+            std::vector<VisibleRows> visible;
+            visible.reserve(queries.rows());
+            for (size_t row = 0; row < queries.rows(); ++row) visible.push_back(cache.visible_rows(at + row, CausalWindow{window}));
+
+            Matrix<Hq * Dh> attended = Matrix<Hq * Dh>::zero_rows(queries.rows());
+            par_for(queries.rows() * Hq, [&](size_t task) {
+                const size_t row = task / Hq, head = task % Hq;
+                const VecView<Dh> query = slice<Dh>(queries.row(row), head);
+                const KVHead group{head / (Hq / Hkv)};
+                const VisibleRows rows = visible[row];
+
+                std::vector<Scalar> alpha;
+                alpha.reserve(rows.count());
+                for (size_t j = rows.first; j < rows.end; ++j) alpha.push_back(dot(query, cache.key(j, group)));
+                Softmax::apply(alpha);
+
+                Vec<Dh> head_output;
+                for (size_t n = 0; n < alpha.size(); ++n) head_output.scaled_add(cache.value(rows.first + n, group), alpha[n]);
+                attended.template replace_partition<Dh>(row, head, head_output);
+            });
+            return attended;
+        };
+
+        // Prefill appends the batch once and attends in parallel. A bounded ring
+        // that would evict mid-batch advances row by row instead, so the early
+        // queries keep the keys they are still allowed to see.
+        Matrix<Hq * Dh> A;
+        if (cache.can_append_without_eviction(Q.rows())) {
+            for (size_t row = 0; row < Q.rows(); ++row) cache.append(conversation_position + row, K.row(row), V.row(row));
+            A = reduce(Q.view(), conversation_position);
+        } else {
+            A.reserve(Q.rows());
+            for (size_t row = 0; row < Q.rows(); ++row) {
+                const Position at = conversation_position + row;
+                cache.append(at, K.row(row), V.row(row));
+                A.append(reduce(Q.view().single_row(row), at).row(0));
+            }
+        }
         return WO(A.view());
     }
 
     template <HeadRotation<Dh> Rope>
-    Matrix<D> forward(MatrixView<D> X, MultiHeadAttention<Hq, Hkv, Dh>& cache, const Rope& rope, Position first_position, size_t window, MatrixView<Gemma4E4BTextConfig::PLE> per_layer_input) const {
+    Matrix<D> forward(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, Position conversation_position, size_t window, MatrixView<Gemma4E4BTextConfig::PLE> per_layer_input) const {
         const Matrix<D> U = attn_norm(X);
-        const Matrix<D> A = post_attn_norm(attention(U.view(), cache, rope, first_position, window));
-        Matrix<D> H = add(X, A.view());
+        const Matrix<D> A = post_attn_norm(attention(U.view(), cache, rope, conversation_position, window));
+        Matrix<D> H = X + A;
 
         Matrix<D> Z = ffn_norm(H.view());
         Matrix<D> F = post_ffn_norm(ffn(Z.view()));
-        H = add(H.view(), F.view());
+        H = H + F;
 
         H = ple(H.view(), per_layer_input);
         H.scale(layer_output_scale);
@@ -244,27 +291,49 @@ struct GemmaE4BSharedLayer {
     GemmaPerLayerResidual<D, Gemma4E4BTextConfig::PLE> ple;
     Scalar layer_output_scale;
 
-    // This layer owns no K/V. It only forms Q and attends to an earlier
-    // owning layer's cache; in particular, it never appends cache rows.
+    // This layer owns no K/V. It forms Q and reduces against an earlier owning
+    // layer's cache, which it takes by CONST reference: never appending is a
+    // property of this layer's anatomy, so the signature enforces it. The
+    // reduction is the same equation the owning layer writes, minus the append.
     template <HeadRotation<Dh> Rope>
-    Matrix<D> attention(MatrixView<D> X, MultiHeadAttention<Hq, Hkv, Dh>& cache, const Rope& rope, Position first_position, size_t window) const {
+    Matrix<D> attention(MatrixView<D> X, const KVCache<Hkv, Dh>& cache, const Rope& rope, Position conversation_position, size_t window) const {
         Matrix<Hq * Dh> Q = WQ(X);
         q_norm.apply(Q);
-        rotate_heads<Hq, Dh>(Q, rope, first_position);
-        Matrix<Hq * Dh> A = cache.attend(Q.view(), first_position, CausalWindow{window});
+        rotate_heads<Hq, Dh>(Q, rope, conversation_position);
+
+        std::vector<VisibleRows> visible;
+        visible.reserve(Q.rows());
+        for (size_t row = 0; row < Q.rows(); ++row) visible.push_back(cache.visible_rows(conversation_position + row, CausalWindow{window}));
+
+        Matrix<Hq * Dh> A = Matrix<Hq * Dh>::zero_rows(Q.rows());
+        par_for(Q.rows() * Hq, [&](size_t task) {
+            const size_t row = task / Hq, head = task % Hq;
+            const VecView<Dh> query = slice<Dh>(Q.row(row), head);
+            const KVHead group{head / (Hq / Hkv)};
+            const VisibleRows rows = visible[row];
+
+            std::vector<Scalar> alpha;
+            alpha.reserve(rows.count());
+            for (size_t j = rows.first; j < rows.end; ++j) alpha.push_back(dot(query, cache.key(j, group)));
+            Softmax::apply(alpha);
+
+            Vec<Dh> head_output;
+            for (size_t n = 0; n < alpha.size(); ++n) head_output.scaled_add(cache.value(rows.first + n, group), alpha[n]);
+            A.template replace_partition<Dh>(row, head, head_output);
+        });
         return WO(A.view());
     }
 
     template <HeadRotation<Dh> Rope>
-    Matrix<D> forward(MatrixView<D> X, MultiHeadAttention<Hq, Hkv, Dh>& cache, const Rope& rope, Position first_position, size_t window, MatrixView<Gemma4E4BTextConfig::PLE> per_layer_input) const {
+    Matrix<D> forward(MatrixView<D> X, const KVCache<Hkv, Dh>& cache, const Rope& rope, Position conversation_position, size_t window, MatrixView<Gemma4E4BTextConfig::PLE> per_layer_input) const {
         Matrix<D> U = attn_norm(X);
-        Matrix<D> A = attention(U.view(), cache, rope, first_position, window);
+        Matrix<D> A = attention(U.view(), cache, rope, conversation_position, window);
         A = post_attn_norm(A);
-        Matrix<D> H = add(X, A.view());
+        Matrix<D> H = X + A;
 
         Matrix<D> Z = ffn_norm(H.view());
         Matrix<D> F = post_ffn_norm(ffn(Z.view()));
-        H = add(H.view(), F.view());
+        H = H + F;
 
         H = ple(H.view(), per_layer_input);
         H.scale(layer_output_scale);
@@ -276,8 +345,8 @@ using GemmaE4BModelData = GemmaPerLayerInputs<Gemma4E4BTextConfig::D, Gemma4E4BT
 
 class Gemma4E4BCache {
     using C = Gemma4E4BTextConfig;
-    using Local = MultiHeadAttention<C::Hq, C::Hkv, C::LOCAL_HEAD_DIM>;
-    using Global = MultiHeadAttention<C::Hq, C::Hkv, C::GLOBAL_HEAD_DIM>;
+    using Local = KVCache<C::Hkv, C::LOCAL_HEAD_DIM>;
+    using Global = KVCache<C::Hkv, C::GLOBAL_HEAD_DIM>;
     using Entry = std::variant<std::monostate, Local, Global>;
 
 public:
@@ -360,7 +429,8 @@ public:
         const Matrix<C::PLE * C::L> per_layer = per_layer_inputs_(input.matrix(), input.token_ids());
 
         ResidualStream<D> residual(input);
-        for (size_t layer = 0; layer < L; ++layer) forward_layer(state, input, residual, per_layer, layer);
+        const Position conversation_position = input.conversation_position();
+        for (size_t layer = 0; layer < L; ++layer) forward_layer(state, conversation_position, residual, per_layer, layer);
         state.advance(input.tokens());
 
         Vec<D> last = final_norm_(residual.token(residual.tokens() - 1));
@@ -370,15 +440,19 @@ public:
     }
 
 private:
-    // Run layer `layer_index` in place: `residual` is the only in/out. The
-    // equation is the selected layer type's forward() method; the schedule is
+    // Run layer `layer_index` in place: `residual` is the only in/out, and
+    // `conversation_position` is where its rows sit in the CONVERSATION — RoPE angles
+    // and the sliding window are absolute coordinates, not offsets into this
+    // batch. A layer needs nothing else of the original input: the rows arrive
+    // through `residual`, and the ids were spent once, above, on `per_layer`.
+    //
+    // The equation is the selected layer type's forward() method; the schedule is
     // two plain booleans, and each branch names exactly which vector, which
     // cache, which rope table and which window that layer kind uses. Layers
     // 24..41 own no K/V: they attend against what layer 22 (sliding) or 23
     // (full) wrote earlier in this same pass, which is why local()/global()
     // redirect rather than those layers holding a cache.
-    void forward_layer(PrefixState& state, EmbeddedRows<D> input, ResidualStream<D>& residual, const Matrix<C::PLE * C::L>& per_layer, size_t layer_index) const {
-        const Position pos = input.position(0);
+    void forward_layer(PrefixState& state, Position conversation_position, ResidualStream<D>& residual, const Matrix<C::PLE * C::L>& per_layer, size_t layer_index) const {
         const Matrix<C::PLE> ple = slice_columns<C::PLE>(per_layer.view(), layer_index);
         const MatrixView<D> X = residual.matrix();
         const size_t n = C::position_in_kind(layer_index);
@@ -386,10 +460,13 @@ private:
         const bool shared = C::shares_kv(layer_index);
 
         Matrix<D> next = [&]() -> Matrix<D> {
-            if (!shared && !full) return sliding_.at(n).forward(X, state.local(layer_index), LocalRope{}, pos, C::SLIDING_WINDOW, ple.view());
-            if (!shared) return global_.at(n).forward(X, state.global(layer_index), GlobalRope{}, pos, /*window=*/0, ple.view());
-            if (!full) return sliding_shared_.at(n).forward(X, state.local(layer_index), LocalRope{}, pos, C::SLIDING_WINDOW, ple.view());
-            return global_shared_.at(n).forward(X, state.global(layer_index), GlobalRope{}, pos, /*window=*/0, ple.view());
+            if (!shared && !full)
+             return sliding_.at(n).forward(X, state.local(layer_index), LocalRope{}, conversation_position, C::SLIDING_WINDOW, ple.view());
+            if (!shared)
+             return global_.at(n).forward(X, state.global(layer_index), GlobalRope{}, conversation_position, /*window=*/0, ple.view());
+            if (!full) 
+                return sliding_shared_.at(n).forward(X, state.local(layer_index), LocalRope{}, conversation_position, C::SLIDING_WINDOW, ple.view());
+            return global_shared_.at(n).forward(X, state.global(layer_index), GlobalRope{}, conversation_position, /*window=*/0, ple.view());
         }();
         residual.set_matrix(std::move(next));
     }
@@ -495,35 +572,75 @@ struct Gemma12BSlidingLayer {
     RMSNorm<D> post_ffn_norm;
     Scalar layer_output_scale;
 
-    // Sliding attention owns separate K and V projections and appends them to
-    // its bounded cache.
+    // Sliding attention owns separate K and V projections, appends them to its
+    // bounded cache, and reduces over the window:
+    //   score_j = dot(q_head, k_j,group)      the Q norm carries the scale
+    //   alpha   = softmax(score)
+    //   out     = sum_j alpha_j * v_j,group
     template <HeadRotation<Dh> Rope>
-    Matrix<D> attention(MatrixView<D> X, MultiHeadAttention<Hq, Hkv, Dh>& cache, const Rope& rope, Position first_position, size_t window) const {
+    Matrix<D> attention(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, Position conversation_position, size_t window) const {
         Matrix<Hq * Dh> Q = WQ(X);
         q_norm.apply(Q);
-        rotate_heads<Hq, Dh>(Q, rope, first_position);
+        rotate_heads<Hq, Dh>(Q, rope, conversation_position);
 
         Matrix<Hkv * Dh> K = WK(X);
         k_norm.apply(K);
-        rotate_heads<Hkv, Dh>(K, rope, first_position);
+        rotate_heads<Hkv, Dh>(K, rope, conversation_position);
 
         Matrix<Hkv * Dh> V = WV(X);
         v_norm.apply(V);
 
-        Matrix<Hq * Dh> A = cache.append_and_attend(Q.view(), K.view(), V.view(), first_position, CausalWindow{window});
+        const auto reduce = [&](MatrixView<Hq * Dh> queries, Position at) {
+            std::vector<VisibleRows> visible;
+            visible.reserve(queries.rows());
+            for (size_t row = 0; row < queries.rows(); ++row) visible.push_back(cache.visible_rows(at + row, CausalWindow{window}));
+
+            Matrix<Hq * Dh> attended = Matrix<Hq * Dh>::zero_rows(queries.rows());
+            par_for(queries.rows() * Hq, [&](size_t task) {
+                const size_t row = task / Hq, head = task % Hq;
+                const VecView<Dh> query = slice<Dh>(queries.row(row), head);
+                const KVHead group{head / (Hq / Hkv)};
+                const VisibleRows rows = visible[row];
+
+                std::vector<Scalar> alpha;
+                alpha.reserve(rows.count());
+                for (size_t j = rows.first; j < rows.end; ++j) alpha.push_back(dot(query, cache.key(j, group)));
+                Softmax::apply(alpha);
+
+                Vec<Dh> head_output;
+                for (size_t n = 0; n < alpha.size(); ++n) head_output.scaled_add(cache.value(rows.first + n, group), alpha[n]);
+                attended.template replace_partition<Dh>(row, head, head_output);
+            });
+            return attended;
+        };
+
+        // A 1024-wide ring evicts on any prompt longer than the window, so the
+        // row-by-row path is the normal long-prefill case, not an edge.
+        Matrix<Hq * Dh> A;
+        if (cache.can_append_without_eviction(Q.rows())) {
+            for (size_t row = 0; row < Q.rows(); ++row) cache.append(conversation_position + row, K.row(row), V.row(row));
+            A = reduce(Q.view(), conversation_position);
+        } else {
+            A.reserve(Q.rows());
+            for (size_t row = 0; row < Q.rows(); ++row) {
+                const Position at = conversation_position + row;
+                cache.append(at, K.row(row), V.row(row));
+                A.append(reduce(Q.view().single_row(row), at).row(0));
+            }
+        }
         return WO(A.view());
     }
 
     template <HeadRotation<Dh> Rope>
-    Matrix<D> forward(MatrixView<D> X, MultiHeadAttention<Hq, Hkv, Dh>& cache, const Rope& rope, Position first_position, size_t window) const {
+    Matrix<D> forward(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, Position conversation_position, size_t window) const {
         Matrix<D> U = attn_norm(X);
-        Matrix<D> A = attention(U.view(), cache, rope, first_position, window);
+        Matrix<D> A = attention(U.view(), cache, rope, conversation_position, window);
         A = post_attn_norm(A);
-        Matrix<D> H = add(X, A.view());
+        Matrix<D> H = X + A;
 
         Matrix<D> Z = ffn_norm(H.view());
         Matrix<D> F = post_ffn_norm(ffn(Z.view()));
-        H = add(H.view(), F.view());
+        H = H + F;
 
         H.scale(layer_output_scale);
         return H;
@@ -555,31 +672,73 @@ struct Gemma12BGlobalLayer {
     // why this is the one attention that must copy: two different norms read
     // the same projected rows, so neither can consume them.
     template <HeadRotation<Dh> Rope>
-    Matrix<D> attention(MatrixView<D> X, MultiHeadAttention<Hq, Hkv, Dh>& cache, const Rope& rope, Position first_position, size_t window) const {
+    Matrix<D> attention(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, Position conversation_position, size_t window) const {
         Matrix<Hq * Dh> Q = WQ(X);
         q_norm.apply(Q);
-        rotate_heads<Hq, Dh>(Q, rope, first_position);
+        rotate_heads<Hq, Dh>(Q, rope, conversation_position);
 
         Matrix<Hkv * Dh> V = WK(X);
-        Matrix<Hkv * Dh> K = copy(V.view());
+        Matrix<Hkv * Dh> K = V;  // same projection, rotated as K and left unrotated as V
         k_norm.apply(K);
-        rotate_heads<Hkv, Dh>(K, rope, first_position);
+        rotate_heads<Hkv, Dh>(K, rope, conversation_position);
         v_norm.apply(V);
 
-        Matrix<Hq * Dh> A = cache.append_and_attend(Q.view(), K.view(), V.view(), first_position, CausalWindow{window});
+        // Once the unified projection has become K and V, the reduction is the
+        // ordinary one:
+        //   score_j = dot(q_head, k_j,group)
+        //   alpha   = softmax(score)
+        //   out     = sum_j alpha_j * v_j,group
+        const auto reduce = [&](MatrixView<Hq * Dh> queries, Position at) {
+            std::vector<VisibleRows> visible;
+            visible.reserve(queries.rows());
+            for (size_t row = 0; row < queries.rows(); ++row) visible.push_back(cache.visible_rows(at + row, CausalWindow{window}));
+
+            Matrix<Hq * Dh> attended = Matrix<Hq * Dh>::zero_rows(queries.rows());
+            par_for(queries.rows() * Hq, [&](size_t task) {
+                const size_t row = task / Hq, head = task % Hq;
+                const VecView<Dh> query = slice<Dh>(queries.row(row), head);
+                const KVHead group{head / (Hq / Hkv)};
+                const VisibleRows rows = visible[row];
+
+                std::vector<Scalar> alpha;
+                alpha.reserve(rows.count());
+                for (size_t j = rows.first; j < rows.end; ++j) alpha.push_back(dot(query, cache.key(j, group)));
+                Softmax::apply(alpha);
+
+                Vec<Dh> head_output;
+                for (size_t n = 0; n < alpha.size(); ++n) head_output.scaled_add(cache.value(rows.first + n, group), alpha[n]);
+                attended.template replace_partition<Dh>(row, head, head_output);
+            });
+            return attended;
+        };
+
+        // Global layers retain everything, so the eviction path never fires
+        // here; the branch stays because the cache, not the layer, decides.
+        Matrix<Hq * Dh> A;
+        if (cache.can_append_without_eviction(Q.rows())) {
+            for (size_t row = 0; row < Q.rows(); ++row) cache.append(conversation_position + row, K.row(row), V.row(row));
+            A = reduce(Q.view(), conversation_position);
+        } else {
+            A.reserve(Q.rows());
+            for (size_t row = 0; row < Q.rows(); ++row) {
+                const Position at = conversation_position + row;
+                cache.append(at, K.row(row), V.row(row));
+                A.append(reduce(Q.view().single_row(row), at).row(0));
+            }
+        }
         return WO(A.view());
     }
 
     template <HeadRotation<Dh> Rope>
-    Matrix<D> forward(MatrixView<D> X, MultiHeadAttention<Hq, Hkv, Dh>& cache, const Rope& rope, Position first_position, size_t window) const {
+    Matrix<D> forward(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, Position conversation_position, size_t window) const {
         Matrix<D> U = attn_norm(X);
-        Matrix<D> A = attention(U.view(), cache, rope, first_position, window);
+        Matrix<D> A = attention(U.view(), cache, rope, conversation_position, window);
         A = post_attn_norm(A);
-        Matrix<D> H = add(X, A.view());
+        Matrix<D> H = X + A;
 
         Matrix<D> Z = ffn_norm(H.view());
         Matrix<D> F = post_ffn_norm(ffn(Z.view()));
-        H = add(H.view(), F.view());
+        H = H + F;
 
         H.scale(layer_output_scale);
         return H;
@@ -592,8 +751,8 @@ struct Gemma12BGlobalLayer {
 // rows, so their cost stops growing with T.
 class Gemma4_12BCache {
     using C = Gemma4_12BTextConfig;
-    using Local = MultiHeadAttention<C::Hq, C::LOCAL_HKV, C::LOCAL_HEAD_DIM>;
-    using Global = MultiHeadAttention<C::Hq, C::GLOBAL_HKV, C::GLOBAL_HEAD_DIM>;
+    using Local = KVCache<C::LOCAL_HKV, C::LOCAL_HEAD_DIM>;
+    using Global = KVCache<C::GLOBAL_HKV, C::GLOBAL_HEAD_DIM>;
     using Entry = std::variant<Local, Global>;
 
 public:
@@ -652,7 +811,8 @@ public:
         if (input.tokens() > CTX - state.tokens()) throw std::length_error("Gemma4_12BModel: context exhausted");
 
         ResidualStream<D> residual(input);
-        for (size_t layer = 0; layer < L; ++layer) forward_layer(state, input, residual, layer);
+        const Position conversation_position = input.conversation_position();
+        for (size_t layer = 0; layer < L; ++layer) forward_layer(state, conversation_position, residual, layer);
         state.advance(input.tokens());
 
         Vec<D> last = final_norm_(residual.token(residual.tokens() - 1));
@@ -664,12 +824,11 @@ public:
 private:
     // Each concrete 12B layer owns its equation. Unlike E4B's methods these
     // methods have no per-layer-input argument and perform no PLE residual.
-    void forward_layer(PrefixState& state, EmbeddedRows<D> input, ResidualStream<D>& residual, size_t layer_index) const {
-        const Position pos = input.position(0);
+    void forward_layer(PrefixState& state, Position conversation_position, ResidualStream<D>& residual, size_t layer_index) const {
         const MatrixView<D> X = residual.matrix();
         const size_t n = C::position_in_kind(layer_index);
 
-        Matrix<D> next = C::attention_kind(layer_index) == GemmaAttentionKind::Sliding ? sliding_.at(n).forward(X, state.local(layer_index), LocalRope{}, pos, C::SLIDING_WINDOW) : global_.at(n).forward(X, state.global(layer_index), GlobalRope{}, pos, /*window=*/0);
+        Matrix<D> next = C::attention_kind(layer_index) == GemmaAttentionKind::Sliding ? sliding_.at(n).forward(X, state.local(layer_index), LocalRope{}, conversation_position, C::SLIDING_WINDOW) : global_.at(n).forward(X, state.global(layer_index), GlobalRope{}, conversation_position, /*window=*/0);
         residual.set_matrix(std::move(next));
     }
 

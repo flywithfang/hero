@@ -36,20 +36,18 @@ inline constexpr TokenId SOFT_TOKEN_ID{0};
 template <size_t D>
 class EmbeddedRows {
 public:
-    EmbeddedRows(MatrixView<D> rows, std::span<const TokenId> token_ids, Position first_position) : rows_(rows), token_ids_(token_ids), first_position_(first_position) {
+    EmbeddedRows(MatrixView<D> rows, std::span<const TokenId> token_ids, Position conversation_position) : rows_(rows), token_ids_(token_ids), conversation_position_(conversation_position) {
         if (token_ids_.size() != rows_.rows()) throw std::invalid_argument("EmbeddedRows: one id per row");
     }
 
     size_t tokens() const { return rows_.rows(); }
     MatrixView<D> matrix() const { return rows_; }
     VecView<D> embedding(size_t i) const { return rows_.row(i); }
-    // Where row i sits in the CONVERSATION, not in this view. Everything
-    // positional downstream counts up from it: RoPE angles, sliding-window
-    // range, and the check that these rows continue the carried state.
-    Position position(size_t i) const {
-        if (i >= tokens()) throw std::out_of_range("EmbeddedRows: token out of range");
-        return first_position_ + i;
-    }
+    // Where row 0 sits in the CONVERSATION, not in this view. Rows are
+    // consecutive from there, so this one number is the whole positional story:
+    // RoPE angles, sliding-window range, and where the cache resumes all count
+    // up from it, and not one of them wants it a row at a time.
+    Position conversation_position() const { return conversation_position_; }
     // The vocabulary id each row came from. Rows an encoder invented carry
     // SOFT_TOKEN_ID; Gemma E4B is the one model that reads any of this, to key
     // its per-layer embedding table.
@@ -62,7 +60,7 @@ public:
 private:
     MatrixView<D> rows_;
     std::span<const TokenId> token_ids_;
-    Position first_position_;
+    Position conversation_position_;
 };
 
 // The decoder's whole input: every row of the conversation so far, and the id

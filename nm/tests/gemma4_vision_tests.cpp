@@ -15,9 +15,9 @@ int main() {
     value[32] = 3.f;
     value[48] = 4.f;
     VisionRope2D<64, 100> rope;
-    rope.apply(MutVecView<64>{value.begin()}, 0, 0);
+    rope.apply(MutVecView<64>(value), 0, 0);
     check(value[0] == 1.f && value[16] == 2.f && value[32] == 3.f && value[48] == 4.f, "position zero is identity on both axes");
-    rope.apply(MutVecView<64>{value.begin()}, 1, 0);
+    rope.apply(MutVecView<64>(value), 1, 0);
     check(std::fabs(value[32] - 3.f) < 1e-6f && std::fabs(value[48] - 4.f) < 1e-6f, "x position rotates only the first half of each head");
 
     std::printf("== learned 2-D positions ==\n");

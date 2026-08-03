@@ -30,12 +30,21 @@ standing context.
 - `src/components.hpp` — config-free weight-carrying components: `Linear`,
   `ClippedLinear`, `RMSNorm`, `RMSNormNoScale`, `GatedMLP` (SwiGLU),
   `GeluGatedMLP`, `MoE` (expert body is a template parameter).
-- `src/attention.hpp` — **the model-neutral token-mixing core**: `KVCache`
-  (full-retention or sliding ring), `key_is_visible` (the mask, defined once),
-  `attend`/`attend_head`/`attend_and_cache` (GQA as gather-and-reduce),
-  `RotaryEmbedding` (half-split pairing, optional partial rotation),
-  `rotate_heads`, `PerHeadNorm`. Score scale is a parameter, not a constant:
-  families that fold 1/sqrt(HeadDim) into a learned Q norm pass 1.0.
+- `src/attention.hpp` — **the model-neutral token-mixing PARTS**:
+  `KVCache<Hkv, HeadDim>` (full-retention or sliding ring — storage, eviction and
+  the position anchor, and nothing else; note it takes no `Hq`, because how many
+  query heads read a cache is not the cache's business), `CausalWindow` (the mask
+  defined once, as a predicate `contains` plus its closed-form `visible_rows`),
+  `VisibleRows`, `KVHead`, `RotaryEmbedding` (half-split pairing, optional
+  partial rotation), `rotate_heads`, `PerHeadNorm`.
+  The softmax reduction over cached keys is deliberately NOT here. Each layer
+  kind writes its own, in its `attention()`/`mix_tokens`, because that equation is
+  where families diverge: Gemma folds 1/sqrt(HeadDim) into its learned Q norm and
+  multiplies by no scale at all, Qwen keeps an explicit one, and capped scores or
+  sink logits would land inside the same loop. The known price is five near-copies
+  of ~15 lines — Gemma E4B owned/shared, both 12B kinds, Qwen gated — plus two
+  toy mirrors in the tests, and the `par_for` inside them is the future
+  accelerator seam, so a tiled rewrite happens five times. Accepted knowingly.
 - `src/recurrent.hpp` — **the other token mixer**: `CausalConv1dState`,
   `DeltaNetState`, `gated_delta_step`, `softplus`, `l2_normalize`. Attention
   remembers a cache that grows with T; a delta network remembers a fixed-size
@@ -71,6 +80,31 @@ standing context.
    `par_map_rows`/`par_map_heads`; the one kernel that produces columns rather
    than rows (`Weight::matmul`) writes a complete buffer and hands it over with
    `from_row_major`. Rows change after the fact only through `transform_rows`.
+   MEMBER vs FREE, decided once: an operation on ONE object is that object's
+   method — an owner mutates itself (`Vec::scale`, `Matrix::clamp`,
+   `Matrix::add_bias`) and a view, which cannot, derives a new value
+   (`VecView::copy`, `MatrixView::clamp`). Operations over two peers (`dot`,
+   `hadamard`, `scaled_sum`) and anything parameterised by a compile-time
+   `Width` (`slice`, `slice_mut`, `slice_columns`) stay free functions: as
+   methods the latter would need `v.template slice<HeadDim>(head)` at every
+   dependent call site. Two exceptions, both forced and both commented in
+   `core.hpp`: `operator+(VecView, VecView)` must be free because operator
+   lookup applies no user conversion to the implicit object argument, so a
+   member on `VecView` is never found for `Vec + Vec`; and `Matrix::operator+`
+   must be a member (on both `Matrix` and `MatrixView`) because a free one
+   cannot deduce `C` through the `Matrix -> MatrixView` conversion. That
+   deduction gap is also the point of the rule: a member knows its own `N` and
+   lets the argument convert, which is what keeps `.view()` and
+   `VecView<N>(...)` casts out of call sites.
+   The raw-address constructors — `VecView(const Scalar*)`,
+   `MutVecView(Scalar*)`, `MatrixView(const Scalar*, size_t)` — are PRIVATE,
+   with the storage types as the whole friend list. That list is rule 1 made
+   enforceable: only a storage type can turn an address into a view, so no
+   kernel can fabricate one. A partition index becomes an address in exactly one
+   method, `VecView/MutVecView::partition<Width>(base, index)`; free `slice`,
+   `slice_mut` and `slice_columns` are wrappers over it that put Width first and
+   absorb the `.template`. Anything that needs one row shaped as a sequence uses
+   `MatrixView::single_row`, not a fabricated one-row view.
 2. Abstraction is BOTTOM-UP only. Reusable math components take dimensions
    (template params) and have clear definitions. A layer is a concrete struct
    of tensors named after the checkpoint (`WQ`, `q_norm`, `WO`, ...) plus the
@@ -117,6 +151,12 @@ standing context.
 6. Anything genuinely shared by modern decoders belongs in `attention.hpp` or
    `components.hpp` under a neutral name. A `Gemma`/`Qwen` prefix means "this
    really is family anatomy", not "this is where I happened to write it".
+   "Genuinely shared" means shared BY DEFINITION, not shared today: the softmax
+   reduction over cached keys is identical across the current four layer kinds
+   and still lives in each of them, because that identity is a coincidence of
+   which families are implemented, not a property of attention. Storage, masks,
+   norms and rotary tables are the real invariants; the equation between the
+   scores and the softmax is not.
 7. Executable property tests stay in the build: RoPE offset identity, RMSNorm
    scale invariance, attention against its own equation, PrefixCache purity.
 

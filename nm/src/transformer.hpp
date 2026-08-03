@@ -27,7 +27,7 @@ struct NoPreparedInput {};
 template <size_t D>
 class ResidualStream {
 public:
-    explicit ResidualStream(EmbeddedRows<D> input) : values_(copy(input.matrix())) {}
+    explicit ResidualStream(EmbeddedRows<D> input) : values_(input.matrix().copy()) {}
 
     size_t tokens() const { return values_.rows(); }
     MatrixView<D> matrix() const { return values_.view(); }
@@ -124,9 +124,9 @@ public:
             // first call, one token per call after that. Nothing is copied —
             // it is a view of the tail — and the model neither knows nor cares
             // which case it is in.
-            const EmbeddedRows<Model::D> uncached = complete_input.from_row(reused);
-            Logits<Model::V> logits = model_.forward(prefix_state_, uncached);
-            if (cached_tokens() != reused + uncached.tokens()) throw std::logic_error("evaluate: the model did not advance its state by the rows it was given");
+            const EmbeddedRows<Model::D> input = complete_input.from_row(reused);
+            Logits<Model::V> logits = model_.forward(prefix_state_, input);
+            if (cached_tokens() != reused + input.tokens()) throw std::logic_error("evaluate: the model did not advance its state by the rows it was given");
             embedded_sequence_id_ = complete_input.sequence_id();
             last_logits_ = logits.copy();
             return logits;

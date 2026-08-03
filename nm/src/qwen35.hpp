@@ -206,7 +206,7 @@ using QwenRecurrentMixer = QwenGatedDeltaNet<C::D, C::KEY_HEAD_DIM, C::VALUE_HEA
 template <class C>
 class Qwen35State {
 public:
-    using AttentionEntry = MultiHeadAttention<C::Hq, C::Hkv, C::HEAD_DIM>;
+    using AttentionEntry = KVCache<C::Hkv, C::HEAD_DIM>;
     struct RecurrentEntry {
         CausalConv1dState<QwenRecurrentMixer<C>::CONV_CHANNELS, C::CONV_WIDTH> conv;
         DeltaNetState<C::VALUE_HEADS, C::KEY_HEAD_DIM, C::VALUE_HEAD_DIM> delta;
@@ -289,7 +289,8 @@ public:
         if (input.tokens() > CTX - state.tokens()) throw std::length_error("Qwen35Model: context exhausted");
 
         ResidualStream<D> residual(input);
-        for (size_t layer = 0; layer < L; ++layer) forward_layer(state, input, residual, layer);
+        const Position conversation_position = input.conversation_position();
+        for (size_t layer = 0; layer < L; ++layer) forward_layer(state, conversation_position, residual, layer);
         state.advance(input.tokens());
 
         Vec<D> last = final_norm_(residual.token(residual.tokens() - 1));
@@ -302,11 +303,10 @@ public:
     }
 
 private:
-    void forward_layer(PrefixState& state, EmbeddedRows<D> input, ResidualStream<D>& residual, size_t layer_index) const {
-        const Position pos = input.position(0);
+    void forward_layer(PrefixState& state, Position conversation_position, ResidualStream<D>& residual, size_t layer_index) const {
         const MatrixView<D> X = residual.matrix();
         const size_t n = position_in_kind(layer_index);
-        Matrix<D> next = C::is_recurrent(layer_index) ? run_layer(recurrent_.at(n), X, state, layer_index, pos) : run_layer(attention_.at(n), X, state, layer_index, pos);
+        Matrix<D> next = C::is_recurrent(layer_index) ? run_layer(recurrent_.at(n), X, state, layer_index, conversation_position) : run_layer(attention_.at(n), X, state, layer_index, conversation_position);
         residual.set_matrix(std::move(next));
     }
 
@@ -316,16 +316,16 @@ private:
     // layers, the gated delta net for the rest — and that overload is the only
     // difference between a recurrent layer and an attention layer in the stack.
     template <class Layer>
-    static Matrix<D> run_layer(const Layer& layer, MatrixView<D> X, PrefixState& state, size_t layer_index, Position first_position) {
+    static Matrix<D> run_layer(const Layer& layer, MatrixView<D> X, PrefixState& state, size_t layer_index, Position conversation_position) {
         // h = x + mix( norm(x) )
         Matrix<D> U = layer.mixer_norm(X);
-        Matrix<D> M = mix_tokens(layer.mixer, U.view(), state, layer_index, first_position);
-        Matrix<D> H = add(X, M.view());
+        Matrix<D> M = mix_tokens(layer.mixer, U.view(), state, layer_index, conversation_position);
+        Matrix<D> H = X + M;
 
         // out = h + mlp( norm(h) )
         Matrix<D> Z = layer.channel_norm(H.view());
         Matrix<D> F = layer.channel(Z.view());
-        return add(H.view(), F.view());
+        return H + F;
     }
 
     Weight<C::D, C::V> embedding_;
@@ -334,7 +334,7 @@ private:
     std::vector<AttentionLayer> attention_;  // every 4th
     RMSNorm<D> final_norm_;
 
-    // Gated attention, over T tokens starting at first_position:
+    // Gated attention, over T tokens starting at conversation_position:
     //
     //     [Q | G] = X W_qg      (head-major pairs)
     //     Q = rope( rmsnorm_per_head(Q) )
@@ -342,7 +342,7 @@ private:
     //     V =                     X W_v
     //     A = attend(Q, cache <- K,V) * sigmoid(G)
     //     out = A W_o
-    static Matrix<D> mix_tokens(const QwenAttentionMixer<C>& attention, MatrixView<D> X, PrefixState& state, size_t layer, Position first_position) {
+    static Matrix<D> mix_tokens(const QwenAttentionMixer<C>& attention, MatrixView<D> X, PrefixState& state, size_t layer, Position conversation_position) {
         constexpr size_t Dh = C::HEAD_DIM;
         constexpr size_t QW = C::Hq * Dh;
 
@@ -351,15 +351,47 @@ private:
         HeadPair<C::Hq, Dh> query_gate = split_head_pairs<C::Hq, Dh>(attention.WQG(X).view());
         Matrix<QW> Q = std::move(query_gate.first);
         attention.q_norm.apply(Q);
-        rotate_heads<C::Hq, Dh>(Q, Rope{}, first_position);
+        rotate_heads<C::Hq, Dh>(Q, Rope{}, conversation_position);
 
         Matrix<C::Hkv * Dh> K = attention.WK(X);
         attention.k_norm.apply(K);
-        rotate_heads<C::Hkv, Dh>(K, Rope{}, first_position);
+        rotate_heads<C::Hkv, Dh>(K, Rope{}, conversation_position);
         Matrix<C::Hkv * Dh> V = attention.WV(X);
 
-        Matrix<QW> A = state.attention(layer).append_and_attend(Q.view(), K.view(), V.view(), first_position, CausalWindow::full(),
-                                                                                /*score_scale=*/1.f / std::sqrt(Scalar(Dh)));
+        // Qwen's reduction. Same shape as Gemma's, one difference that matters:
+        // Qwen keeps an explicit 1/sqrt(Dh) score scale, where Gemma folds it
+        // into the learned Q norm and passes nothing. That single constant is
+        // why these are two equations rather than one with a parameter.
+        KVCache<C::Hkv, Dh>& cache = state.attention(layer);
+        const Scalar score_scale = 1.f / std::sqrt(Scalar(Dh));
+        const auto reduce = [&](MatrixView<QW> queries, Position at) {
+            std::vector<VisibleRows> visible;
+            visible.reserve(queries.rows());
+            for (size_t row = 0; row < queries.rows(); ++row) visible.push_back(cache.visible_rows(at + row, CausalWindow::full()));
+
+            Matrix<QW> attended = Matrix<QW>::zero_rows(queries.rows());
+            par_for(queries.rows() * C::Hq, [&](size_t task) {
+                const size_t row = task / C::Hq, head = task % C::Hq;
+                const VecView<Dh> query = slice<Dh>(queries.row(row), head);
+                const KVHead group{head / (C::Hq / C::Hkv)};
+                const VisibleRows rows = visible[row];
+
+                std::vector<Scalar> alpha;
+                alpha.reserve(rows.count());
+                for (size_t j = rows.first; j < rows.end; ++j) alpha.push_back(score_scale * dot(query, cache.key(j, group)));
+                Softmax::apply(alpha);
+
+                Vec<Dh> head_output;
+                for (size_t n = 0; n < alpha.size(); ++n) head_output.scaled_add(cache.value(rows.first + n, group), alpha[n]);
+                attended.template replace_partition<Dh>(row, head, head_output);
+            });
+            return attended;
+        };
+
+        // Full attention with no window: the cache is unbounded, so the batch
+        // always fits and the eviction path cannot fire.
+        for (size_t row = 0; row < Q.rows(); ++row) cache.append(conversation_position + row, K.row(row), V.row(row));
+        Matrix<QW> A = reduce(Q.view(), conversation_position);
 
         // The gate is applied to the attended value, before W_o.
         A.transform_rows([&](size_t row, MutVecView<QW> attended) {
@@ -392,7 +424,7 @@ private:
     // Gated delta network. The projections are batched matmuls; only the
     // recurrence itself is sequential in T, because the state at token t is
     // by definition a function of the state at t-1.
-    static Matrix<D> mix_tokens(const QwenRecurrentMixer<C>& mixer, MatrixView<D> X, PrefixState& state, size_t layer, Position /*first_position*/) {
+    static Matrix<D> mix_tokens(const QwenRecurrentMixer<C>& mixer, MatrixView<D> X, PrefixState& state, size_t layer, Position /*conversation_position*/) {
         using Mixer = QwenRecurrentMixer<C>;
         constexpr size_t Dk = C::KEY_HEAD_DIM;
         constexpr size_t Dv = C::VALUE_HEAD_DIM;

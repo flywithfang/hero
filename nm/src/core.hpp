@@ -101,8 +101,23 @@ inline uint16_t fp32_to_bf16(float f) {
 
 // ================= stratum 0: typed storage ================================
 
+// The storage types, declared up front because each hands out views over its
+// own buffer and must therefore be a friend of the view types. That friend list
+// IS the rule "layout knowledge lives only in storage types", written where the
+// compiler can enforce it: a view over a raw address can be built by these and
+// by nothing else.
 template <size_t N>
 struct VecView;
+template <size_t N>
+struct MutVecView;
+template <size_t C>
+class Matrix;
+template <size_t C>
+class MatrixView;
+template <size_t R, size_t C>
+struct Mat;
+template <size_t In, size_t Out>
+struct MatT;
 
 template <size_t N>
 struct Vec {
@@ -116,6 +131,10 @@ struct Vec {
     void scale(Scalar factor) {
         for (size_t i = 0; i < N; ++i) p[i] *= factor;
     }
+    void clamp(Scalar minimum, Scalar maximum) {
+        if (minimum > maximum) throw std::invalid_argument("clamp: reversed interval");
+        for (size_t i = 0; i < N; ++i) p[i] = std::clamp(p[i], minimum, maximum);
+    }
     template <size_t Width>
     void replace_partition(size_t partition, VecView<Width> value) {
         static_assert(N % Width == 0);
@@ -123,33 +142,102 @@ struct Vec {
         for (size_t i = 0; i < Width; ++i) p[partition * Width + i] = value[i];
     }
     void scaled_add(VecView<N> addend, Scalar scale);
+    void operator+=(VecView<N> addend);
+    void operator*=(VecView<N> factors);  // Hadamard, in place
 };
 
+// An operation on ONE object is that object's method; an owner mutates itself
+// and a view, which cannot, derives a new value. `Vec::scale` and
+// `VecView::clamp` are the two shapes of that rule. Operations over two peers
+// (`dot`, `hadamard`), and any parameterised by a compile-time Width (`slice`),
+// stay free functions in stratum 1 below.
+//
+// Members also spare every call site a conversion: `N` cannot be deduced from
+// `Vec<N>` through the user-defined conversion to `VecView<N>`, so a free
+// function must be handed `VecView<N>(v)` by hand, while a member already knows
+// its own `N` and lets the argument convert.
 template <size_t N>
 struct VecView {
-    const Scalar* p;
     VecView(const Vec<N>& v) : p(v.p.get()) {}
-    explicit VecView(const Scalar* raw) : p(raw) {}
     const Scalar& operator[](size_t i) const { return p[i]; }
     const Scalar* begin() const { return p; }
     const Scalar* end() const { return p + N; }
+
+    Vec<N> copy() const {
+        Vec<N> y;
+        for (size_t i = 0; i < N; ++i) y[i] = p[i];
+        return y;
+    }
+    Vec<N> clamp(Scalar minimum, Scalar maximum) const {
+        Vec<N> y = copy();
+        y.clamp(minimum, maximum);
+        return y;
+    }
+    // One Width-wide partition, counted in partitions. This is the ONE place a
+    // partition index becomes an address, which is why it is a method: the free
+    // `slice` below is a wrapper over it, so `.template` is written once here
+    // rather than at each of its two dozen dependent call sites.
+    template <size_t Width>
+    VecView<Width> partition(size_t base, size_t index) const {
+        if (base + Width > N || index >= (N - base) / Width) throw std::out_of_range("VecView: partition index out of range");
+        return VecView<Width>(p + base + index * Width);
+    }
+
+private:
+    explicit VecView(const Scalar* raw) : p(raw) {}
+
+    template <size_t>
+    friend struct VecView;
+    template <size_t>
+    friend struct MutVecView;
+    template <size_t>
+    friend class Matrix;
+    template <size_t>
+    friend class MatrixView;
+    template <size_t, size_t>
+    friend struct Mat;
+    template <size_t, size_t>
+    friend struct MatT;
+
+    const Scalar* p;
 };
 
 template <size_t N>
 void Vec<N>::scaled_add(VecView<N> addend, Scalar scale) {
     for (size_t i = 0; i < N; ++i) (*this)[i] += scale * addend[i];
 }
+template <size_t N>
+void Vec<N>::operator+=(VecView<N> addend) {
+    for (size_t i = 0; i < N; ++i) p[i] += addend[i];
+}
+template <size_t N>
+void Vec<N>::operator*=(VecView<N> factors) {
+    for (size_t i = 0; i < N; ++i) p[i] *= factors[i];
+}
 
 template <size_t N>
 struct MutVecView {
     MutVecView(Vec<N>& v) : p(v.begin()) {}
-    explicit MutVecView(Scalar* raw) : p(raw) {}
     Scalar& operator[](size_t i) const { return p[i]; }
     Scalar* begin() const { return p; }
     Scalar* end() const { return p + N; }
     // Writable implies readable, so an in-place kernel can name its own input
     // without reconstructing a view from a raw pointer.
     operator VecView<N>() const { return VecView<N>(p); }
+
+    template <size_t Width>
+    MutVecView<Width> partition(size_t base, size_t index) const {
+        if (base + Width > N || index >= (N - base) / Width) throw std::out_of_range("MutVecView: partition index out of range");
+        return MutVecView<Width>(p + base + index * Width);
+    }
+
+private:
+    explicit MutVecView(Scalar* raw) : p(raw) {}
+
+    template <size_t>
+    friend struct MutVecView;
+    template <size_t>
+    friend class Matrix;
 
     Scalar* p;
 };
@@ -163,9 +251,6 @@ class Matrix;
 template <size_t C>
 class MatrixView {
 public:
-    MatrixView(const Scalar* data, size_t rows) : data_(data), rows_(rows) {
-        if (rows_ != 0 && data_ == nullptr) throw std::invalid_argument("MatrixView: null data");
-    }
     MatrixView(const Matrix<C>& matrix);
 
     size_t rows() const { return rows_; }
@@ -180,11 +265,31 @@ public:
         if (first > rows_) throw std::out_of_range("MatrixView: row out of range");
         return MatrixView(data_ + first * C, rows_ - first);
     }
+    // One row, still shaped as a sequence — for the kernels written against a
+    // [T,C] input that a decode step calls with T == 1.
+    MatrixView single_row(size_t i) const {
+        check_row(i);
+        return MatrixView(data_ + i * C, 1);
+    }
+
+    // Each of these is its VecView operation applied to every row, and says so
+    // in one line — which is why the vector and matrix forms cannot drift apart
+    // and share a spelling at the call site. Defined below, once Matrix<C> is
+    // complete.
+    Matrix<C> copy() const;
+    Matrix<C> clamp(Scalar minimum, Scalar maximum) const;
+    Matrix<C> operator+(MatrixView right) const;
 
 private:
+    MatrixView(const Scalar* data, size_t rows) : data_(data), rows_(rows) {
+        if (rows_ != 0 && data_ == nullptr) throw std::invalid_argument("MatrixView: null data");
+    }
     void check_row(size_t i) const {
         if (i >= rows_) throw std::out_of_range("MatrixView: row out of range");
     }
+
+    template <size_t>
+    friend class Matrix;
 
     const Scalar* data_;
     size_t rows_;
@@ -272,7 +377,23 @@ public:
     void scale(Scalar factor) {
         for (Scalar& element : values_) element *= factor;
     }
+    void clamp(Scalar minimum, Scalar maximum) {
+        if (minimum > maximum) throw std::invalid_argument("clamp: reversed interval");
+        for (Scalar& element : values_) element = std::clamp(element, minimum, maximum);
+    }
+    // One vector added to every row. The old free `add_bias_in_place` named its
+    // own mutation because it could not be a method; now it is one.
+    void add_bias(VecView<C> bias) {
+        transform_rows([&](MutVecView<C> row) {
+            for (size_t channel = 0; channel < C; ++channel) row[channel] += bias[channel];
+        });
+    }
     void fill(Scalar value) { std::fill(values_.begin(), values_.end(), value); }
+    // Both operands are peers, so this would be a free function by the rule
+    // above — but a free operator+ cannot deduce C through Matrix -> MatrixView,
+    // and `H + F` must work whether either side is owned or a view. Two members
+    // covering the four combinations is the smaller price.
+    Matrix operator+(MatrixView<C> right) const { return view() + right; }
     template <size_t Width>
     void replace_partition(size_t row, size_t partition, VecView<Width> value) {
         static_assert(C % Width == 0);
@@ -296,6 +417,27 @@ private:
 
 template <size_t C>
 MatrixView<C>::MatrixView(const Matrix<C>& matrix) : MatrixView(matrix.view()) {}
+
+template <size_t C>
+Matrix<C> MatrixView<C>::copy() const {
+    Matrix<C> output;
+    output.append(*this);
+    return output;
+}
+template <size_t C>
+Matrix<C> MatrixView<C>::clamp(Scalar minimum, Scalar maximum) const {
+    Matrix<C> output = copy();
+    output.clamp(minimum, maximum);
+    return output;
+}
+template <size_t C>
+Matrix<C> MatrixView<C>::operator+(MatrixView<C> right) const {
+    if (rows() != right.rows()) throw std::invalid_argument("Matrix: row count mismatch");
+    Matrix<C> output;
+    output.reserve(rows());
+    for (size_t i = 0; i < rows(); ++i) output.append(row(i) + right.row(i));
+    return output;
+}
 
 template <size_t R, size_t C>
 struct Mat {  // concept layout: y = x·W
@@ -335,25 +477,19 @@ private:
 };
 
 // ================= stratum 1: algebra ======================================
+//
+// What is left here after the one-object operations moved onto the types: the
+// operations over two peers with no owner between them, and the ones
+// parameterised by a compile-time Width, which as methods would need
+// `v.template slice<HeadDim>(head)` at every dependent call site.
 
+// Free because a member operator+ on VecView is never found for `Vec + Vec`:
+// operator lookup does not apply a user conversion to the implicit object
+// argument.
 template <size_t N>
 Vec<N> operator+(VecView<N> a, VecView<N> b) {
     Vec<N> y;
     for (size_t i = 0; i < N; ++i) y[i] = a[i] + b[i];
-    return y;
-}
-template <size_t N>
-void operator+=(Vec<N>& y, VecView<N> x) {
-    for (size_t i = 0; i < N; ++i) y[i] += x[i];
-}
-template <size_t N>
-void operator+=(Vec<N>& y, const Vec<N>& x) {
-    for (size_t i = 0; i < N; ++i) y[i] += x[i];
-}
-template <size_t N>
-Vec<N> copy(VecView<N> v) {
-    Vec<N> y;
-    for (size_t i = 0; i < N; ++i) y[i] = v[i];
     return y;
 }
 template <size_t N>
@@ -376,14 +512,6 @@ Vec<N> scaled_sum(VecView<N> left, VecView<N> right, Scalar scale) {
     return output;
 }
 
-template <size_t N>
-Vec<N> clamp(VecView<N> input, Scalar minimum, Scalar maximum) {
-    if (minimum > maximum) throw std::invalid_argument("clamp: reversed interval");
-    Vec<N> output;
-    for (size_t channel = 0; channel < N; ++channel) output[channel] = std::clamp(input[channel], minimum, maximum);
-    return output;
-}
-
 // ---- a wide vector read as a sequence of Width-wide partitions --------------
 //
 // Heads inside a projection, layers inside the packed PLE table, one head
@@ -395,17 +523,19 @@ Vec<N> clamp(VecView<N> input, Scalar minimum, Scalar maximum) {
 // Base is where the partitioning starts, and it is a compile-time constant
 // because it is always a region boundary in a fixed packed layout — the only
 // place an element offset is legitimate, and it is checked at compile time.
+// Each of these is `partition<Width>` under a name that puts Width first and
+// hides the `.template` the call site would otherwise have to write. The
+// address arithmetic is the view's, not theirs; all that is left here is the
+// compile-time check that Base is a region boundary that fits.
 template <size_t Width, size_t Base = 0, size_t N>
 VecView<Width> slice(VecView<N> v, size_t index) {
     static_assert(Base + Width <= N, "slice: the first partition does not fit");
-    if (index >= (N - Base) / Width) throw std::out_of_range("slice: partition index out of range");
-    return VecView<Width>(&v[Base + index * Width]);
+    return v.template partition<Width>(Base, index);
 }
 template <size_t Width, size_t Base = 0, size_t N>
 MutVecView<Width> slice_mut(MutVecView<N> v, size_t index) {
     static_assert(Base + Width <= N, "slice_mut: the first partition does not fit");
-    if (index >= (N - Base) / Width) throw std::out_of_range("slice_mut: partition index out of range");
-    return MutVecView<Width>(&v[Base + index * Width]);
+    return v.template partition<Width>(Base, index);
 }
 template <size_t Width, size_t Base = 0, size_t N>
 MutVecView<Width> slice_mut(Vec<N>& v, size_t index) {
@@ -419,43 +549,11 @@ MutVecView<Width> slice_mut(Vec<N>& v, size_t index) {
 // apart, and why no kernel here indexes a flat buffer.
 
 template <size_t N>
-Matrix<N> copy(MatrixView<N> input) {
-    Matrix<N> output;
-    output.append(input);
-    return output;
-}
-
-template <size_t N>
-Matrix<N> add(MatrixView<N> left, MatrixView<N> right) {
-    if (left.rows() != right.rows()) throw std::invalid_argument("add: matrix row mismatch");
-    Matrix<N> output;
-    output.reserve(left.rows());
-    for (size_t row = 0; row < left.rows(); ++row) output.append(left.row(row) + right.row(row));
-    return output;
-}
-
-template <size_t N>
-void add_bias_in_place(Matrix<N>& output, VecView<N> bias) {
-    output.transform_rows([&](MutVecView<N> row) {
-        for (size_t channel = 0; channel < N; ++channel) row[channel] += bias[channel];
-    });
-}
-
-template <size_t N>
 Matrix<N> hadamard(MatrixView<N> left, MatrixView<N> right) {
     if (left.rows() != right.rows()) throw std::invalid_argument("hadamard: matrix row mismatch");
     Matrix<N> output;
     output.reserve(left.rows());
     for (size_t row = 0; row < left.rows(); ++row) output.append(hadamard(left.row(row), right.row(row)));
-    return output;
-}
-
-template <size_t N>
-Matrix<N> clamp(MatrixView<N> input, Scalar minimum, Scalar maximum) {
-    if (minimum > maximum) throw std::invalid_argument("clamp: reversed interval");
-    Matrix<N> output;
-    output.reserve(input.rows());
-    for (size_t row = 0; row < input.rows(); ++row) output.append(clamp(input.row(row), minimum, maximum));
     return output;
 }
 
@@ -471,7 +569,7 @@ Matrix<Width> slice_columns(MatrixView<Total> input, size_t index) {
 
 template <size_t N>
 Matrix<N> scaled_sum(MatrixView<N> left, MatrixView<N> right, Scalar scale) {
-    Matrix<N> output = add(left, right);
+    Matrix<N> output = left + right;
     output.scale(scale);
     return output;
 }
@@ -479,11 +577,6 @@ Matrix<N> scaled_sum(MatrixView<N> left, MatrixView<N> right, Scalar scale) {
 // sigmoid is a scalar function of a scalar, like std::exp: no storage to be a
 // method of, no state to be a type. Gelu/Silu/Softmax live in components.hpp.
 inline Scalar sigmoid(Scalar x) { return 1.f / (1.f + std::exp(-x)); }
-
-template <size_t N>
-void operator*=(Vec<N>& y, const Vec<N>& x) {
-    for (size_t i = 0; i < N; ++i) y[i] *= x[i];  // Hadamard
-}
 
 // ---- the parallel seams (M5 replaces the bodies with a thread pool) --------
 void par_for(size_t n, const std::function<void(size_t)>& f);  // core.cpp

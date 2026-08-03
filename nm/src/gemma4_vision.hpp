@@ -171,14 +171,14 @@ struct GemmaVisionLayer {
         Matrix<D> A = scaled_dot_product_attention<H, HeadDim, HeadDim>(Q.view(), K.view(), V.view(), 1.f);
 
         Matrix<D> attention_branch = attention_post_norm(WO(A.view()));
-        Matrix<D> residual = add(input, attention_branch.view());
+        Matrix<D> residual = input + attention_branch;
 
         Matrix<D> ffn_input = ffn_norm(residual.view());
         Matrix<FF> gate = W_gate(ffn_input.view());
         Gelu::apply(gate);
         Matrix<FF> up = W_up(ffn_input.view());
         Matrix<D> ffn = ffn_post_norm(W_down(hadamard(gate.view(), up.view()).view()));
-        return add(residual.view(), ffn.view());
+        return residual + ffn;
     }
 };
 
@@ -200,7 +200,7 @@ public:
         Matrix<C::PATCH * C::PATCH * 3> patches = patchify_rgb<C::PATCH>(prepared.pixels, prepared.width, prepared.height);
         Matrix<C::D> patch_tokens = patch_embedding_.matmul(patches.view());
         Matrix<C::D> positions = positions_.grid(px, py);
-        Matrix<C::D> hidden = add(patch_tokens.view(), positions.view());
+        Matrix<C::D> hidden = patch_tokens + positions;
         for (const Layer& layer : layers_) hidden = layer(hidden.view(), px, py);
 
         const size_t out_x = px / C::POOL, out_y = py / C::POOL;

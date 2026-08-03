@@ -23,12 +23,12 @@ public:
 
     Vec<Out> operator()(VecView<In> x) const {
         Vec<Out> y = weight_.matvec(x);
-        if (has_bias_) y += VecView<Out>(bias_);
+        if (has_bias_) y += bias_;
         return y;
     }
     Matrix<Out> operator()(MatrixView<In> x) const {
         Matrix<Out> y = weight_.matmul(x);
-        if (has_bias_) add_bias_in_place(y, VecView<Out>(bias_));
+        if (has_bias_) y.add_bias(bias_);
         return y;
     }
 
@@ -49,12 +49,14 @@ public:
     }
 
     Vec<Out> operator()(VecView<In> input) const {
-        Vec<In> clamped = clamp(input, input_min_, input_max_);
-        return clamp(VecView<Out>(linear_(clamped)), output_min_, output_max_);
+        Vec<Out> output = linear_(input.clamp(input_min_, input_max_));
+        output.clamp(output_min_, output_max_);
+        return output;
     }
     Matrix<Out> operator()(MatrixView<In> input) const {
-        Matrix<In> clamped = clamp(input, input_min_, input_max_);
-        return clamp(linear_(clamped.view()).view(), output_min_, output_max_);
+        Matrix<Out> output = linear_(input.clamp(input_min_, input_max_));
+        output.clamp(output_min_, output_max_);
+        return output;
     }
 
 private:
@@ -130,12 +132,12 @@ public:
     void apply(Matrix<N>& x) const { x.transform_rows([&](MutVecView<N> row) { apply(row); }); }
 
     Vec<N> operator()(VecView<N> x) const {
-        Vec<N> normalized = copy(x);
+        Vec<N> normalized = x.copy();
         apply(MutVecView<N>(normalized));
         return normalized;
     }
     Matrix<N> operator()(MatrixView<N> x) const {
-        Matrix<N> normalized = copy(x);
+        Matrix<N> normalized = x.copy();
         apply(normalized);
         return normalized;
     }
@@ -163,12 +165,12 @@ public:
     void apply(Matrix<N>& x) const { x.transform_rows([&](MutVecView<N> row) { apply(row); }); }
 
     Vec<N> operator()(VecView<N> x) const {
-        Vec<N> normalized = copy(x);
+        Vec<N> normalized = x.copy();
         apply(MutVecView<N>(normalized));
         return normalized;
     }
     Matrix<N> operator()(MatrixView<N> x) const {
-        Matrix<N> normalized = copy(x);
+        Matrix<N> normalized = x.copy();
         apply(normalized);
         return normalized;
     }

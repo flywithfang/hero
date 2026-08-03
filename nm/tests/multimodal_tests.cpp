@@ -41,14 +41,14 @@ int main() {
         const EmbeddedRows<2> all = seq.view();
         check(seq.tokens() == 6, "appends concatenate into one decoder sequence");
         check(all.embedding(0)[0] == 1 && all.embedding(5)[1] == 60, "appending preserves order and values");
-        check(all.position(0) == Position{0} && all.position(5) == Position{5}, "row i is at conversation position i");
+        check(all.conversation_position() == Position{0}, "the whole sequence starts at conversation position zero");
         check(all.token_id(0) == TokenId{11} && all.token_id(2) == SOFT_TOKEN_ID && all.token_id(5) == TokenId{13}, "rows keep the vocabulary id they came from, and soft tokens carry the placeholder");
 
         // What a warm cache is handed: the tail, as a view, knowing where it
         // was cut from. No copy, and nothing called a suffix.
-        const EmbeddedRows<2> uncached = seq.from_row(2);
-        check(uncached.tokens() == 4 && uncached.position(0) == Position{2}, "the uncached tail knows where it starts");
-        check(uncached.embedding(0)[0] == 3 && uncached.token_id(3) == TokenId{13}, "the tail views the same rows and ids, not copies of them");
+        const EmbeddedRows<2> input = seq.from_row(2);
+        check(input.tokens() == 4 && input.conversation_position() == Position{2}, "row i is at conversation position i, so the tail cut at 2 starts at 2");
+        check(input.embedding(0)[0] == 3 && input.token_id(3) == TokenId{13}, "the tail views the same rows and ids, not copies of them");
 
         // Rows and their ids are one append or none: they can never drift.
         bool mismatch_rejected = false;

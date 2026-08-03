@@ -3,8 +3,8 @@
 // A decoder's output is not an anonymous Vec<V>. It is one score per vocabulary
 // entry, and every operation meaningful on it — argmax, repetition penalty,
 // temperature, top-k/top-p, log-softmax — is meaningful ONLY on that axis.
-// Giving the axis a type collects that math in one place, the way
-// MultiHeadAttention owns its cache layout and reduction. This is a COHESION argument, not a safety one: V is unique
+// Giving the axis a type collects that math in one place, the way KVCache owns
+// its row layout. This is a COHESION argument, not a safety one: V is unique
 // among the engine's widths, so the dimension already stops a Vec<D> from
 // arriving here.
 //
@@ -54,8 +54,8 @@ public:
     Scalar operator[](size_t v) const { return values_[v]; }
     Scalar& operator[](size_t v) { return values_[v]; }
     VecView<V> view() const { return VecView<V>(values_); }
-    MutVecView<V> mutable_view() { return MutVecView<V>{values_.begin()}; }
-    Logits copy() const { return Logits(::copy(view())); }
+    MutVecView<V> mutable_view() { return MutVecView<V>(values_); }
+    Logits copy() const { return Logits(view().copy()); }
 
     // The greedy token. Ties resolve to the lowest id, which is what makes
     // greedy decoding bit-for-bit reproducible against the oracle.

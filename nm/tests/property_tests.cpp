@@ -15,7 +15,7 @@ static_assert(!std::is_default_constructible_v<RMSNorm<4>>);
 static_assert(!std::is_default_constructible_v<Linear<2, 2>>);
 static_assert(!std::is_default_constructible_v<GeluGatedMLP<2, 2>>);
 static_assert(std::is_default_constructible_v<RotaryEmbedding<8, 10000>>);
-static_assert(std::is_default_constructible_v<MultiHeadAttention<1, 1, 2>>);
+static_assert(std::is_default_constructible_v<KVCache<1, 2>>);
 static_assert(!std::is_convertible_v<Position, size_t>);
 static_assert(!std::is_convertible_v<size_t, Position>);
 
@@ -24,6 +24,36 @@ static void check(bool ok, const char* msg) {
     std::printf("  [%s] %s\n", ok ? "PASS" : "FAIL", msg);
     if (!ok) ++g_fail;
 }
+// The softmax reduction over cached keys, at toy size and with an explicit score
+// scale (Qwen's form; Gemma folds the scale into its Q norm and omits it). The
+// real ones live in the layer structs, which cannot be instantiated this small —
+// so this mirrors them, and the equation below is checked against arithmetic
+// worked out by hand rather than against another copy of itself.
+template <size_t Hq, size_t Hkv, size_t Dh>
+static Matrix<Hq * Dh> toy_attend(const KVCache<Hkv, Dh>& cache, MatrixView<Hq * Dh> Q, Position at, CausalWindow window, Scalar score_scale) {
+    std::vector<VisibleRows> visible;
+    visible.reserve(Q.rows());
+    for (size_t row = 0; row < Q.rows(); ++row) visible.push_back(cache.visible_rows(at + row, window));
+
+    Matrix<Hq * Dh> A = Matrix<Hq * Dh>::zero_rows(Q.rows());
+    par_for(Q.rows() * Hq, [&](size_t task) {
+        const size_t row = task / Hq, head = task % Hq;
+        const VecView<Dh> query = slice<Dh>(Q.row(row), head);
+        const KVHead group{head / (Hq / Hkv)};
+        const VisibleRows rows = visible[row];
+
+        std::vector<Scalar> alpha;
+        alpha.reserve(rows.count());
+        for (size_t j = rows.first; j < rows.end; ++j) alpha.push_back(score_scale * dot(query, cache.key(j, group)));
+        Softmax::apply(alpha);
+
+        Vec<Dh> head_output;
+        for (size_t n = 0; n < alpha.size(); ++n) head_output.scaled_add(cache.value(rows.first + n, group), alpha[n]);
+        A.template replace_partition<Dh>(row, head, head_output);
+    });
+    return A;
+}
+
 static std::mt19937 rng(42);
 static void fill(Scalar* p, size_t n, float sd = 1.0f) {
     std::normal_distribution<Scalar> N(0, sd);
@@ -69,7 +99,7 @@ public:
     }
     Logits<V> forward(PrefixState& prefix_state, EmbeddedRows<D> input) const {
         ResidualStream<D> residual(input);
-        Vec<D> sum = copy(VecView<D>(prefix_state.prefix_sum));
+        Vec<D> sum = VecView<D>(prefix_state.prefix_sum).copy();
         Matrix<D> running;
         running.reserve(residual.tokens());
         for (size_t row = 0; row < residual.tokens(); ++row) {
@@ -111,7 +141,7 @@ int main() {
         fill(q0.begin(), 8);
         fill(k0.begin(), 8);
         auto score = [&](Position p, Position m) {
-            Vec<8> q = copy(VecView<8>(q0)), k = copy(VecView<8>(k0));
+            Vec<8> q = VecView<8>(q0).copy(), k = VecView<8>(k0).copy();
             r.apply(slice_mut<8>(q, 0), p);
             r.apply(slice_mut<8>(k, 0), m);
             return dot(VecView<8>(q), VecView<8>(k));
@@ -157,7 +187,7 @@ int main() {
     {
         // One KV head, two query rows at positions 0 and 1. Row 0 may see only
         // key 0; row 1 sees both. Scores use the conventional 1/sqrt(HeadDim).
-        MultiHeadAttention<1, 1, 2> cache;
+        KVCache<1, 2> cache;
         Vec<2> key0, key1, value0, value1;
         key0[0] = 1.f;
         key1[1] = 1.f;
@@ -177,14 +207,15 @@ int main() {
         values.append(value1);
 
         const Scalar scale = 1.f / std::sqrt(2.f);
-        Matrix<2> attended = cache.append_and_attend(queries.view(), keys.view(), values.view(), Position{0}, CausalWindow::full(), scale);
+        for (size_t row = 0; row < keys.rows(); ++row) cache.append(Position{0} + row, keys.row(row), values.row(row));
+        Matrix<2> attended = toy_attend<1, 1, 2>(cache, queries.view(), Position{0}, CausalWindow::full(), scale);
         const Scalar weight1 = std::exp(scale) / (1.f + std::exp(scale));
         const Scalar expected1 = (1.f - weight1) * 10.f + weight1 * 30.f;
         check(attended.row(0)[0] == 10.f && std::fabs(attended.row(1)[0] - expected1) < 1e-5f, "the causal mask and row-wise softmax match the equation");
 
         // The same reduction under a width-1 window sees only the newest key.
-        const MatrixView<2> second_query(queries.row(1).begin(), 1);
-        Matrix<2> windowed = cache.attend(second_query, Position{1}, CausalWindow{1}, scale);
+        const MatrixView<2> second_query = queries.view().single_row(1);
+        Matrix<2> windowed = toy_attend<1, 1, 2>(cache, second_query, Position{1}, CausalWindow{1}, scale);
         check(windowed.row(0)[0] == 30.f, "a sliding window of one keeps only the current position");
     }
     std::printf("== softmax sums to 1 ==\n");
@@ -266,23 +297,41 @@ int main() {
 
     std::printf("== a query with no visible key is an error, never zero ==\n");
     {
-        MultiHeadAttention<1, 1, 2> cache;
+        KVCache<1, 2> cache;
         Vec<2> key0, value0;
         key0[0] = 1.f;
         value0[0] = 5.f;
         cache.append(Position{0}, key0, value0);
-        Vec<2> query;
-        query[0] = 1.f;
-        Matrix<2> queries;
-        queries.append(query);
         bool threw = false;
         try {
             // Position 9 with a window of 2 can see nothing at position 0.
-            (void)cache.attend(queries.view(), Position{9}, CausalWindow{2});
+            (void)cache.visible_rows(Position{9}, CausalWindow{2});
         } catch (const std::runtime_error&) {
             threw = true;
         }
         check(threw, "an empty visible set throws instead of softmaxing nothing");
+    }
+
+    std::printf("== the visible-row interval is the causal mask in closed form ==\n");
+    {
+        // attend() derives its row range by arithmetic rather than by testing
+        // every row, which is only legitimate while the two agree exactly. The
+        // box covers windows past the newest row, queries before the anchor,
+        // and an empty cache.
+        bool agrees = true;
+        for (size_t width = 0; width <= 4; ++width) {
+            const CausalWindow window{width};
+            for (size_t anchor = 0; anchor <= 3; ++anchor) {
+                for (size_t rows = 0; rows <= 5; ++rows) {
+                    for (size_t query = 0; query <= 9; ++query) {
+                        const Position oldest{anchor};
+                        const VisibleRows closed = window.visible_rows(Position{query}, oldest, rows);
+                        for (size_t row = 0; row < rows; ++row) agrees = agrees && (row >= closed.first && row < closed.end) == window.contains(oldest + row, Position{query});
+                    }
+                }
+            }
+        }
+        check(agrees, "visible_rows admits exactly the rows contains() does");
     }
 
     std::printf("\n%s (%d failures)\n", g_fail ? "PROPERTY TESTS FAILED" : "ALL PROPERTY TESTS PASSED", g_fail);

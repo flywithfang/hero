@@ -26,6 +26,36 @@ static Linear<N, N> identity_linear() {
     return Linear<N, N>(Weight<N, N>(std::move(matrix)));
 }
 
+// Gemma's softmax reduction over cached keys, at toy size. This MIRRORS the
+// bodies of GemmaE4BLayer::attention and friends, which cannot themselves be
+// instantiated small: their D/Hq/Hkv come from the E4B and 12B configs, not from
+// template parameters. Keeping the equation in the layers is a deliberate
+// choice; this copy is the price, and the two must be kept in step by hand.
+template <size_t Hq, size_t Hkv, size_t Dh>
+static Matrix<Hq * Dh> toy_attend(const KVCache<Hkv, Dh>& cache, MatrixView<Hq * Dh> Q, Position at, CausalWindow window) {
+    std::vector<VisibleRows> visible;
+    visible.reserve(Q.rows());
+    for (size_t row = 0; row < Q.rows(); ++row) visible.push_back(cache.visible_rows(at + row, window));
+
+    Matrix<Hq * Dh> A = Matrix<Hq * Dh>::zero_rows(Q.rows());
+    par_for(Q.rows() * Hq, [&](size_t task) {
+        const size_t row = task / Hq, head = task % Hq;
+        const VecView<Dh> query = slice<Dh>(Q.row(row), head);
+        const KVHead group{head / (Hq / Hkv)};
+        const VisibleRows rows = visible[row];
+
+        std::vector<Scalar> alpha;
+        alpha.reserve(rows.count());
+        for (size_t j = rows.first; j < rows.end; ++j) alpha.push_back(dot(query, cache.key(j, group)));
+        Softmax::apply(alpha);
+
+        Vec<Dh> head_output;
+        for (size_t n = 0; n < alpha.size(); ++n) head_output.scaled_add(cache.value(rows.first + n, group), alpha[n]);
+        A.template replace_partition<Dh>(row, head, head_output);
+    });
+    return A;
+}
+
 // A toy-sized statement of the unified K/V equation used by the concrete 12B
 // global layer: one projection, with different K and V normalization paths.
 struct ToyUnifiedLayer {
@@ -38,18 +68,19 @@ struct ToyUnifiedLayer {
     Linear<2, 2> WO;
 
     template <class Rope>
-    Matrix<D> attention(MatrixView<D> X, MultiHeadAttention<Hq, Hkv, Dh>& cache, const Rope& rope, Position first_position, size_t window) const {
+    Matrix<D> attention(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, Position conversation_position, size_t window) const {
         Matrix<Hq * Dh> Q = WQ(X);
         q_norm.apply(Q);
-        rotate_heads<Hq, Dh>(Q, rope, first_position);
+        rotate_heads<Hq, Dh>(Q, rope, conversation_position);
 
         Matrix<Hkv * Dh> V = WK(X);
-        Matrix<Hkv * Dh> K = copy(V.view());
+        Matrix<Hkv * Dh> K = V;  // same projection, rotated as K and left unrotated as V
         k_norm.apply(K);
-        rotate_heads<Hkv, Dh>(K, rope, first_position);
+        rotate_heads<Hkv, Dh>(K, rope, conversation_position);
         v_norm.apply(V);
 
-        Matrix<Hq * Dh> A = cache.append_and_attend(Q.view(), K.view(), V.view(), first_position, CausalWindow{window});
+        for (size_t row = 0; row < Q.rows(); ++row) cache.append(conversation_position + row, K.row(row), V.row(row));
+        Matrix<Hq * Dh> A = toy_attend<Hq, Hkv, Dh>(cache, Q.view(), conversation_position, CausalWindow{window});
         return WO(A.view());
     }
 };
@@ -86,7 +117,7 @@ int main() {
         static_assert(decltype(rope)::rotary_planes() == 2);
         Vec<8> value;
         for (size_t i = 0; i < 8; ++i) value[i] = Scalar(i + 1);
-        Vec<8> original = copy(VecView<8>(value));
+        Vec<8> original = VecView<8>(value).copy();
         rope.apply(slice_mut<8>(value, 0), Position{7});
         check(value[2] == original[2] && value[3] == original[3] && value[6] == original[6] && value[7] == original[7], "non-RoPE planes are exactly unchanged");
         check(value[0] != original[0] && value[4] != original[4], "the configured rotary prefix rotates");
@@ -94,7 +125,7 @@ int main() {
 
     std::printf("== heterogeneous K/V cache and Gemma attention ==\n");
     {
-        MultiHeadAttention<2, 1, 2> full;
+        KVCache<1, 2> full;
         Vec<2> k0, v0, k1, v1;
         k0[0] = 1;
         k0[1] = 0;
@@ -113,13 +144,13 @@ int main() {
         q[3] = 0;
         Matrix<4> queries;
         queries.append(q);
-        Matrix<4> global = full.attend(queries.view(), Position{1}, CausalWindow::full());
+        Matrix<4> global = toy_attend<2, 1, 2>(full, queries.view(), Position{1}, CausalWindow::full());
         const Scalar p0 = std::exp(1.f) / (std::exp(1.f) + 1.f);
         check(std::fabs(global.row(0)[0] - (p0 * 10 + (1 - p0) * 30)) < 1e-5f && global.row(0)[0] == global.row(0)[2], "GQA heads share KV and attention uses scale 1.0");
-        Matrix<4> local = full.attend(queries.view(), Position{1}, CausalWindow{1});
+        Matrix<4> local = toy_attend<2, 1, 2>(full, queries.view(), Position{1}, CausalWindow{1});
         check(local.row(0)[0] == 30 && local.row(0)[1] == 40, "sliding attention excludes positions outside its window");
 
-        MultiHeadAttention<2, 1, 2> ring(2);
+        KVCache<1, 2> ring(2);
         Vec<2> k2, v2;
         k2[0] = 2;
         k2[1] = 2;
@@ -222,7 +253,7 @@ int main() {
         // One token, one visible key: the softmax weight is 1 regardless of K,
         // and WO is identity, so attention() returns V itself — which for
         // unified K/V must be the raw W_k output under the scale-free norm.
-        MultiHeadAttention<1, 1, 2> cache;
+        KVCache<1, 2> cache;
         Matrix<2> out = layer.attention(x.view(), cache, RotaryEmbedding<2, 10000>{}, Position{0}, /*window=*/0);
 
         // rms([3,4]) = sqrt(12.5); normalized = [0.8485, 1.1314]

@@ -41,7 +41,7 @@ static int check(const GGUF& gguf, const char* name, const char* prompt, size_t 
     // One sequence, appended to as tokens are produced: the prefix cache keys
     // on its identity, so growing it in place is what makes decode incremental.
     EmbeddedSequence<C::D> sequence;
-    sequence.append(model.tokens(tokens), tokens);
+    sequence.append(model.embed(tokens), tokens);
     PrefixCache<Qwen35Model<C>> memo(model);
     const auto prefill_start = std::chrono::steady_clock::now();
     auto logits = memo.evaluate(sequence);
@@ -63,7 +63,7 @@ static int check(const GGUF& gguf, const char* name, const char* prompt, size_t 
             text += tokenizer.decode1(int32_t(token));
             if (tokenizer.is_eog(int32_t(token)) || i + 1 == generate_count) break;
             const std::span<const TokenId> next(&token, 1);
-            sequence.append(model.tokens(next), next);
+            sequence.append(model.embed(next), next);
             logits = memo.evaluate(sequence);
         }
         const double decode = std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_start).count();

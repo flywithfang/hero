@@ -282,7 +282,7 @@ public:
 
 
     // Qwen reads embedding rows as they are: no input scale.
-    Matrix<D> tokens(std::span<const TokenId> ids) const { return embedding_.gather_rows(ids); }
+    Matrix<D> embed(std::span<const TokenId> ids) const { return embedding_.gather_rows(ids); }
 
     // Nothing to precompute: a Qwen layer reads only the residual stream.
     Logits<V> forward(PrefixState& state, EmbeddedRows<D> input) const {
@@ -290,10 +290,10 @@ public:
 
         ResidualStream<D> residual(input);
         const Position conversation_position = input.conversation_position();
-        for (size_t layer = 0; layer < L; ++layer) forward_layer(state, conversation_position, residual, layer);
+        for (size_t layer = 0; layer < L; ++layer) residual.replace(forward_layer(state, conversation_position, residual.matrix(), layer));
         state.advance(input.tokens());
 
-        const auto last = final_norm_(residual.token(residual.tokens() - 1));
+        const auto last = final_norm_(residual.hidden(residual.tokens() - 1));
         // 4B ties its embedding to the head; 9B carries a separate one. The
         // config says which, so the choice costs nothing at run time.
         if constexpr (std::is_same_v<typename C::OutputWeight, std::monostate>)
@@ -303,11 +303,9 @@ public:
     }
 
 private:
-    void forward_layer(PrefixState& state, Position conversation_position, ResidualStream<D>& residual, size_t layer_index) const {
-        const MatrixView<D> X = residual.matrix();
+    Matrix<D> forward_layer(PrefixState& state, Position conversation_position, MatrixView<D> X, size_t layer_index) const {
         const size_t n = position_in_kind(layer_index);
-        Matrix<D> next = C::is_recurrent(layer_index) ? run_layer(recurrent_.at(n), X, state, layer_index, conversation_position) : run_layer(attention_.at(n), X, state, layer_index, conversation_position);
-        residual.set_matrix(std::move(next));
+        return C::is_recurrent(layer_index) ? run_layer(recurrent_.at(n), X, state, layer_index, conversation_position) : run_layer(attention_.at(n), X, state, layer_index, conversation_position);
     }
 
     // One layer, whole. This is the payoff for calling attention a token mixer:

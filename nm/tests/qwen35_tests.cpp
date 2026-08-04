@@ -228,7 +228,7 @@ int main() {
 
         PrefixCache<Qwen35Model<ToyQwen>> scratch(model);
         EmbeddedSequence<ToyQwen::D> one_shot;
-        one_shot.append(model.tokens(input), input);
+        one_shot.append(model.embed(input), input);
         const Logits<ToyQwen::V> whole = scratch.evaluate(one_shot);
 
         // Incremental decode must equal one-shot prefill. This is the property
@@ -240,7 +240,7 @@ int main() {
         EmbeddedSequence<ToyQwen::D> growing;
         for (size_t n = 0; n < input.size(); ++n) {
             const std::span<const TokenId> next(input.data() + n, 1);
-            growing.append(model.tokens(next), next);
+            growing.append(model.embed(next), next);
             stepwise = incremental.evaluate(growing);
         }
 

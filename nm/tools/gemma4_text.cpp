@@ -21,7 +21,7 @@ static int run(Model model, const Tokenizer& tokenizer, const std::vector<int32_
     // One sequence, appended to as tokens are produced: the prefix cache keys
     // on its identity, so growing it in place is what makes decode incremental.
     EmbeddedSequence<Model::D> sequence;
-    sequence.append(model.tokens(tokens), tokens);
+    sequence.append(model.embed(tokens), tokens);
     PrefixCache<Model> memo(model);
     const auto start = std::chrono::steady_clock::now();
     auto logits = memo.evaluate(sequence);
@@ -47,7 +47,7 @@ static int run(Model model, const Tokenizer& tokenizer, const std::vector<int32_
             text += tokenizer.decode1(int32_t(token));
             if (tokenizer.is_eog(int32_t(token)) || i + 1 == generate_count) break;
             const std::span<const TokenId> next(&token, 1);
-            sequence.append(model.tokens(next), next);
+            sequence.append(model.embed(next), next);
             logits = memo.evaluate(sequence);
         }
         const double decode_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_start).count();

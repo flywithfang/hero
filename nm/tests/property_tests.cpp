@@ -87,7 +87,7 @@ public:
     ToyModel& operator=(const ToyModel&) = delete;
     ToyModel(ToyModel&&) = default;
 
-    Matrix<D> tokens(std::span<const TokenId> ids) const {
+    Matrix<D> embed(std::span<const TokenId> ids) const {
         Matrix<D> X;
         X.reserve(ids.size());
         for (const TokenId id : ids) {
@@ -104,14 +104,14 @@ public:
         Matrix<D> running;
         running.reserve(residual.tokens());
         for (size_t row = 0; row < residual.tokens(); ++row) {
-            sum += residual.token(row);
+            sum += residual.hidden(row);
             running.append(sum);
         }
-        residual.set_matrix(std::move(running));
+        residual.replace(std::move(running));
         prefix_state.prefix_sum = std::move(sum);
         prefix_state.advance(input.tokens());
 
-        const VecView<D> last = residual.token(residual.tokens() - 1);
+        const VecView<D> last = residual.hidden(residual.tokens() - 1);
         Logits<V> logits;
         logits[0] = last[0];
         logits[1] = last[1];
@@ -129,7 +129,7 @@ static_assert(TransformerModel<ToyModel>);
 template <class Model>
 static EmbeddedSequence<Model::D> sequence_of(const Model& model, std::span<const TokenId> ids) {
     EmbeddedSequence<Model::D> sequence;
-    sequence.append(model.tokens(ids), ids);
+    sequence.append(model.embed(ids), ids);
     return sequence;
 }
 
@@ -250,7 +250,7 @@ int main() {
             PrefixCache<ToyModel> empty(model);
             return empty.evaluate(input);
         };
-        const auto grow = [&](EmbeddedSequence<2>& sequence, TokenId id) { sequence.append(model.tokens(std::span<const TokenId>(&id, 1)), std::span<const TokenId>(&id, 1)); };
+        const auto grow = [&](EmbeddedSequence<2>& sequence, TokenId id) { sequence.append(model.embed(std::span<const TokenId>(&id, 1)), std::span<const TokenId>(&id, 1)); };
 
         const std::vector<TokenId> X2{TokenId{1}, TokenId{2}};
         EmbeddedSequence<2> X = sequence_of(model, X2);

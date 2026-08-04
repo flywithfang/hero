@@ -205,7 +205,6 @@ class FullAttentionCache {
 
 public:
     size_t size() const { return keys_.rows(); }
-    Position oldest_position() const { return oldest_position_; }
     Position position(size_t chronological_row) const {
         require_row(chronological_row);
         return oldest_position_ + chronological_row;
@@ -262,7 +261,6 @@ public:
 
     size_t size() const { return size_; }
     size_t window() const { return window_; }
-    Position oldest_position() const { return oldest_position_; }
     Position position(size_t chronological_row) const {
         require_row(chronological_row);
         return oldest_position_ + chronological_row;

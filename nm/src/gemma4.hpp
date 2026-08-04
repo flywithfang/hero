@@ -78,9 +78,15 @@ enum class GemmaKVKind : uint8_t { Owned, Unified, Shared };
 
 inline Scalar gemma_softcap(Scalar value, Scalar cap) { return cap * std::tanh(value / cap); }
 
+// Value in, value out. `values` is a by-value sink: the caller's prvalue
+// materializes straight into it, the cap is applied in place, and the result
+// moves out — one allocation, no copy, and no caller left holding something
+// half-capped. A free function that wrote through a mutable view would cost the
+// same and say nothing at the call site about what it had changed.
 template <size_t N>
-void gemma_softcap(MutVecView<N> values, Scalar cap) {
+Vec<N> gemma_softcap(Vec<N> values, Scalar cap) {
     for (size_t i = 0; i < N; ++i) values[i] = gemma_softcap(values[i], cap);
+    return values;
 }
 
 // The per-layer part of E4B's PLE residual. Model-level token/context PLE
@@ -299,19 +305,19 @@ struct GemmaE4BSharedLayer {
 
         Matrix<Hq * Dh> A = Matrix<Hq * Dh>::zero_rows(Q.rows());
         par_for(Q.rows() * Hq, [&](size_t task) {
-            const size_t row = task / Hq, head = task % Hq;
-            const VecView<Dh> query = slice<Dh>(Q.row(row), head);
+            const size_t token_pos = task / Hq, head = task % Hq;
+            const VecView<Dh> query = slice<Dh>(Q.row(token_pos), head);
             const KVHead group{head / (Hq / Hkv)};
-            const VisibleRows rows = visible[row];
+            const VisibleRows visible_tokens = visible[token_pos];
 
             std::vector<Scalar> alpha;
-            alpha.reserve(rows.count());
-            for (size_t j = rows.first; j < rows.end; ++j) alpha.push_back(dot(query, cache.key(j, group)));
+            alpha.reserve(visible_tokens.count());
+            for (size_t j = visible_tokens.first; j < visible_tokens.end; ++j) alpha.push_back(dot(query, cache.key(j, group)));
             alpha = Softmax{}(std::move(alpha));
 
             Vec<Dh> head_output;
-            for (size_t n = 0; n < alpha.size(); ++n) head_output.scaled_add(cache.value(rows.first + n, group), alpha[n]);
-            A.template replace_partition<Dh>(row, head, head_output);
+            for (size_t n = 0; n < alpha.size(); ++n) head_output.scaled_add(cache.value(visible_tokens.first + n, group), alpha[n]);
+            A.template replace_partition<Dh>(token_pos, head, head_output);
         });
         return WO(A.view());
     }
@@ -406,7 +412,7 @@ public:
     Gemma4E4BModel& operator=(Gemma4E4BModel&&) = delete;  // immutable once built
 
     // Input embeddings, for callers that assemble multimodal sequences.
-    Matrix<D> tokens(std::span<const TokenId> ids) const {
+    Matrix<D> embed(std::span<const TokenId> ids) const {
         Matrix<D> rows = embedding_.gather_rows(ids);
         rows.scale(std::sqrt(Scalar(D)));  // Gemma scales embeddings on the way in
         return rows;
@@ -429,22 +435,25 @@ public:
         // window plus this prefill batch until those deferred readers finish;
         // then restore the ordinary fixed-size ring.
         state.local(22).begin_batch_retention(input.tokens());
-        for (size_t layer = 0; layer < L; ++layer) forward_layer(state, conversation_position, residual, per_layer, layer);
+        for (size_t layer = 0; layer < L; ++layer) residual.replace(forward_layer(state, conversation_position, residual.matrix(), per_layer, layer));
         state.local(22).end_batch_retention();
         state.advance(input.tokens());
 
-        const auto last = final_norm_(residual.token(residual.tokens() - 1));
-        Logits<V> logits(embedding_.matvec(last));  // tied head
-        gemma_softcap<V>(logits.mutable_view(), C::LOGIT_SOFTCAP);
-        return logits;
+        const auto last = final_norm_(residual.hidden(residual.tokens() - 1));
+        // Capped before it is wrapped: no Logits ever exists un-softcapped.
+        return Logits<V>(gemma_softcap(embedding_.matvec(last), C::LOGIT_SOFTCAP));  // tied head
     }
 
 private:
-    // Run layer `layer_index` in place: `residual` is the only in/out, and
-    // `conversation_position` is where its rows sit in the CONVERSATION — RoPE angles
-    // and the sliding window are absolute coordinates, not offsets into this
-    // batch. A layer needs nothing else of the original input: the rows arrive
-    // through `residual`, and the ids were spent once, above, on `per_layer`.
+    // Run layer `layer_index`: rows in, the next stream out. The K/V caches in
+    // `state` are the only thing it mutates — the residual is a value being
+    // transformed, the caches are a structure being appended to, and the caller
+    // puts the result back through replace(), which is what holds a layer to
+    // its row count. `conversation_position` is where these rows sit in the
+    // CONVERSATION — RoPE angles and the sliding window are absolute
+    // coordinates, not offsets into this batch. A layer needs nothing else of
+    // the original input: the rows arrive as `X`, and the ids were spent once,
+    // above, on `per_layer`.
     //
     // The equation is the selected layer type's forward() method; the schedule is
     // two plain booleans, and each branch names exactly which vector, which
@@ -452,23 +461,19 @@ private:
     // K/V: they attend against what layer 22 (local) or 23 (full) wrote earlier
     // in this same pass, which is why local()/full() redirect rather than those
     // layers holding caches.
-    void forward_layer(PrefixState& state, Position conversation_position, ResidualStream<D>& residual, const Matrix<C::PLE * C::L>& per_layer, size_t layer_index) const {
+    Matrix<D> forward_layer(PrefixState& state, Position conversation_position, MatrixView<D> X, const Matrix<C::PLE * C::L>& per_layer, size_t layer_index) const {
         const Matrix<C::PLE> ple = slice_columns<C::PLE>(per_layer.view(), layer_index);
-        const MatrixView<D> X = residual.matrix();
         const size_t n = C::position_in_group(layer_index);
         const bool full = C::attention_type(layer_index) == GemmaAttentionType::Full;
         const bool shared = C::uses_shared_kv(layer_index);
 
-        Matrix<D> next = [&]() -> Matrix<D> {
-            if (!shared && !full)
-                return local_.at(n).forward(X, state.local(layer_index), LocalRope{}, conversation_position, ple.view());
-            if (!shared)
-                return full_.at(n).forward(X, state.full(layer_index), FullRope{}, conversation_position, ple.view());
-            if (!full)
-                return local_shared_.at(n).forward(X, state.local(layer_index), LocalRope{}, conversation_position, ple.view());
-            return full_shared_.at(n).forward(X, state.full(layer_index), FullRope{}, conversation_position, ple.view());
-        }();
-        residual.set_matrix(std::move(next));
+        if (!shared && !full)
+            return local_.at(n).forward(X, state.local(layer_index), LocalRope{}, conversation_position, ple.view());
+        if (!shared)
+            return full_.at(n).forward(X, state.full(layer_index), FullRope{}, conversation_position, ple.view());
+        if (!full)
+            return local_shared_.at(n).forward(X, state.local(layer_index), LocalRope{}, conversation_position, ple.view());
+        return full_shared_.at(n).forward(X, state.full(layer_index), FullRope{}, conversation_position, ple.view());
     }
 
     // Tied: the same table is the input embedding and the LM head. Gemma
@@ -777,7 +782,7 @@ public:
     Gemma4_12BModel(Gemma4_12BModel&&) = default;
     Gemma4_12BModel& operator=(Gemma4_12BModel&&) = delete;
 
-    Matrix<D> tokens(std::span<const TokenId> ids) const {
+    Matrix<D> embed(std::span<const TokenId> ids) const {
         Matrix<D> rows = embedding_.gather_rows(ids);
         rows.scale(std::sqrt(Scalar(D)));  // Gemma scales embeddings on the way in
         return rows;
@@ -789,24 +794,20 @@ public:
 
         ResidualStream<D> residual(input);
         const Position conversation_position = input.conversation_position();
-        for (size_t layer = 0; layer < L; ++layer) forward_layer(state, conversation_position, residual, layer);
+        for (size_t layer = 0; layer < L; ++layer) residual.replace(forward_layer(state, conversation_position, residual.matrix(), layer));
         state.advance(input.tokens());
 
-        const auto last = final_norm_(residual.token(residual.tokens() - 1));
-        Logits<V> logits(embedding_.matvec(last));  // tied head
-        gemma_softcap<V>(logits.mutable_view(), C::LOGIT_SOFTCAP);
-        return logits;
+        const auto last = final_norm_(residual.hidden(residual.tokens() - 1));
+        // Capped before it is wrapped: no Logits ever exists un-softcapped.
+        return Logits<V>(gemma_softcap(embedding_.matvec(last), C::LOGIT_SOFTCAP));  // tied head
     }
 
 private:
     // Each concrete 12B layer owns its equation. Unlike E4B's methods these
     // methods have no per-layer-input argument and perform no PLE residual.
-    void forward_layer(PrefixState& state, Position conversation_position, ResidualStream<D>& residual, size_t layer_index) const {
-        const MatrixView<D> X = residual.matrix();
+    Matrix<D> forward_layer(PrefixState& state, Position conversation_position, MatrixView<D> X, size_t layer_index) const {
         const size_t n = C::position_in_group(layer_index);
-
-        Matrix<D> next = C::attention_type(layer_index) == GemmaAttentionType::Local ? local_.at(n).forward(X, state.local(layer_index), LocalRope{}, conversation_position) : full_.at(n).forward(X, state.full(layer_index), FullRope{}, conversation_position);
-        residual.set_matrix(std::move(next));
+        return C::attention_type(layer_index) == GemmaAttentionType::Local ? local_.at(n).forward(X, state.local(layer_index), LocalRope{}, conversation_position) : full_.at(n).forward(X, state.full(layer_index), FullRope{}, conversation_position);
     }
 
     // Tied, and scaled by sqrt(D) on the way in, exactly as in E4B.

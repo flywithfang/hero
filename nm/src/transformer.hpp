@@ -31,8 +31,14 @@ public:
 
     size_t tokens() const { return values_.rows(); }
     MatrixView<D> matrix() const { return values_.view(); }
-    VecView<D> token(size_t i) const { return values_.row(i); }
-    void set_matrix(Matrix<D> values) {
+    // The hidden state of token `i`. Not `token(i)`: with TokenId a strong type,
+    // that name reads as if it hands back an id rather than a D-wide vector.
+    VecView<D> hidden(size_t i) const { return values_.row(i); }
+    // A layer's output replaces the stream's values and nothing else — the row
+    // count is the stream's identity, so changing it is the one error possible
+    // here. Deliberately not operator=: the implicit move-assign would enter
+    // with the same syntax and skip this check.
+    void replace(Matrix<D> values) {
         if (values.rows() != values_.rows()) throw std::invalid_argument("ResidualStream: matrix row mismatch");
         values_ = std::move(values);
     }
@@ -45,7 +51,7 @@ private:
 // immutable and non-copyable. It owes the outside world exactly two things —
 // turn token ids into decoder-width rows, and run rows to logits:
 //
-//     tokens(ids)           -> Matrix<D>
+//     embed(ids)            -> Matrix<D>
 //     forward(state, rows)  -> Logits<V>
 //
 // Note what it does NOT owe: a way to build a whole EmbeddedSequence. Assembling
@@ -66,7 +72,7 @@ concept TransformerModel = requires(const M& model, typename M::PrefixState& pre
     requires !std::is_copy_constructible_v<M>;  // weights are immutable and never copied
     typename M::PrefixState;
     { prefix_state.tokens() } -> std::convertible_to<size_t>;
-    { model.tokens(ids) } -> std::same_as<Matrix<M::D>>;
+    { model.embed(ids) } -> std::same_as<Matrix<M::D>>;
     { model.forward(prefix_state, input) } -> std::same_as<Logits<M::V>>;
     { M::CTX } -> std::convertible_to<size_t>;
 };

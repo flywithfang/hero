@@ -77,7 +77,7 @@ public:
         // encoders can say how many rows an image is worth.
         const ChatTurnText rendered = Protocol::render(user, first_, system_, image != nullptr, budget.thinks());
         const std::vector<TokenId> before = to_tokens(tokenizer_.encode(rendered.before_image, first_, true));
-        Matrix<D> before_rows = model_.tokens(before);
+        Matrix<D> before_rows = model_.embed(before);
 
         ChatTurnResult result;
         Matrix<D> image_rows;
@@ -91,7 +91,7 @@ public:
         Matrix<D> after_rows;
         if (!rendered.after_image.empty()) {
             after = to_tokens(tokenizer_.encode(rendered.after_image, false, true));
-            after_rows = model_.tokens(after);
+            after_rows = model_.embed(after);
         }
 
         const size_t new_tokens = before_rows.rows() + image_rows.rows() + after_rows.rows();
@@ -185,7 +185,7 @@ private:
     Logits<V> extend(TokenId id, ChatStats& delta) {
         if (!complete_input_) throw std::logic_error("chat has no complete input");
         const std::span<const TokenId> one(&id, 1);
-        complete_input_->append(model_.tokens(one), one);
+        complete_input_->append(model_.embed(one), one);
         const auto start = std::chrono::steady_clock::now();
         Logits<V> logits = prefix_memo_.evaluate(*complete_input_);
         delta.decode_seconds += seconds_since(start);

@@ -44,9 +44,9 @@ int main(int argc, char** argv) {
         const size_t image_tokens = image_rows.rows();
 
         EmbeddedSequence<Gemma4E4BTextConfig::D> sequence;
-        sequence.append(model.tokens(prefix_tokens), prefix_tokens);
+        sequence.append(model.embed(prefix_tokens), prefix_tokens);
         sequence.append_soft_tokens(std::move(image_rows));
-        sequence.append(model.tokens(suffix_tokens), suffix_tokens);
+        sequence.append(model.embed(suffix_tokens), suffix_tokens);
 
         PrefixCache<Gemma4E4BModel> memo(model);
         const auto text_start = std::chrono::steady_clock::now();
@@ -63,7 +63,7 @@ int main(int argc, char** argv) {
             answer += tokenizer.decode1(int32_t(token));
             if (tokenizer.is_eog(int32_t(token))) break;
             const TokenId next{token};
-            sequence.append(model.tokens(std::span<const TokenId>(&next, 1)), std::span<const TokenId>(&next, 1));
+            sequence.append(model.embed(std::span<const TokenId>(&next, 1)), std::span<const TokenId>(&next, 1));
             logits = memo.evaluate(sequence);
         }
         std::printf("\nanswer: %s\n", answer.c_str());

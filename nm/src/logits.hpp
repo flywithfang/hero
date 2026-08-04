@@ -54,7 +54,6 @@ public:
     Scalar operator[](size_t v) const { return values_[v]; }
     Scalar& operator[](size_t v) { return values_[v]; }
     VecView<V> view() const { return VecView<V>(values_); }
-    MutVecView<V> mutable_view() { return MutVecView<V>(values_); }
     Logits copy() const { return Logits(view().copy()); }
 
     // The greedy token. Ties resolve to the lowest id, which is what makes

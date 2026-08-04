@@ -7,7 +7,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     try {
-        GGUF gguf(argv[1]);
+        const GGUF gguf(argv[1]);
         auto model = gemma4_vision_loader::load_e4b_vision(gguf);
         (void)model;
         std::printf("Gemma 4 E4B immutable vision assembly loaded (16 layers)\n");

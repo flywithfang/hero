@@ -16,7 +16,7 @@ template <class Model>
 static int run(Model model, const Tokenizer& tokenizer, const std::vector<int32_t>& ids, size_t generate_count) {
     std::vector<TokenId> tokens;
     tokens.reserve(ids.size());
-    for (int32_t id : ids) tokens.push_back(TokenId{id});
+    for (const int32_t id : ids) tokens.push_back(TokenId{id});
 
     // One sequence, appended to as tokens are produced: the prefix cache keys
     // on its identity, so growing it in place is what makes decode incremental.
@@ -29,7 +29,7 @@ static int run(Model model, const Tokenizer& tokenizer, const std::vector<int32_
 
     const int32_t best = int32_t(logits.argmax());
     std::printf("prompt_tokens:");
-    for (int32_t id : ids) std::printf(" %d", id);
+    for (const int32_t id : ids) std::printf(" %d", id);
     std::printf("\nnext_token: %d\npiece: %s\nprefill: %.3fs (%zu tokens, %.1f tok/s)\n", best, tokenizer.decode1(best).c_str(), elapsed, ids.size(), double(ids.size()) / elapsed);
 
     const std::vector<ScoredToken> top = logits.top(5);
@@ -62,8 +62,8 @@ int main(int argc, char** argv) {
         return 2;
     }
     try {
-        GGUF gguf(argv[1]);
-        Tokenizer tokenizer(gguf);
+        const GGUF gguf(argv[1]);
+        const Tokenizer tokenizer(gguf);
         const auto ids = tokenizer.encode(argv[2], /*add_bos=*/true, /*parse_special=*/true);
         const size_t generate_count = argc == 4 ? std::strtoull(argv[3], nullptr, 10) : 1;
 

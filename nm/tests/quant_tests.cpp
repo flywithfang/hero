@@ -94,7 +94,7 @@ int main() {
             auto w = rand_block_and_dequant(GT::Q8_0, blk);
             std::vector<Scalar> x(32);
             for (auto& v : x) v = frand(-2, 2);
-            Scalar k = dot_block_q8_0(blk, x.data());
+            const Scalar k = dot_block_q8_0(blk, x.data());
             Scalar r = 0;
             for (int i = 0; i < 32; ++i) r += w[i] * x[i];
             check(rel(k, r) < 1e-5f, "Q8_0 kernel == dequant-dot");
@@ -105,7 +105,7 @@ int main() {
             auto w = rand_block_and_dequant(GT::Q4_0, blk);
             std::vector<Scalar> x(32);
             for (auto& v : x) v = frand(-2, 2);
-            Scalar k = dot_block_q4_0(blk, x.data());
+            const Scalar k = dot_block_q4_0(blk, x.data());
             Scalar r = 0;
             for (int i = 0; i < 32; ++i) r += w[i] * x[i];
             check(rel(k, r) < 1e-5f, "Q4_0 kernel == dequant-dot");
@@ -116,7 +116,7 @@ int main() {
             auto w = rand_block_and_dequant(GT::Q4_K, blk);
             std::vector<Scalar> x(256);
             for (auto& v : x) v = frand(-2, 2);
-            Scalar k = dot_block_q4_K(blk, x.data());
+            const Scalar k = dot_block_q4_K(blk, x.data());
             Scalar r = 0;
             for (int i = 0; i < 256; ++i) r += w[i] * x[i];
             check(rel(k, r) < 1e-4f, "Q4_K kernel == dequant-dot");
@@ -128,7 +128,7 @@ int main() {
             auto w = rand_block_and_dequant(GT::Q5_K, blk);
             std::vector<Scalar> x(256);
             for (auto& v : x) v = frand(-2, 2);
-            Scalar k = dot_block_q5_K(blk, x.data());
+            const Scalar k = dot_block_q5_K(blk, x.data());
             Scalar r = 0;
             for (int i = 0; i < 256; ++i) r += w[i] * x[i];
             check(rel(k, r) < 1e-4f, "Q5_K kernel == dequant-dot");
@@ -154,7 +154,7 @@ int main() {
             auto w = rand_block_and_dequant(GT::Q6_K, blk);
             std::vector<Scalar> x(256);
             for (auto& v : x) v = frand(-2, 2);
-            Scalar k = dot_block_q6_K(blk, x.data());
+            const Scalar k = dot_block_q6_K(blk, x.data());
             Scalar r = 0;
             for (int i = 0; i < 256; ++i) r += w[i] * x[i];
             check(rel(k, r) < 1e-4f, "Q6_K kernel == dequant-dot");
@@ -213,7 +213,7 @@ int main() {
     std::printf("== fp16 round-trip ==\n");
     {
         float mx = 0;
-        for (float v : {0.0f, 1.0f, -1.0f, 0.5f, 3.14159f, 65504.0f, 1e-4f, -2.5f}) mx = std::max(mx, std::fabs(v - fp16_to_fp32(fp32_to_fp16(v))) / (std::fabs(v) + 1e-6f));
+        for (const float v : {0.0f, 1.0f, -1.0f, 0.5f, 3.14159f, 65504.0f, 1e-4f, -2.5f}) mx = std::max(mx, std::fabs(v - fp16_to_fp32(fp32_to_fp16(v))) / (std::fabs(v) + 1e-6f));
         check(mx < 1e-2f, "fp16 relative round-trip < 1%");
     }
 

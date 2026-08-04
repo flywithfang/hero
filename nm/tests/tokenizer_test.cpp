@@ -13,16 +13,16 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: %s vocab.gguf [--roundtrip]\n", argv[0]);
         return 2;
     }
-    bool roundtrip = argc > 2 && std::string(argv[2]) == "--roundtrip";
+    const bool roundtrip = argc > 2 && std::string(argv[2]) == "--roundtrip";
     try {
-        GGUF g(argv[1]);
-        Tokenizer tok(g);
+        const GGUF g(argv[1]);
+        const Tokenizer tok(g);
         std::string line;
         int bad = 0, total = 0;
         while (std::getline(std::cin, line)) {
             auto ids = tok.encode(line, /*add_bos=*/false, /*parse_special=*/true);
             if (roundtrip) {
-                std::string back = tok.decode(ids);
+                const std::string back = tok.decode(ids);
                 ++total;
                 if (back != line) {
                     ++bad;

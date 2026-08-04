@@ -12,7 +12,7 @@ namespace {
 std::vector<TokenId> to_tokens(const std::vector<int32_t>& ids) {
     std::vector<TokenId> tokens;
     tokens.reserve(ids.size());
-    for (int32_t id : ids) tokens.push_back(TokenId{id});
+    for (const int32_t id : ids) tokens.push_back(TokenId{id});
     return tokens;
 }
 
@@ -24,12 +24,12 @@ int main(int argc, char** argv) {
         return 2;
     }
     try {
-        GGUF text_gguf(argv[1]);
-        GGUF vision_gguf(argv[2]);
-        Tokenizer tokenizer(text_gguf);
+        const GGUF text_gguf(argv[1]);
+        const GGUF vision_gguf(argv[2]);
+        const Tokenizer tokenizer(text_gguf);
         auto model = gemma4_loader::load_e4b_text(text_gguf);
         auto vision_model = gemma4_vision_loader::load_e4b_vision(vision_gguf);
-        RGBImage image = load_rgb_image(argv[3]);
+        const RGBImage image = load_rgb_image(argv[3]);
 
         const auto vision_start = std::chrono::steady_clock::now();
         Matrix<Gemma4E4BTextConfig::D> image_rows = vision_model.encode(image);

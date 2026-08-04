@@ -133,7 +133,7 @@ int main() {
     {
         // Two channels, width 3, taps [1, 10, 100] on both channels: the
         // output at token t is x[t-2] + 10*x[t-1] + 100*x[t].
-        Matrix<3> taps{{1.f, 10.f, 100.f}, {1.f, 10.f, 100.f}};
+        const Matrix<3> taps{{1.f, 10.f, 100.f}, {1.f, 10.f, 100.f}};
         CausalConv1dState<2, 3> conv;
         Vec<2> x1, x2, x3;
         x1[0] = 1.f;
@@ -199,8 +199,8 @@ int main() {
     std::printf("== gated attention splits its query projection ==\n");
     {
         // Two heads of width 2, packed [q0 | g0 | q1 | g1].
-        Matrix<8> packed{{0.f, 1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 7.f}};
-        HeadPair<2, 2> split = split_head_pairs<2, 2>(packed.view());
+        const Matrix<8> packed{{0.f, 1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 7.f}};
+        const HeadPair<2, 2> split = split_head_pairs<2, 2>(packed.view());
         check(split.first.row(0)[0] == 0.f && split.first.row(0)[1] == 1.f && split.first.row(0)[2] == 4.f && split.first.row(0)[3] == 5.f, "queries are the first half of each head pair");
         check(split.second.row(0)[0] == 2.f && split.second.row(0)[1] == 3.f && split.second.row(0)[2] == 6.f && split.second.row(0)[3] == 7.f, "gates are the second half of each head pair");
     }

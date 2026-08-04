@@ -3,7 +3,7 @@
 // A decoder's output is not an anonymous Vec<V>. It is one score per vocabulary
 // entry, and every operation meaningful on it — argmax, repetition penalty,
 // temperature, top-k/top-p, log-softmax — is meaningful ONLY on that axis.
-// Giving the axis a type collects that math in one place, the way KVCache owns
+// Giving the axis a type collects that math in one place, the way attention caches own
 // its row layout. This is a COHESION argument, not a safety one: V is unique
 // among the engine's widths, so the dimension already stops a Vec<D> from
 // arriving here.

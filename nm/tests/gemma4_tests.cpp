@@ -31,11 +31,11 @@ static Linear<N, N> identity_linear() {
 // instantiated small: their D/Hq/Hkv come from the E4B and 12B configs, not from
 // template parameters. Keeping the equation in the layers is a deliberate
 // choice; this copy is the price, and the two must be kept in step by hand.
-template <size_t Hq, size_t Hkv, size_t Dh>
-static Matrix<Hq * Dh> toy_attend(const KVCache<Hkv, Dh>& cache, MatrixView<Hq * Dh> Q, Position at, CausalWindow window) {
+template <size_t Hq, size_t Hkv, size_t Dh, class Cache>
+static Matrix<Hq * Dh> toy_attend(const Cache& cache, MatrixView<Hq * Dh> Q, Position at) {
     std::vector<VisibleRows> visible;
     visible.reserve(Q.rows());
-    for (size_t row = 0; row < Q.rows(); ++row) visible.push_back(cache.visible_rows(at + row, window));
+    for (size_t row = 0; row < Q.rows(); ++row) visible.push_back(cache.visible_rows(at + row));
 
     Matrix<Hq * Dh> A = Matrix<Hq * Dh>::zero_rows(Q.rows());
     par_for(Q.rows() * Hq, [&](size_t task) {
@@ -47,7 +47,7 @@ static Matrix<Hq * Dh> toy_attend(const KVCache<Hkv, Dh>& cache, MatrixView<Hq *
         std::vector<Scalar> alpha;
         alpha.reserve(rows.count());
         for (size_t j = rows.first; j < rows.end; ++j) alpha.push_back(dot(query, cache.key(j, group)));
-        Softmax::apply(alpha);
+        alpha = Softmax{}(std::move(alpha));
 
         Vec<Dh> head_output;
         for (size_t n = 0; n < alpha.size(); ++n) head_output.scaled_add(cache.value(rows.first + n, group), alpha[n]);
@@ -57,7 +57,7 @@ static Matrix<Hq * Dh> toy_attend(const KVCache<Hkv, Dh>& cache, MatrixView<Hq *
 }
 
 // A toy-sized statement of the unified K/V equation used by the concrete 12B
-// global layer: one projection, with different K and V normalization paths.
+// full-attention layer: one projection with different K and V normalization paths.
 struct ToyUnifiedLayer {
     static constexpr size_t D = 2, Hq = 1, Hkv = 1, Dh = 2;
     Linear<2, 2> WQ;
@@ -68,19 +68,15 @@ struct ToyUnifiedLayer {
     Linear<2, 2> WO;
 
     template <class Rope>
-    Matrix<D> attention(MatrixView<D> X, KVCache<Hkv, Dh>& cache, const Rope& rope, Position conversation_position, size_t window) const {
-        Matrix<Hq * Dh> Q = WQ(X);
-        q_norm.apply(Q);
-        rotate_heads<Hq, Dh>(Q, rope, conversation_position);
+    Matrix<D> attention(MatrixView<D> X, FullAttentionCache<Hkv, Dh>& cache, const Rope& rope, Position conversation_position) const {
+        const auto Q = rope(q_norm(WQ(X)), conversation_position);
 
         Matrix<Hkv * Dh> V = WK(X);
-        Matrix<Hkv * Dh> K = V;  // same projection, rotated as K and left unrotated as V
-        k_norm.apply(K);
-        rotate_heads<Hkv, Dh>(K, rope, conversation_position);
-        v_norm.apply(V);
+        const auto K = rope(k_norm(V), conversation_position);
+        V = v_norm(std::move(V));
 
         for (size_t row = 0; row < Q.rows(); ++row) cache.append(conversation_position + row, K.row(row), V.row(row));
-        Matrix<Hq * Dh> A = toy_attend<Hq, Hkv, Dh>(cache, Q.view(), conversation_position, CausalWindow{window});
+        const auto A = toy_attend<Hq, Hkv, Dh>(cache, Q.view(), conversation_position);
         return WO(A.view());
     }
 };
@@ -94,12 +90,12 @@ static RMSNorm<N> unit_norm(Scalar eps = 1e-6f) {
 
 int main() {
     std::printf("== Gemma E4B layer schedule ==\n");
-    check(Gemma4E4BTextConfig::attention_kind(0) == GemmaAttentionKind::Sliding && Gemma4E4BTextConfig::attention_kind(5) == GemmaAttentionKind::Full && Gemma4E4BTextConfig::attention_kind(41) == GemmaAttentionKind::Full, "five sliding layers followed by one full layer");
-    check(Gemma4E4BTextConfig::stores_shared_kv(22) && Gemma4E4BTextConfig::stores_shared_kv(23) && Gemma4E4BTextConfig::shares_kv(24), "last local/full producers feed the final 18 KV-sharing layers");
+    check(Gemma4E4BTextConfig::attention_type(0) == GemmaAttentionType::Local && Gemma4E4BTextConfig::attention_type(5) == GemmaAttentionType::Full && Gemma4E4BTextConfig::attention_type(41) == GemmaAttentionType::Full, "five local layers followed by one full layer");
+    check(Gemma4E4BTextConfig::is_shared_kv_source(22) && Gemma4E4BTextConfig::is_shared_kv_source(23) && Gemma4E4BTextConfig::uses_shared_kv(24), "last local/full producers feed the final 18 KV-sharing layers");
 
     std::printf("== Gemma normalization ==\n");
     {
-        RMSNormNoScale<4> norm(1e-6f);
+        const RMSNormNoScale<4> norm(1e-6f);
         Vec<4> a, b;
         for (size_t i = 0; i < 4; ++i) {
             a[i] = Scalar(i + 1);
@@ -113,19 +109,19 @@ int main() {
 
     std::printf("== partial RoPE ==\n");
     {
-        RotaryEmbedding<8, 10000, 1, 2> rope;
+        const RotaryEmbedding<8, 10000, 1, 2> rope;
         static_assert(decltype(rope)::rotary_planes() == 2);
         Vec<8> value;
         for (size_t i = 0; i < 8; ++i) value[i] = Scalar(i + 1);
         Vec<8> original = VecView<8>(value).copy();
-        rope.apply(slice_mut<8>(value, 0), Position{7});
+        rope(slice_mut<8>(value, 0), Position{7});
         check(value[2] == original[2] && value[3] == original[3] && value[6] == original[6] && value[7] == original[7], "non-RoPE planes are exactly unchanged");
         check(value[0] != original[0] && value[4] != original[4], "the configured rotary prefix rotates");
     }
 
     std::printf("== heterogeneous K/V cache and Gemma attention ==\n");
     {
-        KVCache<1, 2> full;
+        FullAttentionCache<1, 2> full;
         Vec<2> k0, v0, k1, v1;
         k0[0] = 1;
         k0[1] = 0;
@@ -144,13 +140,17 @@ int main() {
         q[3] = 0;
         Matrix<4> queries;
         queries.append(q);
-        Matrix<4> global = toy_attend<2, 1, 2>(full, queries.view(), Position{1}, CausalWindow::full());
+        const auto full_result = toy_attend<2, 1, 2>(full, queries.view(), Position{1});
         const Scalar p0 = std::exp(1.f) / (std::exp(1.f) + 1.f);
-        check(std::fabs(global.row(0)[0] - (p0 * 10 + (1 - p0) * 30)) < 1e-5f && global.row(0)[0] == global.row(0)[2], "GQA heads share KV and attention uses scale 1.0");
-        Matrix<4> local = toy_attend<2, 1, 2>(full, queries.view(), Position{1}, CausalWindow{1});
-        check(local.row(0)[0] == 30 && local.row(0)[1] == 40, "sliding attention excludes positions outside its window");
+        check(std::fabs(full_result.row(0)[0] - (p0 * 10 + (1 - p0) * 30)) < 1e-5f && full_result.row(0)[0] == full_result.row(0)[2], "GQA heads share KV and attention uses scale 1.0");
 
-        KVCache<1, 2> ring(2);
+        LocalAttentionCache<1, 2> local(1);
+        local.append(Position{0}, k0, v0);
+        local.append(Position{1}, k1, v1);
+        const auto local_result = toy_attend<2, 1, 2>(local, queries.view(), Position{1});
+        check(local_result.row(0)[0] == 30 && local_result.row(0)[1] == 40, "local attention excludes positions outside its window");
+
+        LocalAttentionCache<1, 2> ring(2);
         Vec<2> k2, v2;
         k2[0] = 2;
         k2[1] = 2;
@@ -159,15 +159,25 @@ int main() {
         ring.append(Position{0}, k0, v0);
         ring.append(Position{1}, k1, v1);
         ring.append(Position{2}, k2, v2);
-        check(ring.size() == 2 && ring.position(0) == Position{1} && ring.position(1) == Position{2}, "bounded cache is an ordered sliding ring");
+        check(ring.size() == 2 && ring.position(0) == Position{1} && ring.position(1) == Position{2}, "local cache rows remain chronologically ordered across ring wrap-around");
+
+        // Deferred shared-layer readers need the union of the old window and
+        // the current prefill rows. Retention is temporary: ending the batch
+        // restores the same fixed-window invariant.
+        ring.begin_batch_retention(2);
+        ring.append(Position{3}, k0, v0);
+        ring.append(Position{4}, k1, v1);
+        check(ring.size() == 4 && ring.position(0) == Position{1} && ring.position(3) == Position{4}, "a shared-KV prefill batch temporarily preserves all rows its queries need");
+        ring.end_batch_retention();
+        check(ring.size() == 2 && ring.position(0) == Position{3} && ring.position(1) == Position{4}, "ending shared-KV prefill restores the local window");
     }
 
     std::printf("== E4B cache topology ==\n");
     {
         Gemma4E4BCache cache;
-        check(cache.local(0).capacity() == Gemma4E4BTextConfig::SLIDING_WINDOW, "ordinary local layers own bounded caches");
-        check(cache.local(22).capacity() == 0 && &cache.local(24) == &cache.local(22), "shared local layers reuse the full-retention layer-22 cache");
-        check(cache.global(23).capacity() == 0 && &cache.global(29) == &cache.global(23), "shared global layers reuse the layer-23 cache");
+        check(cache.local(0).window() == Gemma4E4BTextConfig::LOCAL_WINDOW, "ordinary local layers own fixed-window caches");
+        check(cache.local(22).window() == Gemma4E4BTextConfig::LOCAL_WINDOW && &cache.local(24) == &cache.local(22), "shared local layers reuse layer 22's local cache");
+        check(&cache.full(29) == &cache.full(23), "shared full-attention layers reuse layer 23's append-only cache");
     }
 
     std::printf("== logit cap ==\n");
@@ -180,7 +190,7 @@ int main() {
         // component with numbers of its own is the PLE residual. Zero PLE
         // projections make the branch contribute nothing, so `h + branch` is
         // `h`, and the layer scale that follows in run_layer() is then exact.
-        GemmaPerLayerResidual<2, 1> ple(zero_linear<2, 1>(), zero_linear<1, 2>(), unit_norm<2>());
+        const GemmaPerLayerResidual<2, 1> ple(zero_linear<2, 1>(), zero_linear<1, 2>(), unit_norm<2>());
         auto x = [] {
             Vec<2> value;
             value[0] = 3;
@@ -202,18 +212,18 @@ int main() {
         check(batch_output.row(0)[0] == 6 && batch_output.row(0)[1] == -8, "the matrix PLE residual states the same equation as the scalar one");
 
         // A shared-KV layer carries no K/V tensors — the members do not exist.
-        check(sizeof(GemmaE4BSharedLayer<256>) < sizeof(GemmaE4BLayer<256>), "a shared-KV layer is physically smaller than an owning one");
+        check(sizeof(Gemma4E4BModel::LocalSharedLayer) < sizeof(Gemma4E4BModel::LocalLayer), "a shared-KV layer is physically smaller than an owning one");
     }
 
     std::printf("== Gemma 4 12B anatomy ==\n");
     {
         using C = Gemma4_12BTextConfig;
-        size_t sliding = 0, global = 0;
-        for (size_t l = 0; l < C::L; ++l) (C::attention_kind(l) == GemmaAttentionKind::Full ? global : sliding)++;
-        check(sliding == 40 && global == 8, "12B is 40 sliding + 8 global layers");
-        check(C::attention_kind(C::L - 1) == GemmaAttentionKind::Full, "the final layer is global, as the model card requires");
-        check(C::kv_heads(0) == 8 && C::kv_heads(5) == 1, "KV head count differs per attention kind (8 sliding, 1 global)");
-        check(C::kv_kind(0) == GemmaKVKind::Owned && C::kv_kind(5) == GemmaKVKind::Unified, "global layers use unified K/V, sliding layers own both");
+        size_t local = 0, full = 0;
+        for (size_t layer = 0; layer < C::L; ++layer) (C::attention_type(layer) == GemmaAttentionType::Full ? full : local)++;
+        check(local == 40 && full == 8, "12B is 40 local + 8 full-attention layers");
+        check(C::attention_type(C::L - 1) == GemmaAttentionType::Full, "the final layer uses full attention");
+        check(C::kv_heads(0) == 8 && C::kv_heads(5) == 1, "KV head count differs per attention type (8 local, 1 full)");
+        check(C::kv_kind(0) == GemmaKVKind::Owned && C::kv_kind(5) == GemmaKVKind::Unified, "full-attention layers use unified K/V; local layers own both");
         const double params = double(gemma_dense_param_count<C>());
         check(params > 11.7e9 && params < 12.1e9, "parameter count lands on the advertised ~11.95B");
 
@@ -226,8 +236,8 @@ int main() {
         check(h[0] == 3.f && h[1] == -4.f, "the layer output scale is applied last");
 
         Gemma4_12BCache cache;
-        check(cache.local(0).capacity() == C::SLIDING_WINDOW, "sliding layers own a bounded ring, so their cost stops growing");
-        check(cache.global(5).capacity() == 0, "global layers retain everything");
+        check(cache.local(0).window() == C::LOCAL_WINDOW, "local layers own a fixed-window ring");
+        check(cache.full(5).size() == 0, "full-attention layers own append-only history");
     }
 
     std::printf("== unified K/V takes one projection two ways ==\n");
@@ -242,7 +252,7 @@ int main() {
         Vec<2> gamma;
         gamma[0] = 3.f;
         gamma[1] = 3.f;
-        ToyUnifiedLayer layer{identity_linear<2>(), PerHeadNorm<RMSNorm<2>>(unit_norm<2>()), Linear<2, 2>(Weight<2, 2>(std::move(w))), PerHeadNorm<RMSNorm<2>>(RMSNorm<2>(std::move(gamma), 1e-6f)), PerHeadNorm<RMSNormNoScale<2>>(RMSNormNoScale<2>(1e-6f)), identity_linear<2>()};
+        const ToyUnifiedLayer layer{identity_linear<2>(), PerHeadNorm<RMSNorm<2>>(unit_norm<2>()), Linear<2, 2>(Weight<2, 2>(std::move(w))), PerHeadNorm<RMSNorm<2>>(RMSNorm<2>(std::move(gamma), 1e-6f)), PerHeadNorm<RMSNormNoScale<2>>(RMSNormNoScale<2>(1e-6f)), identity_linear<2>()};
 
         Vec<2> token;
         token[0] = 3.f;
@@ -253,14 +263,13 @@ int main() {
         // One token, one visible key: the softmax weight is 1 regardless of K,
         // and WO is identity, so attention() returns V itself — which for
         // unified K/V must be the raw W_k output under the scale-free norm.
-        KVCache<1, 2> cache;
-        Matrix<2> out = layer.attention(x.view(), cache, RotaryEmbedding<2, 10000>{}, Position{0}, /*window=*/0);
+        FullAttentionCache<1, 2> cache;
+        const auto out = layer.attention(x.view(), cache, RotaryEmbedding<2, 10000>{}, Position{0});
 
         // rms([3,4]) = sqrt(12.5); normalized = [0.8485, 1.1314]
         const Scalar inv = 1.f / std::sqrt(12.5f);
         check(std::fabs(out.row(0)[0] - 3.f * inv) < 1e-5f && std::fabs(out.row(0)[1] - 4.f * inv) < 1e-5f, "the value is the raw projection with the scale-free norm");
-        Matrix<2> K = layer.WK(x.view());
-        layer.k_norm.apply(K);
+        const auto K = layer.k_norm(layer.WK(x.view()));
         check(std::fabs(K.row(0)[0] - 3.f * 3.f * inv) < 1e-5f, "the key is the same projection with the learned scale");
         check(cache.size() == 1, "the unified K/V row was cached like any owned one");
     }

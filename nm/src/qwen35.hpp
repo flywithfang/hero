@@ -206,7 +206,7 @@ using QwenRecurrentMixer = QwenGatedDeltaNet<C::D, C::KEY_HEAD_DIM, C::VALUE_HEA
 template <class C>
 class Qwen35State {
 public:
-    using AttentionEntry = KVCache<C::Hkv, C::HEAD_DIM>;
+    using AttentionEntry = FullAttentionCache<C::Hkv, C::HEAD_DIM>;
     struct RecurrentEntry {
         CausalConv1dState<QwenRecurrentMixer<C>::CONV_CHANNELS, C::CONV_WIDTH> conv;
         DeltaNetState<C::VALUE_HEADS, C::KEY_HEAD_DIM, C::VALUE_HEAD_DIM> delta;
@@ -293,7 +293,7 @@ public:
         for (size_t layer = 0; layer < L; ++layer) forward_layer(state, conversation_position, residual, layer);
         state.advance(input.tokens());
 
-        Vec<D> last = final_norm_(residual.token(residual.tokens() - 1));
+        const auto last = final_norm_(residual.token(residual.tokens() - 1));
         // 4B ties its embedding to the head; 9B carries a separate one. The
         // config says which, so the choice costs nothing at run time.
         if constexpr (std::is_same_v<typename C::OutputWeight, std::monostate>)
@@ -318,13 +318,13 @@ private:
     template <class Layer>
     static Matrix<D> run_layer(const Layer& layer, MatrixView<D> X, PrefixState& state, size_t layer_index, Position conversation_position) {
         // h = x + mix( norm(x) )
-        Matrix<D> U = layer.mixer_norm(X);
-        Matrix<D> M = mix_tokens(layer.mixer, U.view(), state, layer_index, conversation_position);
-        Matrix<D> H = X + M;
+        const auto U = layer.mixer_norm(X);
+        const auto M = mix_tokens(layer.mixer, U.view(), state, layer_index, conversation_position);
+        const auto H = X + M;
 
         // out = h + mlp( norm(h) )
-        Matrix<D> Z = layer.channel_norm(H.view());
-        Matrix<D> F = layer.channel(Z.view());
+        const auto Z = layer.channel_norm(H.view());
+        const auto F = layer.channel(Z.view());
         return H + F;
     }
 
@@ -349,25 +349,20 @@ private:
         // One projection emits Q and G interleaved per head, so the split is
         // pure layout; .first is the query, .second the raw gate.
         HeadPair<C::Hq, Dh> query_gate = split_head_pairs<C::Hq, Dh>(attention.WQG(X).view());
-        Matrix<QW> Q = std::move(query_gate.first);
-        attention.q_norm.apply(Q);
-        rotate_heads<C::Hq, Dh>(Q, Rope{}, conversation_position);
-
-        Matrix<C::Hkv * Dh> K = attention.WK(X);
-        attention.k_norm.apply(K);
-        rotate_heads<C::Hkv, Dh>(K, Rope{}, conversation_position);
-        Matrix<C::Hkv * Dh> V = attention.WV(X);
+        const auto Q = Rope{}(attention.q_norm(std::move(query_gate.first)), conversation_position);
+        const auto K = Rope{}(attention.k_norm(attention.WK(X)), conversation_position);
+        const auto V = attention.WV(X);
 
         // Qwen's reduction. Same shape as Gemma's, one difference that matters:
         // Qwen keeps an explicit 1/sqrt(Dh) score scale, where Gemma folds it
         // into the learned Q norm and passes nothing. That single constant is
         // why these are two equations rather than one with a parameter.
-        KVCache<C::Hkv, Dh>& cache = state.attention(layer);
+        FullAttentionCache<C::Hkv, Dh>& cache = state.attention(layer);
         const Scalar score_scale = 1.f / std::sqrt(Scalar(Dh));
         const auto reduce = [&](MatrixView<QW> queries, Position at) {
             std::vector<VisibleRows> visible;
             visible.reserve(queries.rows());
-            for (size_t row = 0; row < queries.rows(); ++row) visible.push_back(cache.visible_rows(at + row, CausalWindow::full()));
+            for (size_t row = 0; row < queries.rows(); ++row) visible.push_back(cache.visible_rows(at + row));
 
             Matrix<QW> attended = Matrix<QW>::zero_rows(queries.rows());
             par_for(queries.rows() * C::Hq, [&](size_t task) {
@@ -379,7 +374,7 @@ private:
                 std::vector<Scalar> alpha;
                 alpha.reserve(rows.count());
                 for (size_t j = rows.first; j < rows.end; ++j) alpha.push_back(score_scale * dot(query, cache.key(j, group)));
-                Softmax::apply(alpha);
+                alpha = Softmax{}(std::move(alpha));
 
                 Vec<Dh> head_output;
                 for (size_t n = 0; n < alpha.size(); ++n) head_output.scaled_add(cache.value(rows.first + n, group), alpha[n]);
@@ -434,15 +429,14 @@ private:
         const Scalar query_scale = 1.f / std::sqrt(Scalar(Dk));
 
         auto& entry = state.recurrent(layer);
-        Matrix<Mixer::CONV_CHANNELS> qkv = mixer.WQKV(X);
-        Matrix<Hv> beta = write_strength(mixer, X);
-        Matrix<Hv> gate = decay_gate(mixer, X);
+        const auto qkv = mixer.WQKV(X);
+        const auto beta = write_strength(mixer, X);
+        const auto gate = decay_gate(mixer, X);
         Matrix<Mixer::VALUE_WIDTH> mixed;
         mixed.reserve(X.rows());
 
         for (size_t t = 0; t < X.rows(); ++t) {
-            Vec<Mixer::CONV_CHANNELS> stream = entry.conv.step(qkv.row(t), mixer.conv);
-            Silu::apply(stream);
+            const auto stream = Silu{}(entry.conv.step(qkv.row(t), mixer.conv));
 
             // q and k are shared by every value head in a key head's group, so
             // normalize them once per token rather than once per value head.
@@ -456,17 +450,16 @@ private:
             Vec<Mixer::VALUE_WIDTH> row;
             for (size_t h = 0; h < Hv; ++h) {
                 const size_t hk = Mixer::key_head_of(h);
-                Vec<Dv> attended = gated_delta_step<Dk, Dv>(entry.delta.head(h), VecView<Dk>(query[hk]), VecView<Dk>(key[hk]), slice<Dv, 2 * Mixer::KEY_WIDTH>(VecView<Mixer::CONV_CHANNELS>(stream), h), gate.row(t)[h], beta.row(t)[h]);
-                MutVecView<Dv> partition = slice_mut<Dv>(row, h);
+                const auto attended = gated_delta_step<Dk, Dv>(entry.delta.head(h), VecView<Dk>(query[hk]), VecView<Dk>(key[hk]), slice<Dv, 2 * Mixer::KEY_WIDTH>(VecView<Mixer::CONV_CHANNELS>(stream), h), gate.row(t)[h], beta.row(t)[h]);
+                const MutVecView<Dv> partition = slice_mut<Dv>(row, h);
                 for (size_t i = 0; i < Dv; ++i) partition[i] = attended[i];
             }
             mixed.append(row);
         }
 
         // Gated output norm: rmsnorm per head, then the SiLU'd z gate.
-        mixer.head_norm.apply(mixed);
-        Matrix<Mixer::VALUE_WIDTH> z = mixer.WZ(X);
-        Silu::apply(z);
+        mixed = mixer.head_norm(std::move(mixed));
+        const auto z = Silu{}(mixer.WZ(X));
         return mixer.WO(hadamard(mixed.view(), z.view()).view());
     }
 };

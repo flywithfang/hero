@@ -11,13 +11,13 @@ static void check_case(const Tokenizer& tokenizer, const char* text, std::initia
     if (!ids_match) {
         ++failures;
         std::printf("    got:");
-        for (int32_t id : actual) std::printf(" %d", id);
+        for (const int32_t id : actual) std::printf(" %d", id);
         std::printf("\n    want:");
-        for (int32_t id : want) std::printf(" %d", id);
+        for (const int32_t id : want) std::printf(" %d", id);
         std::printf("\n");
         return;
     }
-    std::vector<int32_t> without_bos(actual.begin() + 1, actual.end());
+    const std::vector<int32_t> without_bos(actual.begin() + 1, actual.end());
     if (expect_roundtrip && tokenizer.decode(without_bos) != text) {
         ++failures;
         std::printf("    round-trip failed\n");
@@ -30,8 +30,8 @@ int main(int argc, char** argv) {
         return 2;
     }
     try {
-        GGUF gguf(argv[1]);
-        Tokenizer tokenizer(gguf);
+        const GGUF gguf(argv[1]);
+        const Tokenizer tokenizer(gguf);
         check_case(tokenizer, "Hello world", {2, 9259, 1902});
         check_case(tokenizer, "caf\xC3\xA9 \xE4\xB8\xAD\xE6\x96\x87 \xF0\x9F\x91\x8B", {2, 123125, 236859, 17346, 237364, 155818});
         check_case(tokenizer, "  spaced   text", {2, 138, 169862, 139, 1005});

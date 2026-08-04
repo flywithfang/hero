@@ -69,9 +69,9 @@ static void print_value(const GGUFValue& v) {
         return;
     }
     if (v.type == GGUFType::ARRAY) {
-        size_t n = v.elem_type == GGUFType::STRING ? v.arr_str.size() : v.arr_num.size();
+        const size_t n = v.elem_type == GGUFType::STRING ? v.arr_str.size() : v.arr_num.size();
         std::printf("[%s x %zu] ", gguftype_name(v.elem_type), n);
-        size_t show = std::min<size_t>(n, 6);
+        const size_t show = std::min<size_t>(n, 6);
         std::printf("{");
         for (size_t i = 0; i < show; ++i) {
             if (i) std::printf(", ");
@@ -94,14 +94,14 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: %s model.gguf [--tensors|--meta|--values NAME [N]]\n", argv[0]);
         return 2;
     }
-    std::string mode = argc > 2 ? argv[2] : "";
+    const std::string mode = argc > 2 ? argv[2] : "";
     if (mode == "--values") {
         if (argc < 4) {
             std::fprintf(stderr, "--values needs a tensor name\n");
             return 2;
         }
         try {
-            GGUF g(argv[1]);
+            const GGUF g(argv[1]);
             const TensorInfo& t = g.require(argv[3]);
             const size_t want = argc > 4 ? std::stoul(argv[4]) : 16;
             const size_t n = std::min(want, size_t(t.nelem()));
@@ -116,7 +116,7 @@ int main(int argc, char** argv) {
         }
     }
     try {
-        GGUF g(argv[1]);
+        const GGUF g(argv[1]);
         std::printf("GGUF version %u   alignment %llu   %zu tensors   %zu metadata keys\n", g.version(), (unsigned long long)g.alignment(), g.tensors().size(), g.meta().size());
 
         if (mode != "--tensors") {

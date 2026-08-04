@@ -327,7 +327,7 @@ int main(int argc, char** argv) {
     }
 
     try {
-        GGUF gguf(options.model);
+        const GGUF gguf(options.model);
         const ChatModelIdentity identity = chat_model_identity(gguf);
         std::fprintf(stderr, "loading %s D=%zu L=%zu (%zu tensors, %zu threads)...\n", identity.architecture.c_str(), identity.embedding_length, identity.block_count, gguf.tensors().size(), nm_num_threads());
         return load_and_chat(gguf, options);

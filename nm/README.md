@@ -11,7 +11,7 @@ on the same Q4_K_M file:
 | model | anatomy | greedy parity |
 |---|---|---|
 | Gemma 4 E4B | 42 layers, PLE, shared KV on the last 18 | exact |
-| Gemma 4 12B Unified | 48 layers, 40 sliding + 8 global **unified K/V**, no PLE | exact |
+| Gemma 4 12B Unified | 48 layers, 40 local + 8 full-attention layers with **unified K/V**, no PLE | exact |
 | Qwen 3.5 4B | **hybrid**: 24 gated-DeltaNet + 8 gated attention | exact |
 | Qwen 3.5 9B | same shape, wider, untied embeddings | exact |
 
@@ -74,7 +74,7 @@ PPM P6/P3. `/reset`, `/stats`, `/help`, and `/quit` work for every adapter.
 | 0 quant | `src/quant.hpp`, `src/quant_i8.hpp` | GGUF block formats, dequant, `Weight<In,Out>` matvec/matmul, int8-activation kernels |
 | 1 algebra | `src/core.hpp` | matrix arithmetic, norms, activations, head transforms, dense attention, `par_for`/`par_map` |
 | 2 components | `src/components.hpp` | `Linear/ClippedLinear/RMSNorm/RMSNormNoScale/GatedMLP/GeluGatedMLP/MoE` (config-free) |
-| 2 token mixing | `src/attention.hpp` | `KVCache`, the visibility mask, GQA `attend`, `RotaryEmbedding`, `PerHeadNorm`, gated-attention head split — **model-neutral** |
+| 2 token mixing | `src/attention.hpp` | `LocalAttentionCache`/`FullAttentionCache`, visibility masks, GQA reduction, `RotaryEmbedding`, `PerHeadNorm`, gated-attention head split — **model-neutral** |
 | 2 token mixing | `src/recurrent.hpp` | `CausalConv1dState`, `DeltaNetState`, the gated delta rule — **model-neutral** |
 | 3 transformer | `src/transformer.hpp` | shared residual stream, the two-operation model contract, `evaluate` + explicit `PrefixCache` (caching only — no pipeline) |
 | 3 models | `src/gemma4.hpp`, `src/qwen35.hpp` | `Gemma4E4BModel`/`Gemma4_12BModel`/`Qwen35Model` — dimensions, flat layer structs, cache/state, and each model's own `forward()` |
@@ -103,16 +103,17 @@ out_h          =  sum_k alpha_k · v_k                        gather-and-reduce
 
 Three things that look like separate architectures are parameters here:
 
-- **causal vs sliding-window** — window width `W`, with `W == 0` meaning global.
+- **local vs full visibility** — local attention has a positive window width;
+  full attention retains and sees the complete causal history.
 - **score scale** — `1/sqrt(HeadDim)` conventionally, or `1.0` for a family
   that folded the constant into a learned per-head Q norm (Gemma 4).
 - **full vs partial rotation** — `RotaryEmbedding<HeadDim, Base, Num, Den>`
   rotates the first `Num/Den` of the frequency planes and passes the rest
-  through; Gemma's global heads rotate a quarter of a 512-wide head.
+  through; Gemma's full-attention heads rotate a quarter of a 512-wide head.
 
-`KVCache` is the same object whether a layer keeps everything or keeps a ring:
-logical row zero is always the oldest retained position, so a sliding layer and
-a global layer are read identically and only the storage cost differs.
+The cache types enforce the distinction: `FullAttentionCache` is append-only;
+`LocalAttentionCache` owns a fixed-window ring and never exposes ring slots.
+Both present retained rows chronologically, with row zero as the oldest.
 
 `src/recurrent.hpp` is the *other* answer to "communication across tokens".
 A gated delta network carries a state matrix `S` forward instead of a cache:
@@ -239,7 +240,7 @@ the oracle by construction.
   scalar kernels **bit-exact** vs `ggml_vec_dot_*_generic`, NEON within 0–1 ulp
   of ggml's own NEON.
 - **Gemma 4 E4B text** — the official Q4_0 GGUF schema (42 heterogeneous
-  local/global layers, final-18 shared KV, PLE, partial RoPE, logit softcap)
+  local/full-attention layers, final-18 shared KV, PLE, partial RoPE, logit softcap)
   loads immutably; tokenizer ids and tested greedy generations match llama.cpp.
 - **Gemma 4 E4B vision** — the official Q8_0 mmproj schema loads immutably;
   dynamic aspect-preserving resize, patch projection, learned 2-D positions,
@@ -254,7 +255,7 @@ the oracle by construction.
   touched only types (a third KV kind, per-kind KV head counts, a tail
   parameter) and left E4B's numerics untouched.
 - **Gemma 4 12B** — the real checkpoint confirms every derived claim: per-layer
-  `head_count_kv` is `{8,8,8,8,8,1,...}`, global layers carry **no `attn_v`**
+  `head_count_kv` is `{8,8,8,8,8,1,...}`, full-attention layers carry **no `attn_v`**
   (unified K/V), and `rope_freqs` is `1.0` for planes 0–63 and `1e30` for
   64–255 — exactly `RotaryEmbedding<512, 1e6, 1, 4>`. The dump also caught a
   real omission: a per-layer `layer_output_scale` that a "no tail" layer would

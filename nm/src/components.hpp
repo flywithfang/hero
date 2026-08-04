@@ -72,33 +72,64 @@ private:
 // type is also what lets one GatedMLP serve both SwiGLU and Gemma's GELU gate.
 struct Gelu {  // gelu_pytorch_tanh
     template <size_t N>
-    static void apply(MutVecView<N> x) {
+    MutVecView<N> operator()(MutVecView<N> x) const {
         for (size_t i = 0; i < N; ++i) {
             const Scalar v = x[i];
             x[i] = 0.5f * v * (1.f + std::tanh(0.7978845608f * (v + 0.044715f * v * v * v)));
         }
+        return x;
     }
     template <size_t N>
-    static void apply(Vec<N>& x) { apply(MutVecView<N>(x)); }
+    Vec<N> operator()(VecView<N> x) const { return (*this)(x.copy()); }
+    template <size_t N>
+    Vec<N> operator()(const Vec<N>& x) const { return (*this)(VecView<N>(x)); }
+    template <size_t N>
+    Vec<N> operator()(Vec<N>&& x) const {
+        (*this)(MutVecView<N>(x));
+        return std::move(x);
+    }
     template <size_t C>
-    static void apply(Matrix<C>& x) { x.transform_rows([](MutVecView<C> row) { apply(row); }); }
+    Matrix<C> operator()(MatrixView<C> x) const { return (*this)(x.copy()); }
+    template <size_t C>
+    Matrix<C> operator()(const Matrix<C>& x) const { return (*this)(x.view()); }
+    template <size_t C>
+    Matrix<C> operator()(Matrix<C>&& x) const {
+        x.transform_rows([&](MutVecView<C> row) { (*this)(row); });
+        return std::move(x);
+    }
 };
 
 struct Silu {  // z * sigmoid(z)
     template <size_t N>
-    static void apply(MutVecView<N> x) {
+    MutVecView<N> operator()(MutVecView<N> x) const {
         for (size_t i = 0; i < N; ++i) x[i] = x[i] / (1.f + std::exp(-x[i]));  // not x*sigmoid(x): fp32 rounds them differently
+        return x;
     }
     template <size_t N>
-    static void apply(Vec<N>& x) { apply(MutVecView<N>(x)); }
+    Vec<N> operator()(VecView<N> x) const { return (*this)(x.copy()); }
+    template <size_t N>
+    Vec<N> operator()(const Vec<N>& x) const { return (*this)(VecView<N>(x)); }
+    template <size_t N>
+    Vec<N> operator()(Vec<N>&& x) const {
+        (*this)(MutVecView<N>(x));
+        return std::move(x);
+    }
     template <size_t C>
-    static void apply(Matrix<C>& x) { x.transform_rows([](MutVecView<C> row) { apply(row); }); }
+    Matrix<C> operator()(MatrixView<C> x) const { return (*this)(x.copy()); }
+    template <size_t C>
+    Matrix<C> operator()(const Matrix<C>& x) const { return (*this)(x.view()); }
+    template <size_t C>
+    Matrix<C> operator()(Matrix<C>&& x) const {
+        x.transform_rows([&](MutVecView<C> row) { (*this)(row); });
+        return std::move(x);
+    }
 };
 
 // Softmax is the one activation over a RUNTIME-length axis: attention scores
-// over however many keys are visible. Hence the span form.
+// over however many keys are visible. Its owning overload composes without
+// exposing an in-place phase to callers.
 struct Softmax {
-    static void apply(std::span<Scalar> values) {
+    std::span<Scalar> operator()(std::span<Scalar> values) const {
         const Scalar largest = *std::max_element(values.begin(), values.end());
         Scalar total = 0;
         for (Scalar& value : values) {
@@ -106,9 +137,26 @@ struct Softmax {
             total += value;
         }
         for (Scalar& value : values) value /= total;
+        return values;
+    }
+    std::vector<Scalar> operator()(const std::vector<Scalar>& values) const {
+        std::vector<Scalar> result = values;
+        return (*this)(std::move(result));
+    }
+    std::vector<Scalar> operator()(std::vector<Scalar>&& values) const {
+        (*this)(std::span<Scalar>(values));
+        return std::move(values);
     }
     template <size_t N>
-    static void apply(Vec<N>& x) { apply(std::span<Scalar>(x.begin(), N)); }
+    Vec<N> operator()(const Vec<N>& x) const {
+        Vec<N> result = VecView<N>(x).copy();
+        return (*this)(std::move(result));
+    }
+    template <size_t N>
+    Vec<N> operator()(Vec<N>&& x) const {
+        (*this)(std::span<Scalar>(x.begin(), N));
+        return std::move(x);
+    }
 };
 
 // ---- normalization ----------------------------------------------------------
@@ -123,23 +171,25 @@ public:
     explicit RMSNorm(Vec<N> gamma, Scalar eps = 1e-5f) : gamma_(std::move(gamma)), eps_(eps) {}
 
     // The reduction completes before any element is written, so `x` may be
-    // both the input and the output.
-    void apply(MutVecView<N> x) const {
-        const VecView<N> input = x;  // deduction cannot see the conversion; name it once
+    // both the input and the output. Owning rvalues are normalized and returned,
+    // making norm(projection(x)) a single move-only composition.
+    MutVecView<N> operator()(MutVecView<N> x) const {
+        const VecView<N> input = x;
         const Scalar inverse_rms = 1.f / std::sqrt(dot(input, input) / Scalar(N) + eps_);
         for (size_t channel = 0; channel < N; ++channel) x[channel] = gamma_[channel] * x[channel] * inverse_rms;
+        return x;
     }
-    void apply(Matrix<N>& x) const { x.transform_rows([&](MutVecView<N> row) { apply(row); }); }
-
-    Vec<N> operator()(VecView<N> x) const {
-        Vec<N> normalized = x.copy();
-        apply(MutVecView<N>(normalized));
-        return normalized;
+    Vec<N> operator()(VecView<N> x) const { return (*this)(x.copy()); }
+    Vec<N> operator()(const Vec<N>& x) const { return (*this)(VecView<N>(x)); }
+    Vec<N> operator()(Vec<N>&& x) const {
+        (*this)(MutVecView<N>(x));
+        return std::move(x);
     }
-    Matrix<N> operator()(MatrixView<N> x) const {
-        Matrix<N> normalized = x.copy();
-        apply(normalized);
-        return normalized;
+    Matrix<N> operator()(MatrixView<N> x) const { return (*this)(x.copy()); }
+    Matrix<N> operator()(const Matrix<N>& x) const { return (*this)(x.view()); }
+    Matrix<N> operator()(Matrix<N>&& x) const {
+        x.transform_rows([&](MutVecView<N> row) { (*this)(row); });
+        return std::move(x);
     }
 
 private:
@@ -157,32 +207,33 @@ public:
 
     explicit RMSNormNoScale(Scalar eps = 1e-6f) : eps_(eps) {}
 
-    void apply(MutVecView<N> x) const {
-        const VecView<N> input = x;  // deduction cannot see the conversion; name it once
+    MutVecView<N> operator()(MutVecView<N> x) const {
+        const VecView<N> input = x;
         const Scalar inverse_rms = 1.f / std::sqrt(dot(input, input) / Scalar(N) + eps_);
         for (size_t channel = 0; channel < N; ++channel) x[channel] *= inverse_rms;
+        return x;
     }
-    void apply(Matrix<N>& x) const { x.transform_rows([&](MutVecView<N> row) { apply(row); }); }
-
-    Vec<N> operator()(VecView<N> x) const {
-        Vec<N> normalized = x.copy();
-        apply(MutVecView<N>(normalized));
-        return normalized;
+    Vec<N> operator()(VecView<N> x) const { return (*this)(x.copy()); }
+    Vec<N> operator()(const Vec<N>& x) const { return (*this)(VecView<N>(x)); }
+    Vec<N> operator()(Vec<N>&& x) const {
+        (*this)(MutVecView<N>(x));
+        return std::move(x);
     }
-    Matrix<N> operator()(MatrixView<N> x) const {
-        Matrix<N> normalized = x.copy();
-        apply(normalized);
-        return normalized;
+    Matrix<N> operator()(MatrixView<N> x) const { return (*this)(x.copy()); }
+    Matrix<N> operator()(const Matrix<N>& x) const { return (*this)(x.view()); }
+    Matrix<N> operator()(Matrix<N>&& x) const {
+        x.transform_rows([&](MutVecView<N> row) { (*this)(row); });
+        return std::move(x);
     }
 
 private:
     Scalar eps_;
 };
 
-// What it takes to be normalized per partition: a fixed WIDTH, and the ability
-// to rewrite one WIDTH-wide vector in place.
+// What it takes to be normalized per partition: a fixed WIDTH, and a composable
+// call operation over one writable partition.
 template <class N>
-concept PartitionNorm = requires(const N& norm, MutVecView<N::WIDTH> partition) { norm.apply(partition); };
+concept PartitionNorm = requires(const N& norm, MutVecView<N::WIDTH> partition) { norm(partition); };
 
 // ---- the same narrow norm, applied to every head -----------------------------
 //
@@ -201,14 +252,29 @@ public:
     explicit PerHeadNorm(Norm norm) : norm_(std::move(norm)) {}
 
     template <size_t Total>
-    void apply(MutVecView<Total> value) const {
+    MutVecView<Total> operator()(MutVecView<Total> value) const {
         static_assert(Total % HEAD_DIM == 0, "PerHeadNorm: the tensor is not a whole number of heads");
-        for (size_t head = 0; head < Total / HEAD_DIM; ++head) norm_.apply(slice_mut<HEAD_DIM>(value, head));
+        for (size_t head = 0; head < Total / HEAD_DIM; ++head) norm_(slice_mut<HEAD_DIM>(value, head));
+        return value;
     }
     template <size_t Total>
-    void apply(Vec<Total>& value) const { apply(MutVecView<Total>(value)); }
+    Vec<Total> operator()(VecView<Total> value) const { return (*this)(value.copy()); }
     template <size_t Total>
-    void apply(Matrix<Total>& values) const { values.transform_rows([&](MutVecView<Total> value) { apply(value); }); }
+    Vec<Total> operator()(const Vec<Total>& value) const { return (*this)(VecView<Total>(value)); }
+    template <size_t Total>
+    Vec<Total> operator()(Vec<Total>&& value) const {
+        (*this)(MutVecView<Total>(value));
+        return std::move(value);
+    }
+    template <size_t Total>
+    Matrix<Total> operator()(MatrixView<Total> values) const { return (*this)(values.copy()); }
+    template <size_t Total>
+    Matrix<Total> operator()(const Matrix<Total>& values) const { return (*this)(values.view()); }
+    template <size_t Total>
+    Matrix<Total> operator()(Matrix<Total>&& values) const {
+        values.transform_rows([&](MutVecView<Total> value) { (*this)(value); });
+        return std::move(values);
+    }
 
 private:
     Norm norm_;
@@ -226,16 +292,14 @@ public:
     GatedMLP(Linear<D, FF> gate, Linear<D, FF> up, Linear<FF, D> down) : gate_(std::move(gate)), up_(std::move(up)), down_(std::move(down)) {}
 
     Vec<D> operator()(VecView<D> x) const {
-        Vec<FF> g = gate_(x);
-        Activation::apply(g);
-        Vec<FF> u = up_(x);
+        Vec<FF> g = Activation{}(gate_(x));
+        const auto u = up_(x);
         g *= u;
         return down_(g);
     }
     Matrix<D> operator()(MatrixView<D> x) const {
-        Matrix<FF> gate = gate_(x);
-        Activation::apply(gate);
-        Matrix<FF> up = up_(x);
+        const auto gate = Activation{}(gate_(x));
+        const auto up = up_(x);
         return down_(hadamard(gate.view(), up.view()));
     }
 
@@ -259,8 +323,7 @@ public:
     MoE(Linear<D, NE> router, std::array<Expert, NE> experts, std::array<Expert, SHARED> shared) : router_(std::move(router)), experts_(std::move(experts)), shared_(std::move(shared)) {}
 
     Vec<D> operator()(VecView<D> x) const {
-        Vec<NE> s = router_(x);
-        Softmax::apply(s);
+        const auto s = Softmax{}(router_(x));
         std::array<size_t, NE> idx;
         std::iota(idx.begin(), idx.end(), 0u);
         std::partial_sort(idx.begin(), idx.begin() + TOPK, idx.end(), [&](size_t a, size_t b) { return s[a] > s[b]; });
@@ -268,7 +331,7 @@ public:
         for (size_t k = 0; k < TOPK; ++k) norm += s[idx[k]];
         Vec<D> y;
         for (size_t k = 0; k < TOPK; ++k) {  // routed experts
-            Vec<D> ye = experts_[idx[k]](x);
+            const auto ye = experts_[idx[k]](x);
             y.scaled_add(VecView<D>(ye), s[idx[k]] / norm);
         }
         for (const auto& sh : shared_) y += sh(x);  // always-on path

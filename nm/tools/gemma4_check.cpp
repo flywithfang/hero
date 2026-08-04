@@ -10,7 +10,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     try {
-        GGUF gguf(argv[1]);
+        const GGUF gguf(argv[1]);
         std::string size = argc == 3 ? argv[2] : "";
         if (size.empty()) {
             const size_t blocks = size_t(gguf.get_int("gemma4.block_count", 0));
@@ -26,7 +26,7 @@ int main(int argc, char** argv) {
             auto model = gemma4_loader::load_12b_text(gguf);
             (void)model;
             std::printf(
-                "Gemma 4 12B assembly loaded (%zu layers: 40 sliding + 8 global"
+                "Gemma 4 12B assembly loaded (%zu layers: 40 local + 8 full"
                 " unified-K/V, no PLE, no shared KV)\n",
                 Gemma4_12BTextConfig::L);
             return 0;

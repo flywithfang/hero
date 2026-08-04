@@ -30,12 +30,12 @@ static int check(const GGUF& gguf, const char* name, const char* prompt, size_t 
         Qwen35State<C>::recurrent_floats_per_layer(), Qwen35State<C>::attention_floats_per_token_per_layer());
     if (!prompt) return 0;
 
-    Tokenizer tokenizer(gguf);
+    const Tokenizer tokenizer(gguf);
     const auto ids = tokenizer.encode(prompt, /*add_bos=*/false, /*parse_special=*/true);
     std::vector<TokenId> tokens;
-    for (int32_t id : ids) tokens.push_back(TokenId{id});
+    for (const int32_t id : ids) tokens.push_back(TokenId{id});
     std::printf("prompt_tokens:");
-    for (int32_t id : ids) std::printf(" %d", id);
+    for (const int32_t id : ids) std::printf(" %d", id);
     std::printf("\n");
 
     // One sequence, appended to as tokens are produced: the prefix cache keys
@@ -78,7 +78,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     try {
-        GGUF gguf(argv[1]);
+        const GGUF gguf(argv[1]);
         const char* prompt = argc > 3 ? argv[3] : nullptr;
         const size_t generate_count = argc > 4 ? std::strtoull(argv[4], nullptr, 10) : 1;
         return std::strcmp(argv[2], "4b") == 0 ? check<Qwen35_4BConfig>(gguf, "4B", prompt, generate_count) : check<Qwen35_9BConfig>(gguf, "9B", prompt, generate_count);

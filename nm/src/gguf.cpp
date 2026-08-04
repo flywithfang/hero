@@ -37,7 +37,7 @@ struct Cursor {
         return v;
     }
     std::string read_str() {
-        uint64_t n = read<uint64_t>();
+        const uint64_t n = read<uint64_t>();
         need(n);
         std::string s((const char*)p, (const char*)p + n);
         p += n;
@@ -88,7 +88,7 @@ GGUFValue read_value(Cursor& c) {
     }
     if (v.type == GGUFType::ARRAY) {
         v.elem_type = u32_to_gguftype(c.read<uint32_t>());
-        uint64_t n = c.read<uint64_t>();
+        const uint64_t n = c.read<uint64_t>();
         if (v.elem_type == GGUFType::STRING) {
             v.arr_str.reserve(n);
             for (uint64_t i = 0; i < n; ++i) v.arr_str.push_back(c.read_str());
@@ -152,8 +152,8 @@ GGUF::GGUF(const std::string& path) {
     }
 
     // keepalive: unmap + close when the last Weight view drops.
-    void* mp = map_;
-    int fd = fd_;
+    const void* mp = map_;
+    const int fd = fd_;
     holder_ = std::shared_ptr<const void>(map_, [mp, fd](const void*) {
         ::UnmapViewOfFile(mp);
         ::_close(fd);
@@ -184,16 +184,16 @@ GGUF::GGUF(const std::string& path) {
 #endif
 
     Cursor c{(const uint8_t*)map_, (const uint8_t*)map_ + size_};
-    uint32_t magic = c.read<uint32_t>();
+    const uint32_t magic = c.read<uint32_t>();
     if (magic != 0x46554747u)  // 'G''G''U''F' little-endian
         throw std::runtime_error("GGUF: bad magic (not a GGUF file)");
     version_ = c.read<uint32_t>();
     if (version_ != 3) throw std::runtime_error("GGUF: unsupported version " + std::to_string(version_) + " (expect 3)");
-    uint64_t tensor_count = c.read<uint64_t>();
-    uint64_t kv_count = c.read<uint64_t>();
+    const uint64_t tensor_count = c.read<uint64_t>();
+    const uint64_t kv_count = c.read<uint64_t>();
 
     for (uint64_t i = 0; i < kv_count; ++i) {
-        std::string key = c.read_str();
+        const std::string key = c.read_str();
         meta_[key] = read_value(c);
     }
     alignment_ = has("general.alignment") ? uint64_t(get("general.alignment").as_int()) : 32;
@@ -204,7 +204,7 @@ GGUF::GGUF(const std::string& path) {
     for (uint64_t i = 0; i < tensor_count; ++i) {
         TensorInfo t;
         t.name = c.read_str();
-        uint32_t nd = c.read<uint32_t>();
+        const uint32_t nd = c.read<uint32_t>();
         t.dims.resize(nd);
         for (uint32_t d = 0; d < nd; ++d) t.dims[d] = c.read<uint64_t>();
         t.type = u32_to_gt(c.read<uint32_t>());
@@ -213,10 +213,10 @@ GGUF::GGUF(const std::string& path) {
     }
 
     // data section starts at the aligned end of the header (trap T8).
-    uint64_t header_end = uint64_t(c.p - (const uint8_t*)map_);
+    const uint64_t header_end = uint64_t(c.p - (const uint8_t*)map_);
     const uint64_t padding = alignment_ - 1;
     if (header_end > std::numeric_limits<uint64_t>::max() - padding) throw std::runtime_error("GGUF: aligned header offset overflows");
-    uint64_t data_start = (header_end + padding) & ~padding;
+    const uint64_t data_start = (header_end + padding) & ~padding;
     if (!tensors_.empty() && data_start > size_) throw std::runtime_error("GGUF: data section starts past end of file");
 
     for (auto& t : tensors_) {

@@ -52,20 +52,33 @@ private:
     std::shared_ptr<const void> keepalive_;
 };
 
-template <size_t HeadDim, size_t Base>
+template <size_t Heads, size_t HeadDim, size_t Base>
 class VisionRope2D {
     static_assert(HeadDim % 4 == 0);
     static constexpr size_t AxisDim = HeadDim / 2;
     static constexpr size_t Planes = AxisDim / 2;
 
 public:
-    void apply(MutVecView<HeadDim> value, size_t x, size_t y) const {
-        apply_axis(value.begin(), x);
-        apply_axis(value.begin() + AxisDim, y);
+    MutVecView<HeadDim> operator()(MutVecView<HeadDim> value, size_t x, size_t y) const {
+        rotate_axis(value.begin(), x);
+        rotate_axis(value.begin() + AxisDim, y);
+        return value;
+    }
+
+    Matrix<Heads * HeadDim> operator()(const Matrix<Heads * HeadDim>& values, size_t patches_x, size_t patches_y) const { return (*this)(values.view().copy(), patches_x, patches_y); }
+
+    Matrix<Heads * HeadDim> operator()(Matrix<Heads * HeadDim>&& values, size_t patches_x, size_t patches_y) const {
+        if (values.rows() != patches_x * patches_y) throw std::invalid_argument("VisionRope2D: patch grid mismatch");
+        values.transform_rows([&](size_t token, MutVecView<Heads * HeadDim> row) {
+            const size_t x = token % patches_x;
+            const size_t y = token / patches_x;
+            for (size_t head = 0; head < Heads; ++head) (*this)(slice_mut<HeadDim>(row, head), x, y);
+        });
+        return std::move(values);
     }
 
 private:
-    static void apply_axis(Scalar* value, size_t position) {
+    static void rotate_axis(Scalar* value, size_t position) {
         for (size_t i = 0; i < Planes; ++i) {
             const Scalar frequency = Scalar(std::pow(double(Base), -double(2 * i) / double(AxisDim)));
             const Scalar angle = Scalar(position) * frequency;
@@ -76,19 +89,6 @@ private:
         }
     }
 };
-
-template <size_t Heads, size_t HeadDim, size_t Base>
-void apply_vision_rope_2d(Matrix<Heads * HeadDim>& queries, Matrix<Heads * HeadDim>& keys, size_t patches_x, size_t patches_y) {
-    if (queries.rows() != patches_x * patches_y || keys.rows() != queries.rows()) throw std::invalid_argument("apply_vision_rope_2d: patch grid mismatch");
-    const VisionRope2D<HeadDim, Base> rope;
-    const auto rotate = [&](size_t token, MutVecView<Heads * HeadDim> row) {
-        const size_t x = token % patches_x;
-        const size_t y = token / patches_x;
-        for (size_t head = 0; head < Heads; ++head) rope.apply(slice_mut<HeadDim>(row, head), x, y);
-    };
-    queries.transform_rows(rotate);
-    keys.transform_rows(rotate);
-}
 
 template <size_t Patch>
 Matrix<Patch * Patch * 3> patchify_rgb(std::span<const uint8_t> pixels, size_t width, size_t height) {
@@ -159,25 +159,20 @@ struct GemmaVisionLayer {
     //  out = h + post_norm( (gelu(h W_gate) (*) h W_up) W_down )   sees every patch)
     Matrix<D> operator()(MatrixView<D> input, size_t patches_x, size_t patches_y) const {
         if (input.rows() != patches_x * patches_y) throw std::invalid_argument("GemmaVisionLayer: patch grid mismatch");
-        Matrix<D> U = input_norm(input);
-        Matrix<D> Q = WQ(U.view());
-        q_norm.apply(Q);
-        Matrix<D> K = WK(U.view());
-        k_norm.apply(K);
-        Matrix<D> V = WV(U.view());
-        v_norm.apply(V);
+        const auto U = input_norm(input);
+        const VisionRope2D<H, HeadDim, 100> rope;
+        const auto Q = rope(q_norm(WQ(U.view())), patches_x, patches_y);
+        const auto K = rope(k_norm(WK(U.view())), patches_x, patches_y);
+        const auto V = v_norm(WV(U.view()));
+        const auto A = scaled_dot_product_attention<H, HeadDim, HeadDim>(Q.view(), K.view(), V.view(), 1.f);
 
-        apply_vision_rope_2d<H, HeadDim, 100>(Q, K, patches_x, patches_y);
-        Matrix<D> A = scaled_dot_product_attention<H, HeadDim, HeadDim>(Q.view(), K.view(), V.view(), 1.f);
+        const auto attention_branch = attention_post_norm(WO(A.view()));
+        const auto residual = input + attention_branch;
 
-        Matrix<D> attention_branch = attention_post_norm(WO(A.view()));
-        Matrix<D> residual = input + attention_branch;
-
-        Matrix<D> ffn_input = ffn_norm(residual.view());
-        Matrix<FF> gate = W_gate(ffn_input.view());
-        Gelu::apply(gate);
-        Matrix<FF> up = W_up(ffn_input.view());
-        Matrix<D> ffn = ffn_post_norm(W_down(hadamard(gate.view(), up.view()).view()));
+        const auto ffn_input = ffn_norm(residual.view());
+        const auto gate = Gelu{}(W_gate(ffn_input.view()));
+        const auto up = W_up(ffn_input.view());
+        const auto ffn = ffn_post_norm(W_down(hadamard(gate.view(), up.view()).view()));
         return residual + ffn;
     }
 };
@@ -197,9 +192,9 @@ public:
         const Prepared prepared = prepare(image);
         const size_t px = prepared.width / C::PATCH;
         const size_t py = prepared.height / C::PATCH;
-        Matrix<C::PATCH * C::PATCH * 3> patches = patchify_rgb<C::PATCH>(prepared.pixels, prepared.width, prepared.height);
-        Matrix<C::D> patch_tokens = patch_embedding_.matmul(patches.view());
-        Matrix<C::D> positions = positions_.grid(px, py);
+        const auto patches = patchify_rgb<C::PATCH>(prepared.pixels, prepared.width, prepared.height);
+        const auto patch_tokens = patch_embedding_.matmul(patches.view());
+        const auto positions = positions_.grid(px, py);
         Matrix<C::D> hidden = patch_tokens + positions;
         for (const Layer& layer : layers_) hidden = layer(hidden.view(), px, py);
 
@@ -207,8 +202,8 @@ public:
         if (out_x == 0 || out_y == 0) throw std::invalid_argument("Gemma4E4BVisionEncoder: image produces no pooled tokens");
         Matrix<C::D> pooled = average_pool_2d<C::POOL>(hidden.view(), px, py);
         pooled.scale(std::sqrt(Scalar(C::D)));
-        RMSNormNoScale<C::D> pre_projection(C::EPS);
-        Matrix<C::D> normalized = pre_projection(pooled.view());
+        const RMSNormNoScale<C::D> pre_projection(C::EPS);
+        const auto normalized = pre_projection(pooled.view());
         return projection_(normalized.view());
     }
 

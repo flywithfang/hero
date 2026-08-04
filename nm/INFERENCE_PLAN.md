@@ -17,7 +17,7 @@ Supported GGUF storage formats: F32/F16/BF16, Q8_0, Q4_0, Q4_K, Q6_K.
    executor. Every milestone ends with a verification gate against a reference
    oracle. No perf work before greedy-token parity on the same weights.
 2. KEEP THE FIVE STRATA:
-     0 typed storage (`Vec`/`Matrix`/`MatT`/`KVCache`) — the ONLY layout owners
+     0 typed storage (`Vec`/`Matrix`/`MatT`/attention caches) — the ONLY layout owners
      1 algebra (dot, softmax, gelu/silu, rms_norm, `par_for`/`par_map`)
      2 components (`Linear`, norms, gated MLPs, `MoE`) — config-free
      2 token mixing (`attention.hpp`: cache, mask, GQA reduction, RoPE)
@@ -37,9 +37,9 @@ Supported GGUF storage formats: F32/F16/BF16, Q8_0, Q4_0, Q4_K, Q6_K.
 ### Gemma 4 — implemented: E4B
 ```
 Gemma4E4BTextConfig: V=262144 D=2560 L=42 Hq=8 Hkv=2
-  LOCAL_HEAD_DIM=256 (sliding, window 512, rope base 10000, full rotation)
-  GLOBAL_HEAD_DIM=512 (full attention, rope base 1e6, 1/4 rotation)
-  attention_kind(l) = Full if l % 6 == 5 else Sliding
+  LOCAL_HEAD_DIM=256 (local attention, window 512, rope base 10000, full rotation)
+  FULL_HEAD_DIM=512 (full attention, rope base 1e6, 1/4 rotation)
+  attention_type(l) = Full if l % 6 == 5 else Local
   FF=10240 (GELU-gated), PLE=256, CTX=131072
   KV sharing: layers 24..41 own no K/V; they read layer 22 (local) / 23 (full)
   logit softcap 30.0, tied embeddings, embedding scale = bf16(sqrt(D))
@@ -50,11 +50,11 @@ Vision (mmproj) is implemented and joins at `EmbeddedSequence<D>` as soft tokens
 Config pinned from `google/gemma-4-12B` `config.json` (`gemma4_unified_text`):
 ```
 V=262144 D=3840 L=48 Hq=16 FF=15360 (gelu_pytorch_tanh) CTX=262144
-head_dim=256 (sliding, Hkv=8), global_head_dim=512 (full, Hkv=1)
+head_dim=256 (local, Hkv=8), checkpoint `global_head_dim`=512 (full, Hkv=1)
 layer_types: full at l % 6 == 5 — the same period-6 rule as E4B, and the
-             final layer (47) is global, as the model card requires
+             final layer (47) uses full attention, as the model card requires
 sliding_window=1024
-rope: sliding = default, theta 1e4; full = proportional, theta 1e6,
+rope: local = default, theta 1e4; full = proportional, theta 1e6,
       partial_rotary_factor 0.25   → RotaryEmbedding<512, 1000000, 1, 4>
 rms_norm_eps=1e-6  tie_word_embeddings=true  final_logit_softcapping=30.0
 num_kv_shared_layers=0            → NO KV sharing
@@ -64,8 +64,8 @@ enable_moe_block=false, use_double_wide_mlp=false
 ```
 So 12B is a *simpler* decoder than E4B — no PLE residual, no shared-KV layers —
 but it added two things the code did not express, and both are expressed by the
-flat layer structs (`Gemma12BSlidingLayer` / `Gemma12BGlobalLayer`):
-1. **Per-attention-kind KV head count.** Sliding layers have `Hkv=8`, global
+flat layer structs (`Gemma12BLocalLayer` / `Gemma12BFullLayer`):
+1. **Per-attention-type KV head count.** Local layers have `Hkv=8`, full
    layers `Hkv=1`, so `Hkv` is a per-layer-struct constant and the cache
    follows it.
 2. **Unified K/V.** Three K/V anatomies exist across Gemma 4 — owned, unified,
@@ -73,7 +73,7 @@ flat layer structs (`Gemma12BSlidingLayer` / `Gemma12BGlobalLayer`):
    unified layer has `WK`/`k_norm`/`v_norm` but no `WV`; a shared layer has none
    of them. On a unified layer the VALUE is the raw `W_k` output taken *before*
    the key's learned norm and *before* RoPE, then given the scale-free RMS the
-   ordinary value path uses; `Gemma12BGlobalLayer::attention()` computes
+   ordinary value path uses; `Gemma12BFullLayer::attention()` computes
    `X W_k` once and applies both norms to it.
 PLE is likewise explicit: E4B layer `forward()` methods apply their `ple`
 member, while 12B layer methods have neither the member nor that operation.
@@ -232,8 +232,8 @@ is compute-bound, so they want different treatments:
   1. Prefill: batch the token dimension into real GEMM against a
      weight-stationary tile; this is what an AMX/SME/tensor-core backend wants.
   2. Decode: keep the int8-activation path; optimize bytes moved, not FLOPs.
-  3. KV cache: Q8_0 cache storage — `KVCache::append`/`key`/`value` is the
-     pre-built seam.
+  3. K/V cache: Q8_0 storage — `LocalAttentionCache` and
+     `FullAttentionCache` expose the pre-built `append`/`key`/`value` seam.
 GATE P1: parity suite still green after every kernel change.
 
 ## 3. Verification harnesses

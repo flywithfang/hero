@@ -1,5 +1,5 @@
 // property_tests — in-binary invariants that stay green every build (plan §5):
-// RoPE offset identity, RMSNorm scale invariance, causal/sliding attention
+// RoPE offset identity, RMSNorm scale invariance, full/local attention
 // against its own equation, softmax sums to 1, and PrefixCache purity.
 // Everything here is model-neutral: it tests the core, not a checkpoint.
 #include "../src/attention.hpp"
@@ -15,7 +15,8 @@ static_assert(!std::is_default_constructible_v<RMSNorm<4>>);
 static_assert(!std::is_default_constructible_v<Linear<2, 2>>);
 static_assert(!std::is_default_constructible_v<GeluGatedMLP<2, 2>>);
 static_assert(std::is_default_constructible_v<RotaryEmbedding<8, 10000>>);
-static_assert(std::is_default_constructible_v<KVCache<1, 2>>);
+static_assert(std::is_default_constructible_v<FullAttentionCache<1, 2>>);
+static_assert(!std::is_default_constructible_v<LocalAttentionCache<1, 2>>);
 static_assert(!std::is_convertible_v<Position, size_t>);
 static_assert(!std::is_convertible_v<size_t, Position>);
 
@@ -29,11 +30,11 @@ static void check(bool ok, const char* msg) {
 // real ones live in the layer structs, which cannot be instantiated this small —
 // so this mirrors them, and the equation below is checked against arithmetic
 // worked out by hand rather than against another copy of itself.
-template <size_t Hq, size_t Hkv, size_t Dh>
-static Matrix<Hq * Dh> toy_attend(const KVCache<Hkv, Dh>& cache, MatrixView<Hq * Dh> Q, Position at, CausalWindow window, Scalar score_scale) {
+template <size_t Hq, size_t Hkv, size_t Dh, class Cache>
+static Matrix<Hq * Dh> toy_attend(const Cache& cache, MatrixView<Hq * Dh> Q, Position at, Scalar score_scale) {
     std::vector<VisibleRows> visible;
     visible.reserve(Q.rows());
-    for (size_t row = 0; row < Q.rows(); ++row) visible.push_back(cache.visible_rows(at + row, window));
+    for (size_t row = 0; row < Q.rows(); ++row) visible.push_back(cache.visible_rows(at + row));
 
     Matrix<Hq * Dh> A = Matrix<Hq * Dh>::zero_rows(Q.rows());
     par_for(Q.rows() * Hq, [&](size_t task) {
@@ -45,7 +46,7 @@ static Matrix<Hq * Dh> toy_attend(const KVCache<Hkv, Dh>& cache, MatrixView<Hq *
         std::vector<Scalar> alpha;
         alpha.reserve(rows.count());
         for (size_t j = rows.first; j < rows.end; ++j) alpha.push_back(score_scale * dot(query, cache.key(j, group)));
-        Softmax::apply(alpha);
+        alpha = Softmax{}(std::move(alpha));
 
         Vec<Dh> head_output;
         for (size_t n = 0; n < alpha.size(); ++n) head_output.scaled_add(cache.value(rows.first + n, group), alpha[n]);
@@ -89,7 +90,7 @@ public:
     Matrix<D> tokens(std::span<const TokenId> ids) const {
         Matrix<D> X;
         X.reserve(ids.size());
-        for (TokenId id : ids) {
+        for (const TokenId id : ids) {
             Vec<D> embedding;
             embedding[0] = scale_ * Scalar(int32_t(id));
             embedding[1] = scale_ * Scalar(int32_t(id) + 1);
@@ -142,18 +143,18 @@ int main() {
         fill(k0.begin(), 8);
         auto score = [&](Position p, Position m) {
             Vec<8> q = VecView<8>(q0).copy(), k = VecView<8>(k0).copy();
-            r.apply(slice_mut<8>(q, 0), p);
-            r.apply(slice_mut<8>(k, 0), m);
+            r(slice_mut<8>(q, 0), p);
+            r(slice_mut<8>(k, 0), m);
             return dot(VecView<8>(q), VecView<8>(k));
         };
-        Scalar a = score(Position{3}, Position{1}), b = score(Position{10}, Position{8}), c = score(Position{60}, Position{58});
+        const Scalar a = score(Position{3}, Position{1}), b = score(Position{10}, Position{8}), c = score(Position{60}, Position{58});
         check(std::fabs(a - b) < 1e-4 && std::fabs(b - c) < 1e-4, "same offset => same score at 3 abs positions");
     }
     std::printf("== RMSNorm scale invariance ==\n");
     {
         Vec<4> gamma;
         for (size_t i = 0; i < 4; ++i) gamma[i] = 1.f;
-        RMSNorm<4> rn(std::move(gamma));
+        const RMSNorm<4> rn(std::move(gamma));
         Vec<4> a, b;
         for (size_t i = 0; i < 4; ++i) {
             a[i] = Scalar(2 * (i + 1));
@@ -168,14 +169,14 @@ int main() {
     {
         Vec<4> gamma;
         for (size_t i = 0; i < 4; ++i) gamma[i] = Scalar(i + 1);
-        RMSNorm<4> norm(std::move(gamma));
+        const RMSNorm<4> norm(std::move(gamma));
         Matrix<4> input;
         for (size_t row = 0; row < 2; ++row) {
             Vec<4> values;
             for (size_t channel = 0; channel < 4; ++channel) values[channel] = Scalar(1 + row * 4 + channel);
             input.append(values);
         }
-        Matrix<4> batch = norm(input.view());
+        const Matrix<4> batch = norm(input.view());
         Scalar difference = 0;
         for (size_t row = 0; row < input.rows(); ++row) {
             Vec<4> scalar = norm(input.row(row));
@@ -187,7 +188,7 @@ int main() {
     {
         // One KV head, two query rows at positions 0 and 1. Row 0 may see only
         // key 0; row 1 sees both. Scores use the conventional 1/sqrt(HeadDim).
-        KVCache<1, 2> cache;
+        FullAttentionCache<1, 2> cache;
         Vec<2> key0, key1, value0, value1;
         key0[0] = 1.f;
         key1[1] = 1.f;
@@ -208,30 +209,32 @@ int main() {
 
         const Scalar scale = 1.f / std::sqrt(2.f);
         for (size_t row = 0; row < keys.rows(); ++row) cache.append(Position{0} + row, keys.row(row), values.row(row));
-        Matrix<2> attended = toy_attend<1, 1, 2>(cache, queries.view(), Position{0}, CausalWindow::full(), scale);
+        const auto attended = toy_attend<1, 1, 2>(cache, queries.view(), Position{0}, scale);
         const Scalar weight1 = std::exp(scale) / (1.f + std::exp(scale));
         const Scalar expected1 = (1.f - weight1) * 10.f + weight1 * 30.f;
         check(attended.row(0)[0] == 10.f && std::fabs(attended.row(1)[0] - expected1) < 1e-5f, "the causal mask and row-wise softmax match the equation");
 
-        // The same reduction under a width-1 window sees only the newest key.
+        // The local cache owns its width-1 visibility invariant.
+        LocalAttentionCache<1, 2> local(1);
+        for (size_t row = 0; row < keys.rows(); ++row) local.append(Position{0} + row, keys.row(row), values.row(row));
         const MatrixView<2> second_query = queries.view().single_row(1);
-        Matrix<2> windowed = toy_attend<1, 1, 2>(cache, second_query, Position{1}, CausalWindow{1}, scale);
-        check(windowed.row(0)[0] == 30.f, "a sliding window of one keeps only the current position");
+        const auto windowed = toy_attend<1, 1, 2>(local, second_query, Position{1}, scale);
+        check(windowed.row(0)[0] == 30.f, "a local window of one keeps only the current position");
     }
     std::printf("== softmax sums to 1 ==\n");
     {
         std::vector<Scalar> s(50);
         fill(s.data(), 50, 3.f);
-        Softmax::apply(std::span<Scalar>(s.data(), 50));
+        s = Softmax{}(std::move(s));
         Scalar sum = 0;
-        for (Scalar v : s) sum += v;
+        for (const Scalar v : s) sum += v;
         check(std::fabs(sum - 1.f) < 1e-5f, "sum == 1");
     }
     std::printf("== SiLU value ==\n");
     {
         Vec<1> z;
         z[0] = 2.f;
-        Silu::apply(z);
+        z = Silu{}(std::move(z));
         check(std::fabs(z[0] - 1.7616f) < 1e-3f, "silu(2)=1.7616");
     }
 
@@ -274,7 +277,7 @@ int main() {
         // so the memo starts over even though the first row is the same.
         const std::vector<TokenId> divergent{TokenId{1}, TokenId{9}};
         const Logits<3> pure_divergent = from_scratch(divergent);
-        EmbeddedSequence<2> divergent_input = sequence_of(model, divergent);
+        const EmbeddedSequence<2> divergent_input = sequence_of(model, divergent);
         const Logits<3> cached_divergent = memo.evaluate(divergent_input);
         equal = equal && same(cached_divergent, pure_divergent) && memo.reused_tokens() == 0 && memo.computed_tokens() == 2;
 
@@ -297,7 +300,7 @@ int main() {
 
     std::printf("== a query with no visible key is an error, never zero ==\n");
     {
-        KVCache<1, 2> cache;
+        LocalAttentionCache<1, 2> cache(2);
         Vec<2> key0, value0;
         key0[0] = 1.f;
         value0[0] = 5.f;
@@ -305,7 +308,7 @@ int main() {
         bool threw = false;
         try {
             // Position 9 with a window of 2 can see nothing at position 0.
-            (void)cache.visible_rows(Position{9}, CausalWindow{2});
+            (void)cache.visible_rows(Position{9});
         } catch (const std::runtime_error&) {
             threw = true;
         }

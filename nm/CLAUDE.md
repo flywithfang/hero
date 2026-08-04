@@ -31,12 +31,13 @@ standing context.
   `ClippedLinear`, `RMSNorm`, `RMSNormNoScale`, `GatedMLP` (SwiGLU),
   `GeluGatedMLP`, `MoE` (expert body is a template parameter).
 - `src/attention.hpp` — **the model-neutral token-mixing PARTS**:
-  `KVCache<Hkv, HeadDim>` (full-retention or sliding ring — storage, eviction and
-  the position anchor, and nothing else; note it takes no `Hq`, because how many
-  query heads read a cache is not the cache's business), `CausalWindow` (the mask
-  defined once, as a predicate `contains` plus its closed-form `visible_rows`),
-  `VisibleRows`, `KVHead`, `RotaryEmbedding` (half-split pairing, optional
-  partial rotation), `rotate_heads`, `PerHeadNorm`.
+  `LocalAttentionCache<Hkv, HeadDim>` (fixed-window ring) and
+  `FullAttentionCache<Hkv, HeadDim>` (append-only history), with each type
+  owning its visibility and storage invariant; neither takes `Hq`, because how
+  many query heads read a cache is not the cache's business. `CausalWindow`
+  defines position visibility, while `VisibleRows`, `KVHead`,
+  `RotaryEmbedding` (half-split pairing, optional partial rotation), and
+  `PerHeadNorm` carry the remaining typed operations.
   The softmax reduction over cached keys is deliberately NOT here. Each layer
   kind writes its own, in its `attention()`/`mix_tokens`, because that equation is
   where families diverge: Gemma folds 1/sqrt(HeadDim) into its learned Q norm and
@@ -74,7 +75,8 @@ standing context.
    `Architecture::PrefixState` is its model-specific inner storage. It can
    change cost, never semantics. Conversation history and sampling live outside
    the transformer. Layout knowledge lives ONLY in storage types
-   (`Matrix`, `Mat::operator()`, `KVCache`). `Matrix<C>` is a SEQUENCE OF ROWS
+   (`Matrix`, `Mat::operator()`, `LocalAttentionCache`,
+   `FullAttentionCache`). `Matrix<C>` is a SEQUENCE OF ROWS
    built by `append()`ing whole vectors — never sized-then-poked, and it hands
    out no base pointer. A kernel whose rows are independent uses
    `par_map_rows`/`par_map_heads`; the one kernel that produces columns rather
@@ -110,7 +112,7 @@ standing context.
    of tensors named after the checkpoint (`WQ`, `q_norm`, `WO`, ...) plus the
    `attention()` and `forward()` methods that explain how those tensors are
    used; a model's weights are plain vectors, one per physical layer shape;
-   `forward_layer` is an if/else on the schedule (`Config::position_in_kind`).
+   `forward_layer` is an if/else on the schedule (`Config::position_in_group`).
    KV anatomy remains physical: a shared-KV layer has no `WK`/`WV`, while its
    method explicitly attends to an existing cache. Do not infer semantics from
    member-existence `requires` expressions, kind flags, or wrapper variants.
@@ -195,3 +197,6 @@ standing context.
   checkout is at `~/projects/detective-english/sm/llama.cpp` and already
   implements `gemma4` and `qwen35`/`qwen35moe` — read it when deriving a new
   family's anatomy.
+- Declare local variables `const` whenever they are not modified in their scope.
+  Prefer inferred declarations such as `const auto K = foo();` when the type is
+  already clear from the expression.

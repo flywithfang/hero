@@ -33,7 +33,7 @@ public:
             for (size_t i = 0; i < n; ++i) f(i);
             return;
         }
-        std::unique_lock<std::mutex> job(job_m_);  // one job at a time
+        const std::unique_lock<std::mutex> job(job_m_);  // one job at a time
         fn_ = &f;
         n_ = n;
         // Grab work in CHUNKS, not one index at a time: for the big matvecs
@@ -43,7 +43,7 @@ public:
         next_.store(0, std::memory_order_relaxed);
         remaining_.store(nthreads_, std::memory_order_relaxed);
         {
-            std::lock_guard<std::mutex> lk(m_);
+            const std::lock_guard<std::mutex> lk(m_);
             gen_++;
         }
         cv_.notify_all();
@@ -55,7 +55,7 @@ public:
 
     ~Pool() {
         {
-            std::lock_guard<std::mutex> lk(m_);
+            const std::lock_guard<std::mutex> lk(m_);
             stop_ = true;
             gen_++;
         }
@@ -65,10 +65,10 @@ public:
 
 private:
     Pool() {
-        unsigned hc = std::thread::hardware_concurrency();
+        const unsigned hc = std::thread::hardware_concurrency();
         nthreads_ = hc ? hc : 1;
         if (const char* e = std::getenv("NM_THREADS")) {
-            long v = std::atol(e);
+            const long v = std::atol(e);
             if (v > 0) nthreads_ = size_t(v);
         }
         for (size_t i = 1; i < nthreads_; ++i) threads_.emplace_back([this] { worker(); });
@@ -77,14 +77,14 @@ private:
     void work_loop() {
         t_in_parallel = true;
         for (;;) {
-            size_t b = next_.fetch_add(chunk_, std::memory_order_relaxed);
+            const size_t b = next_.fetch_add(chunk_, std::memory_order_relaxed);
             if (b >= n_) break;
-            size_t e = std::min(b + chunk_, n_);
+            const size_t e = std::min(b + chunk_, n_);
             for (size_t i = b; i < e; ++i) (*fn_)(i);
         }
         t_in_parallel = false;
         if (remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            std::lock_guard<std::mutex> lk(done_m_);
+            const std::lock_guard<std::mutex> lk(done_m_);
             done_cv_.notify_all();
         }
     }

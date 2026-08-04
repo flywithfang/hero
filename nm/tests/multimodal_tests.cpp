@@ -13,7 +13,7 @@ int main() {
 
     std::printf("== runtime token matrix ==\n");
     {
-        Matrix<3> m{{1, 2, 3}, {4, 5, 6}};
+        const Matrix<3> m{{1, 2, 3}, {4, 5, 6}};
         check(m.rows() == 2 && m.cols() == 3, "runtime rows, static channels");
         check(m.row(1)[0] == 4 && m.row(1)[2] == 6, "rows preserve values");
         bool threw = false;

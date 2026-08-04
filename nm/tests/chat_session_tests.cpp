@@ -53,7 +53,7 @@ int main(int argc, char** argv) {
             const bool same_pixels = std::equal(platform_image.pixels().begin(), platform_image.pixels().end(), image.pixels().begin(), image.pixels().end());
             if (!same_pixels) {
                 std::printf("    decoded:");
-                for (uint8_t value : platform_image.pixels()) std::printf(" %u", unsigned(value));
+                for (const uint8_t value : platform_image.pixels()) std::printf(" %u", unsigned(value));
                 std::printf("\n");
             }
             check(same_pixels, "platform decoder preserves RGB orientation and channel order");

@@ -79,7 +79,7 @@ public:
         }
     }
 
-    void apply(MutVecView<HeadDim> value, Position position) const {
+    MutVecView<HeadDim> operator()(MutVecView<HeadDim> value, Position position) const {
         for (size_t i = 0; i < Planes; ++i) {
             const Scalar angle = position * inv_freq_[i];
             const Scalar c = std::cos(angle), s = std::sin(angle);
@@ -87,6 +87,19 @@ public:
             value[i] = x * c - y * s;
             value[i + Planes] = y * c + x * s;
         }
+        return value;
+    }
+
+    template <size_t Total>
+    Matrix<Total> operator()(const Matrix<Total>& values, Position conversation_position) const { return (*this)(values.view().copy(), conversation_position); }
+
+    template <size_t Total>
+    Matrix<Total> operator()(Matrix<Total>&& values, Position conversation_position) const {
+        static_assert(Total % HeadDim == 0, "RotaryEmbedding: tensor is not a whole number of heads");
+        values.transform_rows([&](size_t row, MutVecView<Total> value) {
+            for (size_t head = 0; head < Total / HeadDim; ++head) (*this)(slice_mut<HeadDim>(value, head), conversation_position + row);
+        });
+        return std::move(values);
     }
 
     static constexpr size_t rotary_planes() { return RotaryPlanes; }
@@ -95,24 +108,12 @@ private:
     std::array<Scalar, Planes> inv_freq_{};
 };
 
-// A rotation is, to rotate_heads, exactly what a norm is to PerHeadNorm: an
-// in-place rewrite of one head-wide partition, here parameterized by position.
-// Any table with that operation works — the two Gemma widths, the two bases,
-// full or partial rotation — and nothing else does.
+// A head rotation is a composable operation over an owning matrix. Any table
+// with that operation works — full or partial RoPE, at either Gemma width.
 template <class R, size_t HeadDim>
-concept HeadRotation = requires(const R& rope, MutVecView<HeadDim> head, Position position) { rope.apply(head, position); };
-
-template <size_t Heads, size_t HeadDim, HeadRotation<HeadDim> Rope>
-void rotate_heads(MutVecView<Heads * HeadDim> value, const Rope& rope, Position position) {
-    for (size_t h = 0; h < Heads; ++h) {
-        rope.apply(slice_mut<HeadDim>(value, h), position);
-    }
-}
-
-template <size_t Heads, size_t HeadDim, HeadRotation<HeadDim> Rope>
-void rotate_heads(Matrix<Heads * HeadDim>& values, const Rope& rope, Position conversation_position) {
-    values.transform_rows([&](size_t row, MutVecView<Heads * HeadDim> value) { rotate_heads<Heads, HeadDim>(value, rope, conversation_position + row); });
-}
+concept HeadRotation = requires(const R& rope, Matrix<HeadDim> heads, Position position) {
+    { rope(std::move(heads), position) } -> std::same_as<Matrix<HeadDim>>;
+};
 
 // Dense multi-head attention:
 //   softmax_rows(scale * Q K^T) V
@@ -129,7 +130,7 @@ Matrix<Heads * ValueDim> scaled_dot_product_attention(MatrixView<Heads * QueryKe
 
         std::vector<Scalar> scores(keys.rows());
         for (size_t key_row = 0; key_row < keys.rows(); ++key_row) scores[key_row] = scale * dot(query, slice<QueryKeyDim>(keys.row(key_row), head));
-        Softmax::apply(scores);
+        scores = Softmax{}(std::move(scores));
 
         Vec<ValueDim> attended;
         for (size_t key_row = 0; key_row < keys.rows(); ++key_row) attended.scaled_add(slice<ValueDim>(values.row(key_row), head), scores[key_row]);
@@ -188,109 +189,209 @@ struct KVHead {
     size_t index;
 };
 
-// One layer's K/V rows: storage, the eviction ring, and the position anchor.
-// Nothing else. The reduction that reads these rows belongs to the layer whose
-// weights produced them — what happens between the scores and the softmax is
-// family anatomy, not cache business, and a shared kernel would have to grow a
-// parameter for every family that does it differently.
+// Full and local attention have different storage invariants, so they have
+// different cache types. A full cache is append-only. A local cache is a fixed
+// window ring, except while a prefill batch is deliberately retained for a
+// later layer that shares its K/V. Both expose rows in chronological order:
+// row zero is always the oldest retained position. Ring slots never escape the
+// local cache type.
 //
-// Read the template parameters: a cache is sized by the K/V heads it HOLDS. How
-// many QUERY heads later read it is no concern of this type, which is precisely
-// what grouped-query attention means.
+// The template parameters describe the K/V heads the cache HOLDS. How many
+// query heads read them is a separate GQA concern.
 template <size_t Hkv, size_t HeadDim>
-class KVCache {
+class FullAttentionCache {
     static_assert(Hkv != 0);
-
-public:
     static constexpr size_t Width = Hkv * HeadDim;
 
-    explicit KVCache(size_t capacity = 0) : capacity_(capacity) {}
-
-    size_t size() const { return size_; }
-    size_t capacity() const { return capacity_; }
-    // Row 0 holds the oldest key still cached, and row i the one i positions
-    // after it. A ring's evictions move that anchor forward; nothing else does.
+public:
+    size_t size() const { return keys_.rows(); }
     Position oldest_position() const { return oldest_position_; }
-    Position position(size_t logical) const {
-        if (logical >= size_) throw std::out_of_range("KVCache: row out of range");
-        return oldest_position_ + logical;
+    Position position(size_t chronological_row) const {
+        require_row(chronological_row);
+        return oldest_position_ + chronological_row;
     }
 
-    // Whether `rows` more rows fit before anything is overwritten. A prefill
-    // batch that does NOT fit cannot be appended and then attended in one go:
-    // the earliest queries would lose keys they are still allowed to see.
-    bool can_append_without_eviction(size_t rows) const { return capacity_ == 0 || rows <= capacity_ - size_; }
+    bool can_append_without_eviction(size_t) const { return true; }
 
-    // Append one complete packed K/V row. Positions are CONSECUTIVE, not merely
-    // increasing: a decoder is handed every position in order, so a row's
-    // position is its distance from the anchor and there is nothing per-row to
-    // store.
+    void append(Position position, VecView<Width> key, VecView<Width> value) {
+        if (size() == 0) oldest_position_ = position;
+        else if (position != oldest_position_ + size()) throw std::invalid_argument("FullAttentionCache: positions must be consecutive");
+        keys_.append(key);
+        values_.append(value);
+    }
+
+    VisibleRows visible_rows(Position query) const {
+        const VisibleRows rows = CausalWindow::full().visible_rows(query, oldest_position_, size());
+        if (rows.empty()) throw std::runtime_error("FullAttentionCache: query has no visible keys");
+        return rows;
+    }
+
+    VecView<HeadDim> key(size_t chronological_row, KVHead head) const {
+        require_head(head);
+        require_row(chronological_row);
+        return slice<HeadDim>(keys_.row(chronological_row), head.index);
+    }
+    VecView<HeadDim> value(size_t chronological_row, KVHead head) const {
+        require_head(head);
+        require_row(chronological_row);
+        return slice<HeadDim>(values_.row(chronological_row), head.index);
+    }
+
+private:
+    void require_row(size_t row) const {
+        if (row >= size()) throw std::out_of_range("FullAttentionCache: row out of range");
+    }
+    static void require_head(KVHead head) {
+        if (head.index >= Hkv) throw std::out_of_range("FullAttentionCache: K/V head out of range");
+    }
+
+    Position oldest_position_{0};
+    Matrix<Width> keys_;
+    Matrix<Width> values_;
+};
+
+template <size_t Hkv, size_t HeadDim>
+class LocalAttentionCache {
+    static_assert(Hkv != 0);
+    static constexpr size_t Width = Hkv * HeadDim;
+
+public:
+    explicit LocalAttentionCache(size_t window) : window_(window) {
+        if (window == 0) throw std::invalid_argument("LocalAttentionCache: window must be positive");
+    }
+
+    size_t size() const { return size_; }
+    size_t window() const { return window_; }
+    Position oldest_position() const { return oldest_position_; }
+    Position position(size_t chronological_row) const {
+        require_row(chronological_row);
+        return oldest_position_ + chronological_row;
+    }
+
+    // Ordinarily the ring evicts as soon as it exceeds `window()`. A K/V source
+    // whose later layers process the same prefill batch must defer that eviction:
+    // each query sees only its local window, but the batch contains queries at
+    // many positions. This operation retains exactly the old window plus the
+    // rows about to be appended; end_batch_retention() restores the ring.
+    void begin_batch_retention(size_t appended_rows) {
+        if (retaining_batch_) throw std::logic_error("LocalAttentionCache: batch retention already active");
+        if (appended_rows <= 1) return;
+
+        Matrix<Width> ordered_keys;
+        Matrix<Width> ordered_values;
+        ordered_keys.reserve(size_ + appended_rows);
+        ordered_values.reserve(size_ + appended_rows);
+        for (size_t row = 0; row < size_; ++row) {
+            ordered_keys.append(key_row(row));
+            ordered_values.append(value_row(row));
+        }
+        keys_ = std::move(ordered_keys);
+        values_ = std::move(ordered_values);
+        oldest_slot_ = 0;
+        retaining_batch_ = true;
+        batch_rows_remaining_ = appended_rows;
+    }
+
+    void end_batch_retention() {
+        if (!retaining_batch_) return;
+        if (batch_rows_remaining_ != 0) throw std::logic_error("LocalAttentionCache: retained batch was not fully appended");
+
+        const size_t kept = std::min(size_, window_);
+        const size_t dropped = size_ - kept;
+        Matrix<Width> compact_keys;
+        Matrix<Width> compact_values;
+        compact_keys.reserve(window_);
+        compact_values.reserve(window_);
+        for (size_t row = dropped; row < size_; ++row) {
+            compact_keys.append(key_row(row));
+            compact_values.append(value_row(row));
+        }
+        keys_ = std::move(compact_keys);
+        values_ = std::move(compact_values);
+        oldest_position_ = oldest_position_ + dropped;
+        oldest_slot_ = 0;
+        size_ = kept;
+        retaining_batch_ = false;
+    }
+
+    bool can_append_without_eviction(size_t rows) const {
+        if (retaining_batch_) return rows <= batch_rows_remaining_;
+        return rows <= window_ - size_;
+    }
+
     void append(Position position, VecView<Width> key, VecView<Width> value) {
         if (size_ == 0) oldest_position_ = position;
-        else if (position != oldest_position_ + size_) throw std::invalid_argument("KVCache: positions must be consecutive");
+        else if (position != oldest_position_ + size_) throw std::invalid_argument("LocalAttentionCache: positions must be consecutive");
 
-        if (capacity_ == 0) {
+        if (retaining_batch_) {
+            if (batch_rows_remaining_ == 0) throw std::length_error("LocalAttentionCache: retained batch received too many rows");
             keys_.append(key);
             values_.append(value);
             ++size_;
+            --batch_rows_remaining_;
             return;
         }
 
-        ensure_bounded_storage();
+        ensure_ring_storage();
         size_t destination;
-        if (size_ < capacity_) {
-            destination = (start_ + size_) % capacity_;
+        if (size_ < window_) {
+            destination = (oldest_slot_ + size_) % window_;
             ++size_;
         } else {
-            destination = start_;
-            start_ = (start_ + 1) % capacity_;
-            oldest_position_ = oldest_position_ + 1;  // the row just overwritten was the oldest
+            destination = oldest_slot_;
+            oldest_slot_ = (oldest_slot_ + 1) % window_;
+            oldest_position_ = oldest_position_ + 1;
         }
         keys_.replace(destination, key);
         values_.replace(destination, value);
     }
 
-    // The rows a query at `query` may attend to, as a half-open interval.
-    // Empty is never a legitimate answer — a softmax over no keys has no value —
-    // so this throws rather than handing back a range a caller might average.
-    VisibleRows visible_rows(Position query, CausalWindow window) const {
-        const VisibleRows rows = window.visible_rows(query, oldest_position_, size_);
-        if (rows.empty()) throw std::runtime_error("KVCache: query has no visible keys");
+    VisibleRows visible_rows(Position query) const {
+        const VisibleRows rows = CausalWindow{window_}.visible_rows(query, oldest_position_, size_);
+        if (rows.empty()) throw std::runtime_error("LocalAttentionCache: query has no visible keys");
         return rows;
     }
 
-    // One head of one cached row. `logical` counts up from the oldest retained
-    // row, so a ring's wrap-around never leaves this type.
-    VecView<HeadDim> key(size_t logical, KVHead head) const {
-        if (head.index >= Hkv) throw std::out_of_range("KVCache: K/V head out of range");
-        return slice<HeadDim>(keys_.row(physical(logical)), head.index);
+    VecView<HeadDim> key(size_t chronological_row, KVHead head) const {
+        require_head(head);
+        return slice<HeadDim>(key_row(chronological_row), head.index);
     }
-    VecView<HeadDim> value(size_t logical, KVHead head) const {
-        if (head.index >= Hkv) throw std::out_of_range("KVCache: K/V head out of range");
-        return slice<HeadDim>(values_.row(physical(logical)), head.index);
+    VecView<HeadDim> value(size_t chronological_row, KVHead head) const {
+        require_head(head);
+        return slice<HeadDim>(value_row(chronological_row), head.index);
     }
 
 private:
-    void ensure_bounded_storage() {
-        if (keys_.rows() == capacity_) return;
-        keys_.reserve(capacity_);
-        values_.reserve(capacity_);
+    void ensure_ring_storage() {
+        if (keys_.rows() == window_) return;
+        keys_.reserve(window_);
+        values_.reserve(window_);
         const Vec<Width> empty;
-        for (size_t row = 0; row < capacity_; ++row) {
+        while (keys_.rows() < window_) {
             keys_.append(empty);
             values_.append(empty);
         }
     }
 
-    size_t physical(size_t logical) const {
-        if (logical >= size_) throw std::out_of_range("KVCache: row out of range");
-        return capacity_ == 0 ? logical : (start_ + logical) % capacity_;
+    size_t storage_row_for(size_t chronological_row) const {
+        require_row(chronological_row);
+        return retaining_batch_ ? chronological_row : (oldest_slot_ + chronological_row) % window_;
+    }
+    VecView<Width> key_row(size_t chronological_row) const { return keys_.row(storage_row_for(chronological_row)); }
+    VecView<Width> value_row(size_t chronological_row) const { return values_.row(storage_row_for(chronological_row)); }
+    void require_row(size_t row) const {
+        if (row >= size_) throw std::out_of_range("LocalAttentionCache: row out of range");
+    }
+    static void require_head(KVHead head) {
+        if (head.index >= Hkv) throw std::out_of_range("LocalAttentionCache: K/V head out of range");
     }
 
-    size_t capacity_;
-    size_t start_ = 0;
+    size_t window_;
+    size_t oldest_slot_ = 0;
     size_t size_ = 0;
     Position oldest_position_{0};
     Matrix<Width> keys_;
     Matrix<Width> values_;
+    bool retaining_batch_ = false;
+    size_t batch_rows_remaining_ = 0;
 };

@@ -260,7 +260,7 @@ inline Gemma4E4BChat make_gemma4_e4b_chat_model(const GGUF& gguf, const std::str
 }
 
 inline Gemma4_12BChat make_gemma4_12b_chat_model(const GGUF& gguf, std::string system, SamplerCfg sampling) {
-    return Gemma4_12BChat(gemma4_loader::load_12b_text(gguf), gguf, "Gemma 4 12B D=3840 L=48 (40 sliding + 8 global unified-K/V, text only)", std::move(system), sampling);
+    return Gemma4_12BChat(gemma4_loader::load_12b_text(gguf), gguf, "Gemma 4 12B D=3840 L=48 (40 local + 8 full unified-K/V, text only)", std::move(system), sampling);
 }
 
 template <class C>

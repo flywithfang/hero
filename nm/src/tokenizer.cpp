@@ -18,7 +18,7 @@ struct ByteRemap {
         for (int b = 0xA1; b <= 0xAC; ++b) bs.push_back(b);
         for (int b = 0xAE; b <= 0xFF; ++b) bs.push_back(b);
         std::array<bool, 256> in{};
-        for (int b : bs) in[b] = true;
+        for (const int b : bs) in[b] = true;
         int n = 0;
         for (int b = 0; b < 256; ++b) {
             uint32_t cp;
@@ -32,7 +32,7 @@ struct ByteRemap {
     }
 };
 const ByteRemap& remap() {
-    static ByteRemap r;
+    static const ByteRemap r;
     return r;
 }
 
@@ -59,7 +59,7 @@ void utf8_decode(const std::string& s, std::vector<uint32_t>& cps, std::vector<s
     size_t i = 0, n = s.size();
     while (i < n) {
         off.push_back(i);
-        uint8_t c = s[i];
+        const uint8_t c = s[i];
         uint32_t cp;
         size_t len;
         if (c < 0x80) {
@@ -88,7 +88,7 @@ void utf8_decode(const std::string& s, std::vector<uint32_t>& cps, std::vector<s
 bool in_ranges(uint32_t cp, const uint32_t (*r)[2], size_t n) {
     size_t lo = 0, hi = n;
     while (lo < hi) {
-        size_t m = (lo + hi) / 2;
+        const size_t m = (lo + hi) / 2;
         if (cp < r[m][0])
             hi = m;
         else if (cp >= r[m][1])
@@ -139,14 +139,14 @@ Tokenizer::Tokenizer(const GGUF& g) {
     merge_rank_.reserve(merges.size() * 2);
     for (int32_t r = 0; r < (int32_t)merges.size(); ++r) {
         const std::string& m = merges[r];
-        size_t sp = m.find(' ', 1);
+        const size_t sp = m.find(' ', 1);
         if (sp == std::string::npos) continue;
-        int32_t a = id_of(m.substr(0, sp)), b = id_of(m.substr(sp + 1));
+        const int32_t a = id_of(m.substr(0, sp)), b = id_of(m.substr(sp + 1));
         if (a >= 0 && b >= 0) merge_rank_[(uint64_t(uint32_t(a)) << 32) | uint32_t(b)] = r;
     }
     // special (CONTROL=3 / USER_DEFINED=4) tokens: surface string -> id
     for (int32_t i = 0; i < (int32_t)toks.size(); ++i) {
-        int32_t ty = i < (int32_t)token_type_.size() ? token_type_[i] : 1;
+        const int32_t ty = i < (int32_t)token_type_.size() ? token_type_[i] : 1;
         if (ty == 3 || ty == 4) special_[toks[i]] = i;
     }
     bos_ = (int32_t)g.get_int("tokenizer.ggml.bos_token_id", -1);
@@ -172,7 +172,7 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
         // each maximal newline/non-newline run with no word-level splitting.
         std::string escaped;
         escaped.reserve(text.size());
-        for (char ch : text) {
+        for (const char ch : text) {
             if (ch == ' ')
                 escaped += "\xE2\x96\x81";
             else
@@ -215,17 +215,17 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
 
     size_t pos = 0;
     while (pos < N) {
-        uint32_t c = cp[pos];
+        const uint32_t c = cp[pos];
         // (?i:'s|'t|'re|'ve|'m|'ll|'d)
         if (c == '\'' && pos + 1 < N) {
-            uint32_t n1 = ascii_lower(cp[pos + 1]);
+            const uint32_t n1 = ascii_lower(cp[pos + 1]);
             if (n1 == 's' || n1 == 't' || n1 == 'm' || n1 == 'd') {
                 pos += 2;
                 emit(pos);
                 continue;
             }
             if (pos + 2 < N) {
-                uint32_t n2 = ascii_lower(cp[pos + 2]);
+                const uint32_t n2 = ascii_lower(cp[pos + 2]);
                 if ((n1 == 'r' && n2 == 'e') || (n1 == 'v' && n2 == 'e') || (n1 == 'l' && n2 == 'l')) {
                     pos += 3;
                     emit(pos);
@@ -256,10 +256,10 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
             continue;
         }
         // <space>?[^\s\p{L}\p{N}]+[\r\n]*
-        bool space = (c == ' ');
+        const bool space = (c == ' ');
         {
-            size_t q = space ? pos + 1 : pos;
-            bool other = in(q) && !(W(q) || L(q) || Nn(q));
+            const size_t q = space ? pos + 1 : pos;
+            const bool other = in(q) && !(W(q) || L(q) || Nn(q));
             if (other && in(pos)) {
                 pos += space ? 1 : 0;
                 while (in(pos) && !(W(pos) || L(pos) || Nn(pos))) pos++;
@@ -271,7 +271,7 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
         // whitespace runs: \s*[\r\n]+ | \s+(?!\S) | \s+
         size_t nw = 0, last_rn = 0;
         while (W(pos + nw)) {
-            uint32_t c2 = cp[pos + nw];
+            const uint32_t c2 = cp[pos + nw];
             if (c2 == '\r' || c2 == '\n') last_rn = pos + nw + 1;
             nw++;
         }
@@ -308,7 +308,7 @@ std::vector<int32_t> Tokenizer::bpe_encode_chunk(const std::string& piece) const
     if (byte_encode_) {
         // GPT-2 mode: each byte becomes its printable remapped codepoint.
         sym.reserve(piece.size());
-        for (unsigned char b : piece) {
+        for (const unsigned char b : piece) {
             std::string s;
             utf8_append(s, remap().byte_to_cp[b]);
             sym.push_back(std::move(s));
@@ -328,7 +328,7 @@ std::vector<int32_t> Tokenizer::bpe_encode_chunk(const std::string& piece) const
     std::string whole;
     for (auto& s : sym) whole += s;
     if (ignore_merges_)
-        if (int32_t w = id_of(whole); w >= 0) return {w};
+        if (const int32_t w = id_of(whole); w >= 0) return {w};
 
     // greedy lowest-rank merges over adjacent symbol pairs.
     for (;;) {
@@ -336,7 +336,7 @@ std::vector<int32_t> Tokenizer::bpe_encode_chunk(const std::string& piece) const
         size_t best_i = 0;
         bool found = false;
         for (size_t i = 0; i + 1 < sym.size(); ++i) {
-            int32_t a = id_of(sym[i]), b = id_of(sym[i + 1]);
+            const int32_t a = id_of(sym[i]), b = id_of(sym[i + 1]);
             if (a < 0 || b < 0) continue;
             auto it = merge_rank_.find((uint64_t(uint32_t(a)) << 32) | uint32_t(b));
             if (it != merge_rank_.end() && it->second < best_rank) {
@@ -353,11 +353,11 @@ std::vector<int32_t> Tokenizer::bpe_encode_chunk(const std::string& piece) const
     std::vector<int32_t> ids;
     ids.reserve(sym.size());
     for (auto& s : sym) {
-        int32_t id = id_of(s);
+        const int32_t id = id_of(s);
         if (id >= 0)
             ids.push_back(id);
         else
-            for (unsigned char ch : s) {
+            for (const unsigned char ch : s) {
                 std::string fallback;
                 if (byte_encode_) {
                     fallback.assign(1, char(ch));
@@ -365,7 +365,7 @@ std::vector<int32_t> Tokenizer::bpe_encode_chunk(const std::string& piece) const
                     static constexpr char hex[] = "0123456789ABCDEF";
                     fallback = {'<', '0', 'x', hex[ch >> 4], hex[ch & 15], '>'};
                 }
-                int32_t bid = id_of(fallback);
+                const int32_t bid = id_of(fallback);
                 if (bid >= 0) ids.push_back(bid);
             }
     }
@@ -380,7 +380,7 @@ std::vector<int32_t> Tokenizer::encode(const std::string& text, bool add_bos, bo
     // split on special-token surfaces (longest match) when parse_special.
     auto tokenize_normal = [&](const std::string& s) {
         for (const auto& piece : pretokenize(s))
-            for (int32_t id : bpe_encode_chunk(piece)) out.push_back(id);
+            for (const int32_t id : bpe_encode_chunk(piece)) out.push_back(id);
     };
 
     if (!parse_special || special_.empty()) {
@@ -413,7 +413,7 @@ std::vector<int32_t> Tokenizer::encode(const std::string& text, bool add_bos, bo
 
 std::string Tokenizer::decode1(int32_t id) const {
     if (id < 0 || id >= (int32_t)id_to_tok_.size()) return "";
-    int32_t ty = id < (int32_t)token_type_.size() ? token_type_[id] : 1;
+    const int32_t ty = id < (int32_t)token_type_.size() ? token_type_[id] : 1;
     if (ty == 3) return "";  // control tokens render as nothing
     const std::string& t = id_to_tok_[id];
     if (!byte_encode_) {
@@ -442,7 +442,7 @@ std::string Tokenizer::decode1(int32_t id) const {
     std::vector<size_t> off;
     utf8_decode(t, cp, off);
     std::string out;
-    for (uint32_t c : cp) {
+    for (const uint32_t c : cp) {
         auto it = remap().cp_to_byte.find(c);
         if (it != remap().cp_to_byte.end())
             out += char(it->second);
@@ -453,6 +453,6 @@ std::string Tokenizer::decode1(int32_t id) const {
 }
 std::string Tokenizer::decode(const std::vector<int32_t>& ids) const {
     std::string out;
-    for (int32_t id : ids) out += decode1(id);
+    for (const int32_t id : ids) out += decode1(id);
     return out;
 }

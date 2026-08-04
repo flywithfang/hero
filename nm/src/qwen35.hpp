@@ -360,35 +360,35 @@ private:
         const auto reduce = [&](MatrixView<QW> queries, Position at) {
             std::vector<VisibleRows> visible;
             visible.reserve(queries.rows());
-            for (size_t row = 0; row < queries.rows(); ++row) visible.push_back(cache.visible_rows(at + row));
+            for (size_t token_pos = 0; token_pos < queries.rows(); ++token_pos) visible.push_back(cache.visible_rows(at + token_pos));
 
             Matrix<QW> attended = Matrix<QW>::zero_rows(queries.rows());
             par_for(queries.rows() * C::Hq, [&](size_t task) {
-                const size_t row = task / C::Hq, head = task % C::Hq;
-                const VecView<Dh> query = slice<Dh>(queries.row(row), head);
+                const size_t token_pos = task / C::Hq, head = task % C::Hq;
+                const VecView<Dh> query = slice<Dh>(queries.row(token_pos), head);
                 const KVHead group{head / (C::Hq / C::Hkv)};
-                const VisibleRows rows = visible[row];
+                const VisibleRows visible_tokens = visible[token_pos];
 
                 std::vector<Scalar> alpha;
-                alpha.reserve(rows.count());
-                for (size_t j = rows.first; j < rows.end; ++j) alpha.push_back(score_scale * dot(query, cache.key(j, group)));
+                alpha.reserve(visible_tokens.count());
+                for (size_t j = visible_tokens.first; j < visible_tokens.end; ++j) alpha.push_back(score_scale * dot(query, cache.key(j, group)));
                 alpha = Softmax{}(std::move(alpha));
 
                 Vec<Dh> head_output;
-                for (size_t n = 0; n < alpha.size(); ++n) head_output.scaled_add(cache.value(rows.first + n, group), alpha[n]);
-                attended.template replace_partition<Dh>(row, head, head_output);
+                for (size_t n = 0; n < alpha.size(); ++n) head_output.scaled_add(cache.value(visible_tokens.first + n, group), alpha[n]);
+                attended.template replace_partition<Dh>(token_pos, head, head_output);
             });
             return attended;
         };
 
         // Full attention with no window: the cache is unbounded, so the batch
         // always fits and the eviction path cannot fire.
-        for (size_t row = 0; row < Q.rows(); ++row) cache.append(conversation_position + row, K.row(row), V.row(row));
+        for (size_t token_pos = 0; token_pos < Q.rows(); ++token_pos) cache.append(conversation_position + token_pos, K.row(token_pos), V.row(token_pos));
         Matrix<QW> A = reduce(Q.view(), conversation_position);
 
         // The gate is applied to the attended value, before W_o.
-        A.transform_rows([&](size_t row, MutVecView<QW> attended) {
-            const VecView<QW> gate = query_gate.second.row(row);
+        A.transform_rows([&](size_t token_pos, MutVecView<QW> attended) {
+            const VecView<QW> gate = query_gate.second.row(token_pos);
             for (size_t i = 0; i < QW; ++i) attended[i] *= sigmoid(gate[i]);
         });
         return attention.WO(A.view());

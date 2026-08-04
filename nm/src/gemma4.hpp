@@ -211,44 +211,44 @@ struct GemmaE4BLayer {
         const auto reduce = [&](MatrixView<Hq * Dh> queries, Position at) {
             std::vector<VisibleRows> visible;
             visible.reserve(queries.rows());
-            for (size_t row = 0; row < queries.rows(); ++row){
-                 visible.push_back(cache.visible_rows(at + row));
+            for (size_t token_pos = 0; token_pos < queries.rows(); ++token_pos){
+                 visible.push_back(cache.visible_rows(at + token_pos));
             }
 
             Matrix<Hq * Dh> attended = Matrix<Hq * Dh>::zero_rows(queries.rows());
             par_for(queries.rows() * Hq, [&](size_t task) {
-                const size_t row = task / Hq, head = task % Hq;
-                const VecView<Dh> query = slice<Dh>(queries.row(row), head);
+                const size_t token_pos = task / Hq, head = task % Hq;
+                const VecView<Dh> query = slice<Dh>(queries.row(token_pos), head);
                 const KVHead group{head / (Hq / Hkv)};
-                const VisibleRows rows = visible[row];
+                const VisibleRows visible_tokens = visible[token_pos];
 
                 std::vector<Scalar> alpha;
-                alpha.reserve(rows.count());
-                for (size_t j = rows.first; j < rows.end; ++j) alpha.push_back(dot(query, cache.key(j, group)));
+                alpha.reserve(visible_tokens.count());
+                for (size_t j = visible_tokens.first; j < visible_tokens.end; ++j) alpha.push_back(dot(query, cache.key(j, group)));
                 alpha = Softmax{}(std::move(alpha));
 
                 Vec<Dh> head_output;
-                for (size_t n = 0; n < alpha.size(); ++n) head_output.scaled_add(cache.value(rows.first + n, group), alpha[n]);
-                attended.template replace_partition<Dh>(row, head, head_output);
+                for (size_t n = 0; n < alpha.size(); ++n) head_output.scaled_add(cache.value(visible_tokens.first + n, group), alpha[n]);
+                attended.template replace_partition<Dh>(token_pos, head, head_output);
             });
             return attended;
         };
 
         // Prefill appends the batch once and attends in parallel. A bounded ring
-        // that would evict mid-batch advances row by row instead, so the early
-        // queries keep the keys they are still allowed to see.
+        // that would evict mid-batch advances one token at a time instead, so
+        // the early queries keep the keys they are still allowed to see.
         Matrix<Hq * Dh> A;
         if (cache.can_append_without_eviction(Q.rows())) {
-            for (size_t row = 0; row < Q.rows(); ++row) {
-                cache.append(conversation_position + row, K.row(row), V.row(row));
+            for (size_t token_pos = 0; token_pos < Q.rows(); ++token_pos) {
+                cache.append(conversation_position + token_pos, K.row(token_pos), V.row(token_pos));
             }
             A = reduce(Q.view(), conversation_position);
         } else {
             A.reserve(Q.rows());
-            for (size_t row = 0; row < Q.rows(); ++row) {
-                const Position at = conversation_position + row;
-                cache.append(at, K.row(row), V.row(row));
-                A.append(reduce(Q.view().single_row(row), at).row(0));
+            for (size_t token_pos = 0; token_pos < Q.rows(); ++token_pos) {
+                const Position at = conversation_position + token_pos;
+                cache.append(at, K.row(token_pos), V.row(token_pos));
+                A.append(reduce(Q.view().single_row(token_pos), at).row(0));
             }
         }
         return WO(A.view());
@@ -301,7 +301,7 @@ struct GemmaE4BSharedLayer {
 
         std::vector<VisibleRows> visible;
         visible.reserve(Q.rows());
-        for (size_t row = 0; row < Q.rows(); ++row) visible.push_back(cache.visible_rows(conversation_position + row));
+        for (size_t token_pos = 0; token_pos < Q.rows(); ++token_pos) visible.push_back(cache.visible_rows(conversation_position + token_pos));
 
         Matrix<Hq * Dh> A = Matrix<Hq * Dh>::zero_rows(Q.rows());
         par_for(Q.rows() * Hq, [&](size_t task) {
@@ -593,39 +593,39 @@ struct Gemma12BLocalLayer {
         const auto reduce = [&](MatrixView<Hq * Dh> queries, Position at) {
             std::vector<VisibleRows> visible;
             visible.reserve(queries.rows());
-            for (size_t row = 0; row < queries.rows(); ++row) visible.push_back(cache.visible_rows(at + row));
+            for (size_t token_pos = 0; token_pos < queries.rows(); ++token_pos) visible.push_back(cache.visible_rows(at + token_pos));
 
             Matrix<Hq * Dh> attended = Matrix<Hq * Dh>::zero_rows(queries.rows());
             par_for(queries.rows() * Hq, [&](size_t task) {
-                const size_t row = task / Hq, head = task % Hq;
-                const VecView<Dh> query = slice<Dh>(queries.row(row), head);
+                const size_t token_pos = task / Hq, head = task % Hq;
+                const VecView<Dh> query = slice<Dh>(queries.row(token_pos), head);
                 const KVHead group{head / (Hq / Hkv)};
-                const VisibleRows rows = visible[row];
+                const VisibleRows visible_tokens = visible[token_pos];
 
                 std::vector<Scalar> alpha;
-                alpha.reserve(rows.count());
-                for (size_t j = rows.first; j < rows.end; ++j) alpha.push_back(dot(query, cache.key(j, group)));
+                alpha.reserve(visible_tokens.count());
+                for (size_t j = visible_tokens.first; j < visible_tokens.end; ++j) alpha.push_back(dot(query, cache.key(j, group)));
                 alpha = Softmax{}(std::move(alpha));
 
                 Vec<Dh> head_output;
-                for (size_t n = 0; n < alpha.size(); ++n) head_output.scaled_add(cache.value(rows.first + n, group), alpha[n]);
-                attended.template replace_partition<Dh>(row, head, head_output);
+                for (size_t n = 0; n < alpha.size(); ++n) head_output.scaled_add(cache.value(visible_tokens.first + n, group), alpha[n]);
+                attended.template replace_partition<Dh>(token_pos, head, head_output);
             });
             return attended;
         };
 
         // A 1024-wide ring evicts on any prompt longer than the window, so the
-        // row-by-row path is the normal long-prefill case, not an edge.
+        // token-by-token path is the normal long-prefill case, not an edge.
         Matrix<Hq * Dh> A;
         if (cache.can_append_without_eviction(Q.rows())) {
-            for (size_t row = 0; row < Q.rows(); ++row) cache.append(conversation_position + row, K.row(row), V.row(row));
+            for (size_t token_pos = 0; token_pos < Q.rows(); ++token_pos) cache.append(conversation_position + token_pos, K.row(token_pos), V.row(token_pos));
             A = reduce(Q.view(), conversation_position);
         } else {
             A.reserve(Q.rows());
-            for (size_t row = 0; row < Q.rows(); ++row) {
-                const Position at = conversation_position + row;
-                cache.append(at, K.row(row), V.row(row));
-                A.append(reduce(Q.view().single_row(row), at).row(0));
+            for (size_t token_pos = 0; token_pos < Q.rows(); ++token_pos) {
+                const Position at = conversation_position + token_pos;
+                cache.append(at, K.row(token_pos), V.row(token_pos));
+                A.append(reduce(Q.view().single_row(token_pos), at).row(0));
             }
         }
         return WO(A.view());
@@ -687,28 +687,28 @@ struct Gemma12BFullLayer {
         const auto reduce = [&](MatrixView<Hq * Dh> queries, Position at) {
             std::vector<VisibleRows> visible;
             visible.reserve(queries.rows());
-            for (size_t row = 0; row < queries.rows(); ++row) visible.push_back(cache.visible_rows(at + row));
+            for (size_t token_pos = 0; token_pos < queries.rows(); ++token_pos) visible.push_back(cache.visible_rows(at + token_pos));
 
             Matrix<Hq * Dh> attended = Matrix<Hq * Dh>::zero_rows(queries.rows());
             par_for(queries.rows() * Hq, [&](size_t task) {
-                const size_t row = task / Hq, head = task % Hq;
-                const VecView<Dh> query = slice<Dh>(queries.row(row), head);
+                const size_t token_pos = task / Hq, head = task % Hq;
+                const VecView<Dh> query = slice<Dh>(queries.row(token_pos), head);
                 const KVHead group{head / (Hq / Hkv)};
-                const VisibleRows rows = visible[row];
+                const VisibleRows visible_tokens = visible[token_pos];
 
                 std::vector<Scalar> alpha;
-                alpha.reserve(rows.count());
-                for (size_t j = rows.first; j < rows.end; ++j) alpha.push_back(dot(query, cache.key(j, group)));
+                alpha.reserve(visible_tokens.count());
+                for (size_t j = visible_tokens.first; j < visible_tokens.end; ++j) alpha.push_back(dot(query, cache.key(j, group)));
                 alpha = Softmax{}(std::move(alpha));
 
                 Vec<Dh> head_output;
-                for (size_t n = 0; n < alpha.size(); ++n) head_output.scaled_add(cache.value(rows.first + n, group), alpha[n]);
-                attended.template replace_partition<Dh>(row, head, head_output);
+                for (size_t n = 0; n < alpha.size(); ++n) head_output.scaled_add(cache.value(visible_tokens.first + n, group), alpha[n]);
+                attended.template replace_partition<Dh>(token_pos, head, head_output);
             });
             return attended;
         };
 
-        for (size_t row = 0; row < Q.rows(); ++row) cache.append(conversation_position + row, K.row(row), V.row(row));
+        for (size_t token_pos = 0; token_pos < Q.rows(); ++token_pos) cache.append(conversation_position + token_pos, K.row(token_pos), V.row(token_pos));
         const auto A = reduce(Q.view(), conversation_position);
         return WO(A.view());
     }
